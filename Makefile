@@ -227,11 +227,14 @@ llama.o: llama.cpp llama.h
 common.o: examples/common.cpp examples/common.h
 	$(CXX) $(CXXFLAGS) -c examples/common.cpp -o common.o
 
+run.o: examples/main/run.cpp examples/main/run.h
+	$(CXX) $(CXXFLAGS) -c examples/main/run.cpp -o run.o
+
 clean:
 	rm -vf *.o main quantize perplexity embedding
 
-main: examples/main/run.cpp ggml.o llama.o common.o
-	$(CXX) $(CXXFLAGS) examples/main/run.cpp ggml.o llama.o common.o -o main $(LDFLAGS)
+main: examples/main/main.cpp ggml.o llama.o common.o run.o
+	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o run.o -o main $(LDFLAGS)
 	@echo
 	@echo '====  Run ./main -h for help.  ===='
 	@echo

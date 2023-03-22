@@ -107,7 +107,7 @@ void win32_console_init(void) {
 }
 #endif
 
-int main(int argc, char ** argv) {
+int run(int argc, char ** argv) {
     gpt_params params;
     params.model = "models/llama-7B/ggml-model.bin";
 

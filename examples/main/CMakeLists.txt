@@ -1,4 +1,6 @@
 set(TARGET main)
-add_executable(${TARGET} run.cpp)
+add_executable(${TARGET}
+               main.cpp
+               run.cpp)
 target_link_libraries(${TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
