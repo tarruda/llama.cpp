@@ -158,6 +158,14 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.n_parts = std::stoi(argv[i]);
+#ifndef _WIN32
+        } else if (arg == "-l" || arg == "--listen") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.listen_port = argv[i];
+#endif
         } else if (arg == "-h" || arg == "--help") {
             gpt_print_usage(argc, argv, params);
             exit(0);
@@ -224,6 +232,10 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  --verbose-prompt      print prompt before generation\n");
     fprintf(stderr, "  -m FNAME, --model FNAME\n");
     fprintf(stderr, "                        model path (default: %s)\n", params.model.c_str());
+#ifndef _WIN32
+    fprintf(stderr, "  -l PORT, --listen PORT\n");
+    fprintf(stderr, "                        Run in TCP mode, listening on PORT\n");
+#endif
     fprintf(stderr, "\n");
 }
 

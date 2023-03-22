@@ -230,11 +230,14 @@ common.o: examples/common.cpp examples/common.h
 run.o: examples/main/run.cpp examples/main/run.h
 	$(CXX) $(CXXFLAGS) -c examples/main/run.cpp -o run.o
 
+tcp_server.o: examples/main/tcp_server.cpp examples/main/tcp_server.h
+	$(CXX) $(CXXFLAGS) -c examples/main/tcp_server.cpp -o tcp_server.o
+
 clean:
 	rm -vf *.o main quantize perplexity embedding
 
-main: examples/main/main.cpp ggml.o llama.o common.o run.o
-	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o run.o -o main $(LDFLAGS)
+main: examples/main/main.cpp ggml.o llama.o common.o run.o tcp_server.o
+	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o run.o tcp_server.o -o main $(LDFLAGS)
 	@echo
 	@echo '====  Run ./main -h for help.  ===='
 	@echo
