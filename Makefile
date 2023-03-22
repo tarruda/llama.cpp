@@ -230,8 +230,8 @@ common.o: examples/common.cpp examples/common.h
 clean:
 	rm -vf *.o main quantize perplexity embedding
 
-main: examples/main/main.cpp ggml.o llama.o common.o
-	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o -o main $(LDFLAGS)
+main: examples/main/run.cpp ggml.o llama.o common.o
+	$(CXX) $(CXXFLAGS) examples/main/run.cpp ggml.o llama.o common.o -o main $(LDFLAGS)
 	@echo
 	@echo '====  Run ./main -h for help.  ===='
 	@echo
