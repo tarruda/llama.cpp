@@ -938,6 +938,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_dsv4_hc_comb_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_f32;
+    vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_lightning_indexer[GGML_TYPE_COUNT];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1647,6 +1651,44 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+};
+
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t nm0, nm1;
+    uint32_t ns0;
+    uint32_t nb0;
+    uint32_t nd0, nd1, nd2;
+    uint32_t n_tokens;
+    uint32_t n_iter;
+    float eps;
+};
+
+struct vk_op_dsv4_hc_pre_push_constants {
+    uint32_t nbx0, nbx1, nbx2;
+    uint32_t nbw0, nbw1;
+    uint32_t nbd0, nbd1;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+};
+
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t nbx0, nbx1;
+    uint32_t nbr0, nbr1, nbr2;
+    uint32_t nbp0, nbp1;
+    uint32_t nbc0, nbc1, nbc2;
+    uint32_t nbd0, nbd1, nbd2;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+};
+
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t n_kv;
+    uint32_t nb1, nb3;
+    uint32_t nb01, nb02, nb03;
+    uint32_t nb12, nb13;
+    uint32_t nb21, nb23;
+    float scale_embd;
+    float scale_heads;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5391,6 +5433,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
+    }
+
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,  "dsv4_hc_pre_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, {256}, 1);
+
+    {
+        const uint32_t subgroup_size = std::max(1u, device->subgroup_size);
+        const uint32_t k_vecs_per_wg = std::max(1u, std::min(8u, device->properties.limits.maxComputeWorkGroupInvocations / subgroup_size));
+        const uint32_t wg_size = subgroup_size*k_vecs_per_wg;
+
+#define CREATE_LIGHTNING_INDEXER_PIPELINE(type, name) \
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer[GGML_TYPE_ ## type], "lightning_indexer_" #name, \
+            lightning_indexer_ ## name ## _len, lightning_indexer_ ## name ## _data, "main", 4, \
+            sizeof(vk_op_lightning_indexer_push_constants), {k_vecs_per_wg, 1, 1}, {wg_size, k_vecs_per_wg}, 1, true, true, subgroup_size)
+
+        CREATE_LIGHTNING_INDEXER_PIPELINE(F32,  f32);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(F16,  f16);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(BF16, bf16);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(Q4_0, q4_0);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(Q4_1, q4_1);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(Q5_0, q5_0);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(Q5_1, q5_1);
+        CREATE_LIGHTNING_INDEXER_PIPELINE(Q8_0, q8_0);
+
+#undef CREATE_LIGHTNING_INDEXER_PIPELINE
     }
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -10935,6 +11003,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
+    case GGML_OP_DSV4_HC_COMB:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_comb_f32;
+        }
+        return nullptr;
+    case GGML_OP_DSV4_HC_PRE:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_pre_f32;
+        }
+        return nullptr;
+    case GGML_OP_DSV4_HC_POST:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->src[3]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_post_f32;
+        }
+        return nullptr;
+    case GGML_OP_LIGHTNING_INDEXER:
+        if (src0->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_lightning_indexer[src1->type];
+        }
+        return nullptr;
     case GGML_OP_SSM_SCAN:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t d_state = src0->ne[0];
@@ -11964,6 +12052,141 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
         pc, { H, n_seqs, S_v });
+}
+
+static void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, mixes, scale, base, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_dsv4_hc_comb_push_constants pc = {
+        (uint32_t)(mixes->nb[0] / sizeof(float)), (uint32_t)(mixes->nb[1] / sizeof(float)),
+        (uint32_t)(scale->nb[0] / sizeof(float)),
+        (uint32_t)(base->nb[0] / sizeof(float)),
+        (uint32_t)(dst->nb[0] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[2] / sizeof(float)),
+        (uint32_t)mixes->ne[1],
+        (uint32_t)ggml_get_op_params_i32(dst, 1),
+        ggml_get_op_params_f32(dst, 0),
+    };
+
+    vk_subbuffer mixes_buf = ggml_vk_tensor_subbuffer(ctx, mixes);
+    vk_subbuffer scale_buf = ggml_vk_tensor_subbuffer(ctx, scale);
+    vk_subbuffer base_buf  = ggml_vk_tensor_subbuffer(ctx, base);
+    vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {mixes_buf, scale_buf, base_buf, dst_buf},
+        pc, { pc.n_tokens, 1, 1 });
+}
+
+static void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, weights, nullptr, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_embd   = (uint32_t)x->ne[0];
+    const uint32_t n_tokens = (uint32_t)x->ne[2];
+
+    const vk_op_dsv4_hc_pre_push_constants pc = {
+        (uint32_t)(x->nb[0] / sizeof(float)), (uint32_t)(x->nb[1] / sizeof(float)), (uint32_t)(x->nb[2] / sizeof(float)),
+        (uint32_t)(weights->nb[0] / sizeof(float)), (uint32_t)(weights->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[0] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)),
+        n_embd,
+        n_tokens,
+    };
+
+    vk_subbuffer x_buf       = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx, weights);
+    vk_subbuffer dst_buf     = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {x_buf, weights_buf, dst_buf},
+        pc, { n_embd*n_tokens, 1, 1 });
+}
+
+static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, residual, post, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_embd   = (uint32_t)x->ne[0];
+    const uint32_t n_tokens = (uint32_t)x->ne[1];
+    const uint32_t hc       = (uint32_t)residual->ne[1];
+
+    const vk_op_dsv4_hc_post_push_constants pc = {
+        (uint32_t)(x->nb[0] / sizeof(float)), (uint32_t)(x->nb[1] / sizeof(float)),
+        (uint32_t)(residual->nb[0] / sizeof(float)), (uint32_t)(residual->nb[1] / sizeof(float)), (uint32_t)(residual->nb[2] / sizeof(float)),
+        (uint32_t)(post->nb[0] / sizeof(float)), (uint32_t)(post->nb[1] / sizeof(float)),
+        (uint32_t)(comb->nb[0] / sizeof(float)), (uint32_t)(comb->nb[1] / sizeof(float)), (uint32_t)(comb->nb[2] / sizeof(float)),
+        (uint32_t)(dst->nb[0] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[2] / sizeof(float)),
+        n_embd,
+        n_tokens,
+    };
+
+    vk_subbuffer x_buf        = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer residual_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    vk_subbuffer post_buf     = ggml_vk_tensor_subbuffer(ctx, post);
+    vk_subbuffer comb_buf     = ggml_vk_tensor_subbuffer(ctx, comb);
+    vk_subbuffer dst_buf      = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {x_buf, residual_buf, post_buf, comb_buf, dst_buf},
+        pc, { n_embd*hc*n_tokens, 1, 1 });
+}
+
+static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, weights, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t k_type_size = (uint32_t)ggml_type_size(k->type);
+
+    const vk_op_lightning_indexer_push_constants pc = {
+        (uint32_t)k->ne[2],
+        (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[3] / sizeof(float)),
+        (uint32_t)(q->nb[1] / sizeof(float)), (uint32_t)(q->nb[2] / sizeof(float)), (uint32_t)(q->nb[3] / sizeof(float)),
+        (uint32_t)(k->nb[2] / k_type_size), (uint32_t)(k->nb[3] / k_type_size),
+        (uint32_t)(weights->nb[1] / sizeof(float)), (uint32_t)(weights->nb[3] / sizeof(float)),
+        ggml_get_op_params_f32(dst, 0),
+        ggml_get_op_params_f32(dst, 1),
+    };
+
+    vk_subbuffer q_buf       = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf       = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx, weights);
+    vk_subbuffer dst_buf     = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, k_buf, weights_buf, dst_buf},
+        pc, { (uint32_t)k->ne[2], (uint32_t)q->ne[2], (uint32_t)q->ne[3] });
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -14861,6 +15084,26 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_DSV4_HC_COMB:
+        ggml_vk_dsv4_hc_comb(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_PRE:
+        ggml_vk_dsv4_hc_pre(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_POST:
+        ggml_vk_dsv4_hc_post(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_LIGHTNING_INDEXER:
+        ggml_vk_lightning_indexer(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_SSM_SCAN:
         ggml_vk_ssm_scan(ctx, compute_ctx, node);
 
@@ -17533,6 +17776,80 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_DSV4_HC_COMB:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == 24 &&
+                op->src[1]->ne[0] >= 3 &&
+                op->src[2]->ne[0] == 24 &&
+                op->ne[0] == 4 &&
+                op->ne[1] == 4 &&
+                op->ne[2] == op->src[0]->ne[1];
+        case GGML_OP_DSV4_HC_PRE:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[1]->ne[0] == 4 &&
+                op->src[1]->ne[1] == op->src[0]->ne[2] &&
+                op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == op->src[0]->ne[2];
+        case GGML_OP_DSV4_HC_POST:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                op->src[1]->ne[1] == 4 &&
+                op->src[2]->ne[0] == 4 &&
+                op->src[3]->ne[0] == 4 &&
+                op->src[3]->ne[1] == 4 &&
+                op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == 4 &&
+                op->ne[2] == op->src[0]->ne[1];
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                if (!device->subgroup_basic || !device->subgroup_arithmetic) {
+                    return false;
+                }
+
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_BF16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                        break;
+                    default:
+                        return false;
+                }
+
+                return op->type == GGML_TYPE_F32 &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[2]->type == GGML_TYPE_F32 &&
+                    op->src[0]->ne[0] == 128 &&
+                    op->src[0]->ne[1] == 64 &&
+                    op->src[1]->ne[0] == 128 &&
+                    op->src[1]->ne[1] == 1 &&
+                    op->src[2]->ne[0] == 64 &&
+                    op->src[0]->ne[2] == op->src[2]->ne[1] &&
+                    op->src[2]->ne[2] == 1 &&
+                    op->src[0]->ne[3] == op->src[1]->ne[3] &&
+                    op->src[1]->ne[3] == op->src[2]->ne[3] &&
+                    op->ne[0] == op->src[1]->ne[2] &&
+                    op->ne[1] == op->src[0]->ne[2] &&
+                    op->ne[2] == 1 &&
+                    op->ne[3] == op->src[0]->ne[3] &&
+                    op->src[0]->nb[0] == sizeof(float) &&
+                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                    op->src[2]->nb[0] == sizeof(float) &&
+                    op->nb[0] == sizeof(float);
             }
         case GGML_OP_SSM_SCAN:
             {

@@ -4205,12 +4205,13 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 struct test_lightning_indexer : public test_case {
+    const ggml_type k_type;
     const int64_t n_batch;
     const int64_t n_kv;
     const int64_t n_stream;
 
     std::string vars() override {
-        return VARS_TO_STR3(n_batch, n_kv, n_stream);
+        return VARS_TO_STR4(k_type, n_batch, n_kv, n_stream);
     }
 
     double err(const float * a, const float * b, size_t n) override {
@@ -4225,14 +4226,19 @@ struct test_lightning_indexer : public test_case {
         return 1e-4;
     }
 
-    test_lightning_indexer(int64_t n_batch = 3, int64_t n_kv = 65, int64_t n_stream = 2)
-        : n_batch(n_batch), n_kv(n_kv), n_stream(n_stream) {}
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return max_err();
+    }
+
+    test_lightning_indexer(ggml_type k_type = GGML_TYPE_F32, int64_t n_batch = 3, int64_t n_kv = 65, int64_t n_stream = 2)
+        : k_type(k_type), n_batch(n_batch), n_kv(n_kv), n_stream(n_stream) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 64, n_batch, n_stream);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 1, n_kv, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, 128, 1, n_kv, n_stream);
         ggml_set_name(k, "k");
 
         ggml_tensor * weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, n_batch, 1, n_stream);
@@ -8260,7 +8266,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
 
-    test_cases.emplace_back(new test_lightning_indexer());
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_lightning_indexer(type));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
