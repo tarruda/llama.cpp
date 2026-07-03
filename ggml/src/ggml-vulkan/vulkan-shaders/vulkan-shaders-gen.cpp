@@ -1032,6 +1032,15 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
 
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+    string_to_spv("dsv4_hc_pre_f32", "dsv4_hc_pre.comp", {});
+    string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+
+    for (std::string tname : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0"}) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        string_to_spv("lightning_indexer_" + tname, "lightning_indexer.comp", merge_maps(base_dict, {{data_a_key, "1"}}));
+    }
+
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 

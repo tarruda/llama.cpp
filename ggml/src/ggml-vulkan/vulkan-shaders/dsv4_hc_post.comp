@@ -1,0 +1,56 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nbx0;
+    uint nbx1;
+    uint nbr0;
+    uint nbr1;
+    uint nbr2;
+    uint nbp0;
+    uint nbp1;
+    uint nbc0;
+    uint nbc1;
+    uint nbc2;
+    uint nbd0;
+    uint nbd1;
+    uint nbd2;
+    uint n_embd;
+    uint n_tokens;
+} p;
+
+layout(binding = 0) readonly  buffer XBuf        { float data_x[];        };
+layout(binding = 1) readonly  buffer ResidualBuf { float data_residual[]; };
+layout(binding = 2) readonly  buffer PostBuf     { float data_post[];     };
+layout(binding = 3) readonly  buffer CombBuf     { float data_comb[];     };
+layout(binding = 4) writeonly buffer DstBuf      { float data_dst[];      };
+
+const uint HC = 4u;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    const uint nr = p.n_embd * HC * p.n_tokens;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    const uint i0   = ir % p.n_embd;
+    const uint idst = (ir / p.n_embd) % HC;
+    const uint it   = ir / (p.n_embd * HC);
+
+    const float xv = data_x[i0*p.nbx0 + it*p.nbx1];
+    const float pv = data_post[idst*p.nbp0 + it*p.nbp1];
+
+    float sum = xv * pv;
+    [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+        const float rv = data_residual[i0*p.nbr0 + isrc*p.nbr1 + it*p.nbr2];
+        const float cv = data_comb[idst*p.nbc0 + isrc*p.nbc1 + it*p.nbc2];
+        sum += rv * cv;
+    }
+
+    data_dst[i0*p.nbd0 + idst*p.nbd1 + it*p.nbd2] = sum;
+}

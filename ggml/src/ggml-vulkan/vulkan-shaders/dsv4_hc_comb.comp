@@ -1,0 +1,105 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nm0;
+    uint nm1;
+    uint ns0;
+    uint nb0;
+    uint nd0;
+    uint nd1;
+    uint nd2;
+    uint n_tokens;
+    uint n_iter;
+    float eps;
+} p;
+
+layout(binding = 0) readonly  buffer MixesBuf { float data_mixes[]; };
+layout(binding = 1) readonly  buffer ScaleBuf { float data_scale[]; };
+layout(binding = 2) readonly  buffer BaseBuf  { float data_base[];  };
+layout(binding = 3) writeonly buffer DstBuf   { float data_dst[];   };
+
+const uint HC = 4u;
+const uint COMB_OFFSET = 2u * HC;
+
+void norm_cols(inout float comb[16]) {
+    [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+        float sum = p.eps;
+        [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+            sum += comb[idst + HC*isrc];
+        }
+
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+void norm_rows(inout float comb[16]) {
+    [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+        float sum = p.eps;
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            sum += comb[idst + HC*isrc];
+        }
+
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+void main() {
+    const uint it = gl_GlobalInvocationID.x;
+
+    if (it >= p.n_tokens) {
+        return;
+    }
+
+    const uint mixes_base = it*p.nm1;
+    const float scale_comb = data_scale[2u*p.ns0];
+
+    float comb[16];
+
+    [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+        float row_max = -3.402823466e+38f;
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            const uint mix_idx = COMB_OFFSET + idx;
+            const float v = data_mixes[mixes_base + mix_idx*p.nm0]*scale_comb + data_base[mix_idx*p.nb0];
+            comb[idx] = v;
+            row_max = max(row_max, v);
+        }
+
+        float sum = 0.0f;
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            const float v = exp(comb[idx] - row_max);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            comb[idx] = comb[idx]*inv_sum + p.eps;
+        }
+    }
+
+    norm_cols(comb);
+    for (uint i = 1u; i < p.n_iter; ++i) {
+        norm_rows(comb);
+        norm_cols(comb);
+    }
+
+    [[unroll]] for (uint isrc = 0u; isrc < HC; ++isrc) {
+        [[unroll]] for (uint idst = 0u; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            data_dst[idst*p.nd0 + isrc*p.nd1 + it*p.nd2] = comb[idx];
+        }
+    }
+}

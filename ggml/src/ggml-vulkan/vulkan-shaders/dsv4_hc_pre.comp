@@ -1,0 +1,44 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nbx0;
+    uint nbx1;
+    uint nbx2;
+    uint nbw0;
+    uint nbw1;
+    uint nbd0;
+    uint nbd1;
+    uint n_embd;
+    uint n_tokens;
+} p;
+
+layout(binding = 0) readonly  buffer XBuf       { float data_x[];       };
+layout(binding = 1) readonly  buffer WeightsBuf { float data_weights[]; };
+layout(binding = 2) writeonly buffer DstBuf     { float data_dst[];     };
+
+const uint HC = 4u;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    const uint nr = p.n_embd * p.n_tokens;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    const uint i0 = ir % p.n_embd;
+    const uint it = ir / p.n_embd;
+
+    float sum = 0.0f;
+    [[unroll]] for (uint ih = 0u; ih < HC; ++ih) {
+        const float xv = data_x[i0*p.nbx0 + ih*p.nbx1 + it*p.nbx2];
+        const float wv = data_weights[ih*p.nbw0 + it*p.nbw1];
+        sum += xv * wv;
+    }
+
+    data_dst[i0*p.nbd0 + it*p.nbd1] = sum;
+}
