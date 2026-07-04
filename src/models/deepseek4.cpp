@@ -725,8 +725,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     GGML_ASSERT(inp_csa.kq_mask);
     GGML_ASSERT(inp_attn->self_k_rot == nullptr);
 
-    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
-
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
@@ -753,7 +751,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    ggml_tensor * csa_mask = inp_csa.kq_mask;
+    // If top-k would select every compressed row, the top-k mask is the mask itself.
+    if (n_csa > hparams.indexer_top_k) {
+        ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
+        csa_mask = build_top_k_mask(csa_mask, top_k, "csa_top_k_mask", il);
+    } else {
+        cb(csa_mask, "csa_top_k_mask", il);
+    }
     const bool use_fattn = dsv4_use_flash_attn(cparams, csa_mask);
     if (use_fattn && csa_mask->type != GGML_TYPE_F16) {
         csa_mask = ggml_cast(ctx0, csa_mask, GGML_TYPE_F16);
