@@ -680,10 +680,11 @@ static void dsv4_set_kq_mask(
 
     for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
         const int32_t n_visible = plan.n_visible[i];
+        GGML_ASSERT(n_visible >= 0 && n_visible <= dst->ne[0]);
 
-        for (int64_t j = 0; j < dst->ne[0]; ++j) {
-            data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
-        }
+        float * row = data + i*dst->ne[0];
+        std::fill(row, row + n_visible, 0.0f);
+        std::fill(row + n_visible, row + dst->ne[0], -INFINITY);
     }
 }
 
@@ -699,7 +700,7 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(n_tokens%n_stream == 0);
 
-    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || n_stream == 1);
+    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || n_stream == 1) && n_tokens/n_stream == 1;
     const auto type = use_fattn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
@@ -2381,7 +2382,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+                bool   allow_flash_attn) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2395,7 +2397,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = allow_flash_attn && cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 

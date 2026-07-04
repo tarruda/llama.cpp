@@ -237,7 +237,7 @@ static ggml_tensor * dsv4_build_kq_zero_bias(
         const llama_cparams & cparams,
         ggml_tensor * kq_mask,
         int64_t n_head) {
-    if (!cparams.kv_unified || !cparams.flash_attn || kq_mask->ne[3] == 1) {
+    if (!cparams.kv_unified || !cparams.flash_attn || kq_mask->ne[3] == 1 || kq_mask->ne[1] != 1) {
         return nullptr;
     }
 
@@ -245,6 +245,10 @@ static ggml_tensor * dsv4_build_kq_zero_bias(
     ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
             kq_mask->ne[0], kq_mask->ne[1], n_head, kq_mask->ne[3]);
     return ggml_fill(ctx, res, 0.0f);
+}
+
+static bool dsv4_use_flash_attn(const llama_cparams & cparams, const ggml_tensor * kq_mask) {
+    return cparams.flash_attn && (!cparams.kv_unified || kq_mask->ne[3] == 1) && kq_mask->ne[1] == 1;
 }
 
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
@@ -750,7 +754,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
-    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || csa_mask->ne[3] == 1);
+    const bool use_fattn = dsv4_use_flash_attn(cparams, csa_mask);
     if (use_fattn && csa_mask->type != GGML_TYPE_F16) {
         csa_mask = ggml_cast(ctx0, csa_mask, GGML_TYPE_F16);
     }
@@ -762,7 +766,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il,
+            dsv4_use_flash_attn(cparams, kq_mask));
     cb(out, "attn_csa_lid", il);
 
     return out;
@@ -807,7 +812,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * hca_mask = inp_hca.kq_mask;
-    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || hca_mask->ne[3] == 1);
+    const bool use_fattn = dsv4_use_flash_attn(cparams, hca_mask);
     if (use_fattn && hca_mask->type != GGML_TYPE_F16) {
         hca_mask = ggml_cast(ctx0, hca_mask, GGML_TYPE_F16);
     }
@@ -819,7 +824,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(kq_mask, "hca_kq_mask", il);
 
     ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il,
+            dsv4_use_flash_attn(cparams, kq_mask));
     cb(out, "attn_hca", il);
 
     return out;
@@ -854,7 +860,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
     k = dsv4_repeat_streams(ctx0, k, kq_mask->ne[3]);
 
     ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
-    ggml_tensor * out = build_attn_mha(q, k, k, kq_b, kq_mask, sinks, nullptr, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k, k, kq_b, kq_mask, sinks, nullptr, kq_scale, il,
+            dsv4_use_flash_attn(cparams, kq_mask));
     cb(out, "attn_raw", il);
 
     return out;
