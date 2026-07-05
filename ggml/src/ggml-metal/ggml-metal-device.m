@@ -1297,6 +1297,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             return true;
+        case GGML_OP_DSV4_COMPRESS:
+            if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            return true;
         case GGML_OP_DSV4_HC_PRE:
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

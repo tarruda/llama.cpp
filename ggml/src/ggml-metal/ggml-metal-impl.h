@@ -1196,6 +1196,21 @@ typedef struct {
 } ggml_metal_kargs_lightning_indexer;
 
 typedef struct {
+    uint64_t nbk0;
+    uint64_t nbk1;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbi0;
+    uint64_t nbd0;
+    uint64_t nbd1;
+    int32_t  n_embd;
+    int32_t  n_blocks;
+    int32_t  n_rows;
+    int32_t  ratio;
+    int32_t  overlap;
+} ggml_metal_kargs_dsv4_compress;
+
+typedef struct {
     uint64_t nd0;
     uint64_t nd1;
     uint64_t nd2;

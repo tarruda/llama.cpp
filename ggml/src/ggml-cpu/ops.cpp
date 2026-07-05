@@ -10823,6 +10823,114 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_dsv4_compress
+
+static void ggml_compute_forward_dsv4_compress_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv_state    = dst->src[0];
+    const ggml_tensor * score_state = dst->src[1];
+    const ggml_tensor * read_idxs   = dst->src[2];
+
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(read_idxs->type   == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type         == GGML_TYPE_F32);
+
+    const int32_t ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_blocks = dst->ne[1];
+    const int64_t n_rows   = kv_state->ne[1];
+
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(n_blocks > 0);
+    GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
+    GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
+    GGML_ASSERT(kv_state->ne[0] == (overlap ? 2*n_embd : n_embd));
+    GGML_ASSERT(read_idxs->ne[0] == (overlap ? 2 : 1)*ratio*n_blocks);
+
+    GGML_TENSOR_LOCALS(size_t, nbk, kv_state,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, score_state, nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, read_idxs,   nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,         nb);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = n_embd * n_blocks;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t ib = ir / n_embd;
+
+        const int64_t n_read = overlap ? 2*ratio : ratio;
+
+        float score_max = -INFINITY;
+        for (int64_t j = 0; j < n_read; ++j) {
+            const bool cur_half = overlap && j >= ratio;
+            const int64_t jr = cur_half ? j - ratio : j;
+            const int64_t idx_pos = (cur_half ? ratio*n_blocks : 0) + ib*ratio + jr;
+            const int32_t idx = *(const int32_t *) ((const char *) read_idxs->data + idx_pos*nbi0);
+
+            GGML_ASSERT(idx >= 0 && idx <= n_rows);
+            if (idx == n_rows) {
+                continue;
+            }
+
+            const int64_t i_src = (cur_half ? n_embd : 0) + i0;
+            const float score = *(const float *) ((const char *) score_state->data + i_src*nbs0 + idx*nbs1);
+            score_max = MAX(score_max, score);
+        }
+
+        float sum_v = 0.0f;
+        float sum_w = 0.0f;
+        if (score_max != -INFINITY) {
+            for (int64_t j = 0; j < n_read; ++j) {
+                const bool cur_half = overlap && j >= ratio;
+                const int64_t jr = cur_half ? j - ratio : j;
+                const int64_t idx_pos = (cur_half ? ratio*n_blocks : 0) + ib*ratio + jr;
+                const int32_t idx = *(const int32_t *) ((const char *) read_idxs->data + idx_pos*nbi0);
+
+                GGML_ASSERT(idx >= 0 && idx <= n_rows);
+                if (idx == n_rows) {
+                    continue;
+                }
+
+                const int64_t i_src = (cur_half ? n_embd : 0) + i0;
+                const float score = *(const float *) ((const char *) score_state->data + i_src*nbs0 + idx*nbs1);
+                const float w = expf(score - score_max);
+                const float v = *(const float *) ((const char *) kv_state->data + i_src*nbk0 + idx*nbk1);
+                sum_v += v * w;
+                sum_w += w;
+            }
+        }
+
+        *(float *) ((char *) dst->data + i0*nbd0 + ib*nbd1) = sum_w > 0.0f ? sum_v / sum_w : 0.0f;
+    }
+}
+
+void ggml_compute_forward_dsv4_compress(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dsv4_compress_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ggml_compute_forward_dsv4_hc_comb
 

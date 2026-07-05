@@ -569,6 +569,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_COMPRESS,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2584,6 +2585,18 @@ extern "C" {
         struct ggml_tensor  * weights,
         float                 scale_embd,
         float                 scale_heads);
+
+    // DeepSeek V4 hyper-connection helpers.
+    //   dsv4_compress: kv_state/score_state [state_dim, n_rows],
+    //                  read_idxs [ratio*n_blocks] or [2*ratio*n_blocks]
+    //                  -> [state_dim, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * read_idxs,
+            int32_t               ratio,
+            bool                  overlap);
 
     // DeepSeek V4 hyper-connection helpers.
     //   hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]

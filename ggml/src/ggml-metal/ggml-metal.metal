@@ -11016,6 +11016,67 @@ template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized<block_q5_1, dequantize_q5_1_t4>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized<block_q8_0, dequantize_q8_0_t4>;
 
+kernel void kernel_dsv4_compress(
+        constant ggml_metal_kargs_dsv4_compress & args,
+        device const char * kv_state,
+        device const char * score_state,
+        device const char * read_idxs,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tiitg[[thread_index_in_threadgroup]]) {
+
+    const int ir = (int) tgpig * 256 + (int) tiitg;
+    const int nr = args.n_embd * args.n_blocks;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    const int i0 = ir % args.n_embd;
+    const int ib = ir / args.n_embd;
+    const int n_read = args.overlap ? 2*args.ratio : args.ratio;
+
+    float score_max = -INFINITY;
+    for (int j = 0; j < n_read; ++j) {
+        const bool cur_half = args.overlap && j >= args.ratio;
+        const int jr = cur_half ? j - args.ratio : j;
+        const int idx_pos = (cur_half ? args.ratio*args.n_blocks : 0) + ib*args.ratio + jr;
+        const int idx = *(device const int *) (read_idxs + idx_pos*args.nbi0);
+
+        if (idx < 0 || idx >= args.n_rows) {
+            continue;
+        }
+
+        const int i_src = (cur_half ? args.n_embd : 0) + i0;
+        const float score = *(device const float *) (score_state + i_src*args.nbs0 + idx*args.nbs1);
+        score_max = max(score_max, score);
+    }
+
+    float sum_v = 0.0f;
+    float sum_w = 0.0f;
+    if (score_max != -INFINITY) {
+        for (int j = 0; j < n_read; ++j) {
+            const bool cur_half = args.overlap && j >= args.ratio;
+            const int jr = cur_half ? j - args.ratio : j;
+            const int idx_pos = (cur_half ? args.ratio*args.n_blocks : 0) + ib*args.ratio + jr;
+            const int idx = *(device const int *) (read_idxs + idx_pos*args.nbi0);
+
+            if (idx < 0 || idx >= args.n_rows) {
+                continue;
+            }
+
+            const int i_src = (cur_half ? args.n_embd : 0) + i0;
+            const float score = *(device const float *) (score_state + i_src*args.nbs0 + idx*args.nbs1);
+            const float w = exp(score - score_max);
+            const float v = *(device const float *) (kv_state + i_src*args.nbk0 + idx*args.nbk1);
+            sum_v += v * w;
+            sum_w += w;
+        }
+    }
+
+    *(device float *) (dst + i0*args.nbd0 + ib*args.nbd1) = sum_w > 0.0f ? sum_v / sum_w : 0.0f;
+}
+
 // DeepSeek V4 hierarchical connection kernels
 
 // HC_PRE: weighted sum over hc slices

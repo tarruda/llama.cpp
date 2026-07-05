@@ -320,6 +320,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
+        case GGML_OP_DSV4_COMPRESS:
+            {
+                n_fuse = ggml_metal_op_dsv4_compress(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 n_fuse = ggml_metal_op_dsv4_hc_comb(ctx, idx);
@@ -1301,6 +1305,67 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, 32, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_dsv4_compress(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * dst = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(dst->op == GGML_OP_DSV4_COMPRESS);
+
+    const ggml_tensor * kv_state    = dst->src[0];
+    const ggml_tensor * score_state = dst->src[1];
+    const ggml_tensor * read_idxs   = dst->src[2];
+
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(read_idxs->type   == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type         == GGML_TYPE_F32);
+
+    GGML_TENSOR_LOCALS(size_t, nbk, kv_state,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, score_state, nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, read_idxs,   nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,         nb);
+
+    const int32_t ratio    = ggml_get_op_params_i32(dst, 0);
+    const int32_t overlap  = ggml_get_op_params_i32(dst, 1);
+    const int32_t n_embd   = (int32_t) dst->ne[0];
+    const int32_t n_blocks = (int32_t) dst->ne[1];
+    const int32_t n_rows   = (int32_t) kv_state->ne[1];
+
+    ggml_metal_kargs_dsv4_compress args = {
+        /*.nbk0    =*/ nbk0,
+        /*.nbk1    =*/ nbk1,
+        /*.nbs0    =*/ nbs0,
+        /*.nbs1    =*/ nbs1,
+        /*.nbi0    =*/ nbi0,
+        /*.nbd0    =*/ nbd0,
+        /*.nbd1    =*/ nbd1,
+        /*.n_embd  =*/ n_embd,
+        /*.n_blocks=*/ n_blocks,
+        /*.n_rows  =*/ n_rows,
+        /*.ratio   =*/ ratio,
+        /*.overlap =*/ overlap,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_compress(lib, dst);
+
+    const int block_size = 256;
+    const int nr = n_embd * n_blocks;
+    const int grid_size = (nr + block_size - 1) / block_size;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(kv_state),    1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(score_state), 2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(read_idxs),   3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dst),         4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, grid_size, 1, 1, block_size, 1, 1);
 
     return 1;
 }
