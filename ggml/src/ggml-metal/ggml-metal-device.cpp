@@ -1413,6 +1413,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
+        int32_t nqptg,
         bool    use_f16_kv) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -1430,8 +1431,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    snprintf(base, 256, "kernel_%s%s_%s_dk%d_dv%d",
             "flash_attn_ext",
+            nqptg == 16 ? "_q16" : "",
             type,
             dk,
             dv);

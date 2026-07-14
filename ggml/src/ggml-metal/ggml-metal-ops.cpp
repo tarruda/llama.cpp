@@ -2556,6 +2556,16 @@ static bool ggml_metal_op_flash_attn_ext_use_q8_f16(const ggml_tensor * op) {
         n_head_kv > 0 && n_head % n_head_kv == 0 && n_head/n_head_kv >= 8;
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_f16_nwg64(const ggml_tensor * op) {
+    const int64_t n_head    = op->src[0]->ne[2];
+    const int64_t n_head_kv = op->src[1]->ne[2];
+
+    return op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+        op->src[0]->ne[0] == 128 && op->src[2]->ne[0] == 128 &&
+        op->src[0]->ne[1] == 1 && op->src[1]->ne[1] >= 16384 &&
+        n_head_kv > 0 && n_head % n_head_kv == 0 && n_head/n_head_kv >= 8;
+}
+
 static size_t ggml_metal_op_flash_attn_ext_q8_f16_k_size(const ggml_tensor * op) {
     return GGML_PAD(sizeof(ggml_fp16_t)*
         (size_t) op->src[1]->ne[0]*op->src[1]->ne[1]*op->src[1]->ne[2]*op->src[1]->ne[3], 16);
@@ -2667,7 +2677,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = 32;
+        const int64_t nwg = ggml_metal_op_flash_attn_ext_use_f16_nwg64(op) ? 64 : 32;
         const int64_t ne01_max = std::min(ne01, 32);
 
         // temp buffer for writing the results from each workgroup
@@ -2838,7 +2848,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
-        const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
+        const bool use_q16 =
+            op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+            ne00 == 128 && ne20 == 128 &&
+            ne01 >= 64 && ne12 > 0 && ne02/ne12 >= 8;
+        const int nqptg = use_q16 ? 16 : OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
 
         GGML_ASSERT(nqptg <= 32);
@@ -2987,7 +3001,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(
-            lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_q8_f16);
+            lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nqptg, use_q8_f16);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3093,9 +3107,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nwg = 1;
             nsg = 4;
         } else {
-            nwg = 32;
+            const int64_t nsg_max =
+                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+                ne00 == 128 && ne20 == 128 &&
+                ne01 == 1 && gqa_ratio >= 8 ? 2 : 4;
+
+            nwg = ggml_metal_op_flash_attn_ext_use_f16_nwg64(op) ? 64 : 32;
             nsg = 1;
-            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
+            while (2*nwg*nsg*ncpsg < ne11 && nsg < nsg_max) {
                 nsg *= 2;
             }
         }
@@ -3195,7 +3214,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*std::min(nwg, 32), 1, 1);
             }
         }
 #undef FATTN_SMEM
