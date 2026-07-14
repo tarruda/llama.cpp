@@ -2556,11 +2556,16 @@ static bool ggml_metal_op_flash_attn_ext_use_q8_f16(const ggml_tensor * op) {
         n_head_kv > 0 && n_head % n_head_kv == 0 && n_head/n_head_kv >= 8;
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_f16_attn(const ggml_tensor * op) {
+    return (op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16) ||
+        ggml_metal_op_flash_attn_ext_use_q8_f16(op);
+}
+
 static bool ggml_metal_op_flash_attn_ext_use_f16_nwg64(const ggml_tensor * op) {
     const int64_t n_head    = op->src[0]->ne[2];
     const int64_t n_head_kv = op->src[1]->ne[2];
 
-    return op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+    return ggml_metal_op_flash_attn_ext_use_f16_attn(op) &&
         op->src[0]->ne[0] == 128 && op->src[2]->ne[0] == 128 &&
         op->src[0]->ne[1] == 1 && op->src[1]->ne[1] >= 16384 &&
         n_head_kv > 0 && n_head % n_head_kv == 0 && n_head/n_head_kv >= 8;
@@ -2849,7 +2854,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
         const bool use_q16 =
-            op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+            ggml_metal_op_flash_attn_ext_use_f16_attn(op) &&
             ne00 == 128 && ne20 == 128 &&
             ne01 >= 64 && ne12 > 0 && ne02/ne12 >= 8;
         const int nqptg = use_q16 ? 16 : OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
@@ -3108,7 +3113,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nsg = 4;
         } else {
             const int64_t nsg_max =
-                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+                ggml_metal_op_flash_attn_ext_use_f16_attn(op) &&
                 ne00 == 128 && ne20 == 128 &&
                 ne01 == 1 && gqa_ratio >= 8 ? 2 : 4;
 
