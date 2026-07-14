@@ -2546,8 +2546,9 @@ static bool ggml_metal_op_flash_attn_ext_use_q8_f16(const ggml_tensor * op) {
 
     const bool use_decode = n_query == 1;
     const bool use_prompt = n_query >= 64;
+    const bool use_head_size = op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256;
 
-    return op->src[0]->ne[0] == 256 && op->src[1]->ne[0] == 256 && op->src[2]->ne[0] == 256 &&
+    return use_head_size && op->src[1]->ne[0] == op->src[0]->ne[0] && op->src[2]->ne[0] == op->src[0]->ne[0] &&
         n_kv >= 1024 && (use_decode || use_prompt) &&
         op->src[1]->ne[1] == op->src[2]->ne[1] &&
         op->src[1]->ne[2] == op->src[2]->ne[2] &&
