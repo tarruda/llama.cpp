@@ -1080,6 +1080,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "DSV4_COMPRESS",
+    "DSV4_TOP_K_MASK",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1101,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1196,6 +1198,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "dsv4_compress(kv_state, score_state, read_idxs)",
+    "dsv4_top_k_mask(raw_mask, comp_mask, comp_idx)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1217,7 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6407,6 +6411,75 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+// ggml_dsv4_compress
+
+struct ggml_tensor * ggml_dsv4_compress(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv_state,
+        struct ggml_tensor  * score_state,
+        struct ggml_tensor  * read_idxs,
+        int32_t               ratio,
+        bool                  overlap) {
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(read_idxs->type   == GGML_TYPE_I32);
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
+    GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
+    GGML_ASSERT(kv_state->ne[2] == 1 && kv_state->ne[3] == 1);
+    GGML_ASSERT(score_state->ne[2] == 1 && score_state->ne[3] == 1);
+    GGML_ASSERT(read_idxs->ne[1] == 1 && read_idxs->ne[2] == 1 && read_idxs->ne[3] == 1);
+
+    const int64_t n_read_per_block = (overlap ? 2 : 1)*ratio;
+    GGML_ASSERT(read_idxs->ne[0] % n_read_per_block == 0);
+
+    const int64_t n_blocks = read_idxs->ne[0]/n_read_per_block;
+    const int64_t n_embd   = overlap ? kv_state->ne[0]/2 : kv_state->ne[0];
+
+    GGML_ASSERT(n_blocks > 0 && n_embd > 0);
+    GGML_ASSERT(kv_state->ne[0] == (overlap ? 2 : 1)*n_embd);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, overlap ? 1 : 0);
+
+    result->op     = GGML_OP_DSV4_COMPRESS;
+    result->src[0] = kv_state;
+    result->src[1] = score_state;
+    result->src[2] = read_idxs;
+
+    return result;
+}
+
+// ggml_dsv4_top_k_mask
+
+struct ggml_tensor * ggml_dsv4_top_k_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx) {
+    GGML_ASSERT(raw_mask->type  == GGML_TYPE_F16);
+    GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_idx->type  == GGML_TYPE_I32);
+    GGML_ASSERT(raw_mask->ne[2] == 1 && comp_mask->ne[2] == 1 && comp_idx->ne[2] == 1);
+    GGML_ASSERT(raw_mask->ne[1] == comp_mask->ne[1]);
+    GGML_ASSERT(raw_mask->ne[1] == comp_idx->ne[1]);
+    GGML_ASSERT(raw_mask->ne[3] == comp_mask->ne[3]);
+    GGML_ASSERT(raw_mask->ne[3] == comp_idx->ne[3]);
+    GGML_ASSERT(comp_idx->ne[0] <= comp_mask->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+            raw_mask->ne[0] + comp_mask->ne[0], raw_mask->ne[1], 1, raw_mask->ne[3]);
+
+    result->op     = GGML_OP_DSV4_TOP_K_MASK;
+    result->src[0] = raw_mask;
+    result->src[1] = comp_mask;
+    result->src[2] = comp_idx;
+
+    return result;
+}
+
 // ggml_dsv4_sparse_pack
 
 struct ggml_tensor * ggml_dsv4_sparse_pack(
@@ -6428,7 +6501,8 @@ struct ggml_tensor * ggml_dsv4_sparse_pack(
     const int64_t nq       = raw_mask->ne[1];
     const int64_t nk       = n_raw + comp_idx->ne[0];
 
-    GGML_ASSERT(n_raw > 0 && n_raw <= raw_k->ne[2]);
+    GGML_ASSERT(n_raw >= 0 && n_raw <= raw_k->ne[2]);
+    GGML_ASSERT(nk > 0);
     GGML_ASSERT(comp_k->ne[0] == d);
     GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
     GGML_ASSERT(comp_k->ne[3] == n_stream);
