@@ -79,6 +79,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_sparse_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_SPARSE_PACK,
+    /*.name             =*/ "fused DeepSeek V4 sparse attention packing",
+    /*.n_tokens_per_seq =*/ 512,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -257,6 +263,9 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_dsv4_sparse = true;
+    cparams.auto_fdsv4_sparse = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -570,6 +579,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fdsv4_sparse) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 sparse attention support:\n", func);
+        resolve(llm_fused_op_dsv4_sparse_probe, cparams.fused_dsv4_sparse);
+        cparams.auto_fdsv4_sparse = false;
     }
 }
 
