@@ -144,20 +144,19 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     // detailed check of the elements of the block
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
+        const short nq_mask = args.ne31 == 1 ? 1 : Q;
+        FOR_UNROLL (short j = 0; j < nq_mask; ++j) {
+            device const half * mask_src = (device const half *) (mask +
+                    ((i1*Q + j)%args.ne31)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                 mmin = min(mmin, mask_src[ii*NW]);
                 mmax = max(mmax, mask_src[ii*NW]);
             }
-
-            mask_src += args.nb31/2;
         }
 
         mmin = simd_min(mmin);
@@ -187,6 +186,7 @@ constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
+constant bool FC_flash_attn_ext_scan_mask [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -297,7 +297,7 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = (device const half2 *) ((device const char *) mask + ((iq1 + j)%args.ne31)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
     {
@@ -401,7 +401,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         pm2[jj] = (device const half2 *) ((device const half *) mask +
-                                (iq1 + j)*C +
+                                ((iq1 + j)%args.ne31)*C +
                                 (iq2%args.ne32)*(C*args.ne31) +
                                 (iq3%args.ne33)*(C*args.ne31*args.ne32));
                     }
@@ -414,7 +414,7 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                blk_cur = FC_flash_attn_ext_scan_mask ? blk[ic0] : 1;
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -429,7 +429,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            sm2[j*SH + tiisg] = args.ne31 == 1 || (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
                         }
@@ -792,7 +792,8 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1 + j : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -1205,7 +1206,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        device const half * pm_base = (device const half *) (mask + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         float slope = 1.0f;
 
@@ -1231,7 +1232,7 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 // padded query rows clamp to row 0 of the mask to avoid OOB; their scores
                 // are forced to -inf below, so the values never affect the result.
-                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? ((iq1*Q + qq)%args.ne31)*args.nb31/sizeof(half) : 0);
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -1255,7 +1256,7 @@ kernel void kernel_flash_attn_ext_vec(
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
-                            (iq1*Q + qq)*C +
+                            ((iq1*Q + qq)%args.ne31)*C +
                             (iq2%args.ne32)*(C*args.ne31) +
                             (iq3%args.ne33)*(C*args.ne31*args.ne32);
                     }
@@ -1504,7 +1505,8 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1*Q + qq : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 

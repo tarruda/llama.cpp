@@ -422,6 +422,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
@@ -457,6 +458,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
@@ -1273,6 +1275,28 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_batch;
+    int32_t  n_raw;
+    int32_t  n_raw_k;
+    int32_t  n_comp;
+    uint64_t nb_rk2;
+    uint64_t nb_rk3;
+    uint64_t nb_ck2;
+    uint64_t nb_ck3;
+    uint64_t nb_rm0;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm0;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci0;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_sparse_pack;
 
 typedef struct {
     int32_t  ne00;

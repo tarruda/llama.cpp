@@ -67,6 +67,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     const char * op_str = "undefined";
     switch (op) {
         case GGML_OP_ADD_ID: op_str = "add_id"; break;
+        case GGML_OP_DSV4_SPARSE_PACK: op_str = "dsv4_sparse_pack"; break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -1534,6 +1535,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
 
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool scan_mask = has_mask && op->src[3]->ne[1] != 1;
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
             "flash_attn_ext",
@@ -1541,7 +1543,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_scanm=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
             has_mask,
             has_sinks,
@@ -1549,6 +1551,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             has_scap,
             has_kvpad,
             bc_mask,
+            scan_mask,
             ns10,
             ns20,
             nsg);
@@ -1564,6 +1567,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT + 4);
 
         ggml_metal_cv_set_bool(cv, bc_mask, FC_FLASH_ATTN_EXT + 10);
+        ggml_metal_cv_set_bool(cv, scan_mask, FC_FLASH_ATTN_EXT + 11);
 
         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT + 20);
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);

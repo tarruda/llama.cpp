@@ -331,6 +331,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
             } break;
+        case GGML_OP_DSV4_SPARSE_PACK:
+            {
+                n_fuse = ggml_metal_op_dsv4_sparse_pack(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1521,6 +1525,56 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
         default:
             GGML_ABORT("fatal error");
     }
+
+    return 1;
+}
+
+int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    GGML_ASSERT(op->op == GGML_OP_DSV4_SPARSE_PACK);
+
+    const ggml_tensor * raw_k     = op->src[0];
+    const ggml_tensor * comp_k    = op->src[1];
+    const ggml_tensor * raw_mask  = op->src[2];
+    const ggml_tensor * comp_mask = op->src[3];
+    const ggml_tensor * comp_idx  = op->src[4];
+
+    ggml_metal_kargs_dsv4_sparse_pack args = {
+        /*.n_embd  =*/ (int32_t) raw_k->ne[0],
+        /*.n_batch =*/ (int32_t) raw_mask->ne[1],
+        /*.n_raw   =*/ ggml_get_op_params_i32(op, 0),
+        /*.n_raw_k =*/ (int32_t) raw_k->ne[2],
+        /*.n_comp  =*/ (int32_t) comp_idx->ne[0],
+        /*.nb_rk2  =*/ raw_k->nb[2],
+        /*.nb_rk3  =*/ raw_k->nb[3],
+        /*.nb_ck2  =*/ comp_k->nb[2],
+        /*.nb_ck3  =*/ comp_k->nb[3],
+        /*.nb_rm0  =*/ raw_mask->nb[0],
+        /*.nb_rm1  =*/ raw_mask->nb[1],
+        /*.nb_rm3  =*/ raw_mask->nb[3],
+        /*.nb_cm0  =*/ comp_mask->nb[0],
+        /*.nb_cm1  =*/ comp_mask->nb[1],
+        /*.nb_cm3  =*/ comp_mask->nb[3],
+        /*.nb_ci0  =*/ comp_idx->nb[0],
+        /*.nb_ci1  =*/ comp_idx->nb[1],
+        /*.nb_ci3  =*/ comp_idx->nb[3],
+        /*.nb_d1   =*/ op->nb[1],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    for (int i = 0; i < 5; ++i) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), i + 1);
+    }
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
+
+    // Four 256-thread packers can reside per core; a 512-thread group only
+    // allows two and exposes the random selected-row reads to more latency.
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, nth, 1, 1);
 
     return 1;
 }
@@ -3056,8 +3110,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne12 == ne22);
 
     GGML_ASSERT(!op->src[3] || op->src[3]->type == GGML_TYPE_F16);
-    GGML_ASSERT(!op->src[3] || op->src[3]->ne[1] >= op->src[0]->ne[1] &&
-            "the Flash-Attention Metal kernel requires the mask to be at least n_queries big");
+    GGML_ASSERT(!op->src[3] || op->src[3]->ne[1] == 1 || op->src[3]->ne[1] >= op->src[0]->ne[1]);
 
     float scale;
     float max_bias;
@@ -3075,6 +3128,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool has_sinks = op->src[4] != NULL;
     const bool has_bias  = max_bias != 0.0f;
     const bool has_scap  = logit_softcap != 0.0f;
+    const bool sinks_rows = ggml_get_op_params_i32(op, 4);
 
     const uint32_t n_head      = op->src[0]->ne[2];
     const  int32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
@@ -3257,7 +3311,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             need_sync = true;
         }
 
-        if (has_mask) {
+        if (has_mask && op->src[3]->ne[1] != 1) {
             assert(ggml_metal_op_flash_attn_ext_extra_blk(op) != 0);
 
             ggml_metal_kargs_flash_attn_ext_blk args0 = {
@@ -3356,6 +3410,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m0            =*/ m0,
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
+            /*.sinks_rows    =*/ sinks_rows,
             /*.logit_softcap =*/ logit_softcap,
         };
 
@@ -3509,6 +3564,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m0            =*/ m0,
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
+            /*.sinks_rows    =*/ sinks_rows,
             /*.logit_softcap =*/ logit_softcap,
         };
 
