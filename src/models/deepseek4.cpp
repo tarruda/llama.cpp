@@ -693,6 +693,59 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+
+    // The Lightning Indexer selects a different compressed working set for every
+    // token. Reinterpret the 64 attention heads as query rows of one MQA problem
+    // per token so Metal's tiled flash-attention kernel consumes only those keys.
+    // Dense FA remains faster for decode/small caches; auto probing forces this
+    // branch once during setup so unsupported layer devices can disable it.
+    const bool sparse_probe = cparams.auto_fdsv4_sparse;
+    const bool sparse_prefill = q->ne[2] >= 8 && n_csa > (int64_t) hparams.indexer_top_k;
+    if (cparams.fused_dsv4_sparse && cparams.flash_attn &&
+            raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16 &&
+            (sparse_probe || sparse_prefill)) {
+        const int64_t n_stream = csa_k->ne[3];
+        const int64_t nq       = q->ne[2]/n_stream;
+        const int64_t nt       = q->ne[2];
+        const int64_t n_head   = q->ne[1];
+        const int64_t n_raw    = std::min<int64_t>(hparams.n_swa, raw_k->ne[2]);
+
+        GGML_ASSERT(q->ne[0] == raw_k->ne[0]);
+        GGML_ASSERT(raw_k->ne[1] == 1 && csa_k->ne[1] == 1);
+        GGML_ASSERT(raw_k->ne[3] == n_stream);
+        GGML_ASSERT(raw_mask->ne[1] == nq && raw_mask->ne[3] == n_stream);
+        GGML_ASSERT(inp_csa.kq_mask->ne[1] == nq && inp_csa.kq_mask->ne[3] == n_stream);
+
+        ggml_tensor * packed = ggml_dsv4_sparse_pack(ctx0, raw_k, csa_k, raw_mask,
+                inp_csa.kq_mask, top_k, n_raw);
+        cb(packed, "csa_sparse_pack", il);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_SPARSE_PACK, packed, il});
+
+        const int64_t nk = n_raw + top_k->ne[0];
+        ggml_tensor * k_sel = ggml_view_4d(ctx0, packed, q->ne[0], nk, 1, nt,
+                q->ne[0]*sizeof(ggml_fp16_t), q->ne[0]*nk*sizeof(ggml_fp16_t), packed->nb[1], 0);
+        ggml_tensor * mask_sel = ggml_view_4d(ctx0, packed, nk, 1, 1, nt,
+                nk*sizeof(ggml_fp16_t), nk*sizeof(ggml_fp16_t), packed->nb[1],
+                q->ne[0]*nk*sizeof(ggml_fp16_t));
+        cb(k_sel, "csa_sparse_k", il);
+        cb(mask_sel, "csa_sparse_mask", il);
+
+        ggml_tensor * q_fa = ggml_reshape_4d(ctx0, q, q->ne[0], n_head, 1, nt);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx0, q_fa, k_sel, k_sel, mask_sel, kq_scale,
+                hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_add_sinks_rows(out, sinks);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out, il});
+        out = ggml_reshape_2d(ctx0, out, q->ne[0]*n_head, nt);
+        ggml_build_forward_expand(gf, out);
+
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        cb(out, "attn_csa_lid_sparse", il);
+        return out;
+    }
+
     ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
 
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
