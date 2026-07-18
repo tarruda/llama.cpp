@@ -48,6 +48,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_dsv4_sparse; // use indexed sparse attention packing for DSV4 prefill
+    bool auto_fdsv4_sparse;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

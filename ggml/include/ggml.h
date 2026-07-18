@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_SPARSE_PACK,
 
         GGML_OP_UNARY,
 
@@ -2454,8 +2455,14 @@ extern "C" {
             const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
-            struct ggml_tensor * a,
-            struct ggml_tensor * sinks);
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks);
+
+    // Like ggml_flash_attn_ext_add_sinks(), but indexes sinks by the query-row
+    // dimension instead of the attention-head dimension.
+    GGML_API void ggml_flash_attn_ext_add_sinks_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
@@ -2621,6 +2628,17 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // Packs per-token raw-window and Lightning-Indexer selections into the
+    // strided K + mask storage consumed by DeepSeek V4 sparse flash attention.
+    GGML_API struct ggml_tensor * ggml_dsv4_sparse_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * comp_k,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx,
+            int64_t               n_raw);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
