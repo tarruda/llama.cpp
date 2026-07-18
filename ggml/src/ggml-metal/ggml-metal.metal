@@ -6016,6 +6016,119 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+// DSV4's Lightning Indexer selects 512 entries from a much longer score row.
+// A full bitonic sort spends most of its time ordering entries that are thrown
+// away. Find the exact 512th score with an MSD radix selection, collect that
+// partition, then sort only the retained 512 indices.
+kernel void kernel_top_k_radix_f32_i32(
+        constant ggml_metal_kargs_argsort & args,
+        device const char    * src0,
+        device       int32_t * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr ushort radix = 16;
+    constexpr ushort n_top = 512;
+
+    threadgroup atomic_uint histogram[radix];
+    threadgroup atomic_uint n_selected;
+    threadgroup uint prefix;
+    threadgroup uint rank;
+    threadgroup int32_t selected[n_top];
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+    device const float * row = (device const float *) (src0 +
+            args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+
+    if (tiitg == 0) {
+        prefix = 0;
+        rank = n_top - 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Flip IEEE-754 keys into monotonically increasing unsigned integers.
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        if (tiitg < radix) {
+            atomic_store_explicit(&histogram[tiitg], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint mask = shift == 28 ? 0u : 0xffffffffu << (shift + 4);
+        for (int i = tiitg; i < args.ne00; i += ntg.x) {
+            const uint bits = as_type<uint>(row[i]);
+            const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+            if ((key & mask) == prefix) {
+                atomic_fetch_add_explicit(&histogram[(key >> shift) & 0xfu], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiitg == 0) {
+            uint r = rank;
+            for (int digit = radix - 1; digit >= 0; --digit) {
+                const uint count = atomic_load_explicit(&histogram[digit], memory_order_relaxed);
+                if (r < count) {
+                    prefix |= uint(digit) << shift;
+                    rank = r;
+                    break;
+                }
+                r -= count;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiitg == 0) {
+        atomic_store_explicit(&n_selected, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < args.ne00; i += ntg.x) {
+        const uint bits = as_type<uint>(row[i]);
+        const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+        if (key > prefix) {
+            const uint pos = atomic_fetch_add_explicit(&n_selected, 1u, memory_order_relaxed);
+            if (pos < n_top) {
+                selected[pos] = i;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < args.ne00; i += ntg.x) {
+        const uint bits = as_type<uint>(row[i]);
+        const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+        if (key == prefix) {
+            const uint pos = atomic_fetch_add_explicit(&n_selected, 1u, memory_order_relaxed);
+            if (pos < n_top) {
+                selected[pos] = i;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Restore TOP_K's descending-order contract for the retained partition.
+    const int col = tiitg;
+    for (int k = 2; k <= n_top; k *= 2) {
+        for (int j = k/2; j > 0; j /= 2) {
+            const int ixj = col ^ j;
+            if (ixj > col) {
+                const float lhs = row[selected[col]];
+                const float rhs = row[selected[ixj]];
+                if (((col & k) == 0 && lhs < rhs) || ((col & k) != 0 && lhs > rhs)) {
+                    SWAP(selected[col], selected[ixj]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    dst += args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+    dst[col] = selected[col];
+}
+
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
         device const char    * src0,
@@ -6268,20 +6381,19 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     // detailed check of the elements of the block
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
+        const short nq_mask = args.ne31 == 1 ? 1 : Q;
+        FOR_UNROLL (short j = 0; j < nq_mask; ++j) {
+            device const half * mask_src = (device const half *) (mask +
+                    ((i1*Q + j)%args.ne31)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                 mmin = min(mmin, mask_src[ii*NW]);
                 mmax = max(mmax, mask_src[ii*NW]);
             }
-
-            mask_src += args.nb31/2;
         }
 
         mmin = simd_min(mmin);
@@ -6311,6 +6423,7 @@ constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
+constant bool FC_flash_attn_ext_scan_mask [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -6421,7 +6534,7 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = (device const half2 *) ((device const char *) mask + ((iq1 + j)%args.ne31)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
     {
@@ -6525,7 +6638,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         pm2[jj] = (device const half2 *) ((device const half *) mask +
-                                (iq1 + j)*C +
+                                ((iq1 + j)%args.ne31)*C +
                                 (iq2%args.ne32)*(C*args.ne31) +
                                 (iq3%args.ne33)*(C*args.ne31*args.ne32));
                     }
@@ -6538,7 +6651,7 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                blk_cur = FC_flash_attn_ext_scan_mask ? blk[ic0] : 1;
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -6553,7 +6666,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            sm2[j*SH + tiisg] = args.ne31 == 1 || (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
                         }
@@ -6916,7 +7029,8 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1 + j : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -7315,7 +7429,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        device const half * pm = (device const half *) (mask + (iq1%args.ne31)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         float slope = 1.0f;
 
@@ -7355,7 +7469,7 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     pm = (device const half *) (mask) +
-                        iq1*C +
+                        (iq1%args.ne31)*C +
                         (iq2%args.ne32)*(C*args.ne31) +
                         (iq3%args.ne33)*(C*args.ne31*args.ne32);
                 }
@@ -7560,7 +7674,8 @@ kernel void kernel_flash_attn_ext_vec(
 
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             const float m = M;
-            const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+            const int sink_idx = args.sinks_rows ? iq1 : iq2;
+            const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
             M = simd_max(max(M, s));
 
@@ -11385,6 +11500,96 @@ kernel void kernel_dsv4_hc_post_f32(
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
+}
+
+// One threadgroup owns one token.  The Lightning-Indexer selection is shared by
+// all 64 attention heads, so every cache row is fetched once and packed next to
+// a head-broadcast mask.  This layout lets the regular tiled FA kernel treat the
+// heads as query rows without materializing any dense top-k mask.
+kernel void kernel_dsv4_sparse_pack(
+        constant ggml_metal_kargs_dsv4_sparse_pack & args,
+        device const char * raw_k,
+        device const char * comp_k,
+        device const char * raw_mask,
+        device const char * comp_mask,
+        device const char * comp_idx,
+        device       char * dst,
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    constexpr int max_selected = 128 + 512;
+    threadgroup int  selected_idx[max_selected];
+    threadgroup half selected_mask[max_selected];
+
+    const int iq = tgpig % args.n_batch;
+    const int is = tgpig / args.n_batch;
+    const int nk = args.n_raw + args.n_comp;
+
+    device half * out = (device half *) (dst + (uint64_t) tgpig*args.nb_d1);
+    device half * out_k = out;
+    device half * out_m = out + args.n_embd*nk;
+
+    // Selection indices and masks are shared by every embedding lane/head. Load
+    // them once per token instead of issuing up to 512 identical device reads.
+    // The raw SWA mask has at most n_raw finite entries. Avoid a separate F32
+    // cast + top-k dispatch by compacting those entries directly here.
+    if (tiitg == 0) {
+        int n = 0;
+        for (int idx = 0; idx < args.n_raw_k && n < args.n_raw; ++idx) {
+            const half m = *(device const half *) (raw_mask +
+                    (uint64_t) idx*args.nb_rm0 + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
+            if (isfinite(m)) {
+                selected_idx[n] = idx;
+                selected_mask[n] = m;
+                ++n;
+            }
+        }
+        for (; n < args.n_raw; ++n) {
+            selected_idx[n] = -1;
+            selected_mask[n] = -INFINITY;
+        }
+    }
+    for (int i = tiitg; i < args.n_comp; i += ntg) {
+        const int oi = args.n_raw + i;
+        const int idx = *(device const int *) (comp_idx +
+                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+        selected_idx[oi] = idx;
+        selected_mask[oi] = *(device const half *) (comp_mask +
+                (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = 0; i < args.n_raw; ++i) {
+        const int idx = selected_idx[i];
+        if (idx >= 0) {
+            device const half * src = (device const half *) (raw_k +
+                    (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
+            for (int e = tiitg; e < args.n_embd; e += ntg) {
+                out_k[i*args.n_embd + e] = src[e];
+            }
+        } else {
+            for (int e = tiitg; e < args.n_embd; e += ntg) {
+                out_k[i*args.n_embd + e] = 0.0h;
+            }
+        }
+        if (tiitg == 0) {
+            out_m[i] = selected_mask[i];
+        }
+    }
+
+    for (int i = 0; i < args.n_comp; ++i) {
+        const int oi = args.n_raw + i;
+        const int idx = selected_idx[oi];
+        device const half * src = (device const half *) (comp_k +
+                (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+        for (int e = tiitg; e < args.n_embd; e += ntg) {
+            out_k[oi*args.n_embd + e] = src[e];
+        }
+        if (tiitg == 0) {
+            out_m[oi] = selected_mask[oi];
+        }
+    }
+
 }
 
 constexpr constant short LI_N_EMBD = 128;
