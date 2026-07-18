@@ -62,6 +62,18 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMPRESS,
+    /*.name             =*/ "fused DeepSeek V4 compressor",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_TOP_K_MASK,
+    /*.name             =*/ "fused DeepSeek V4 top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -241,6 +253,10 @@ llama_context::llama_context(
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
+
+    cparams.fused_dsv4_compress   = true;
+    cparams.fused_dsv4_top_k_mask = true;
+    cparams.auto_fdsv4_aux        = true;
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
@@ -590,6 +606,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 sparse attention support:\n", func);
         resolve(llm_fused_op_dsv4_sparse_probe, cparams.fused_dsv4_sparse);
         cparams.auto_fdsv4_sparse = false;
+    }
+
+    if (cparams.auto_fdsv4_aux) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 auxiliary ops support:\n", func);
+        resolve(llm_fused_op_dsv4_compress_probe,   cparams.fused_dsv4_compress);
+        resolve(llm_fused_op_dsv4_top_k_mask_probe, cparams.fused_dsv4_top_k_mask);
+        cparams.auto_fdsv4_aux = false;
     }
 }
 
