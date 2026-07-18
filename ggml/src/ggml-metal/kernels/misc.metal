@@ -594,10 +594,110 @@ kernel void kernel_dsv4_hc_post_f32(
     }
 }
 
-// One threadgroup owns one token.  The Lightning-Indexer selection is shared by
-// all 64 attention heads, so every cache row is fetched once and packed next to
-// a head-broadcast mask.  This layout lets the regular tiled FA kernel treat the
-// heads as query rows without materializing any dense top-k mask.
+// Fuse the get_rows, softmax, multiply and reduction sequence used by the DSV4
+// compressors. One threadgroup owns a contiguous embedding tile for one output
+// block, so its row plan is loaded once into threadgroup memory and all state
+// reads remain coalesced across embedding lanes.
+kernel void kernel_dsv4_compress(
+        constant ggml_metal_kargs_dsv4_compress & args,
+        device const char * kv_state,
+        device const char * score_state,
+        device const char * read_idxs,
+        device       char * dst,
+        threadgroup int32_t * idxs [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int n_read = (args.overlap ? 2 : 1)*args.ratio;
+    const int ib = tgpig.y;
+
+    for (int j = tiitg; j < n_read; j += ntg.x) {
+        const bool cur_half = args.overlap && j >= args.ratio;
+        const int jr = cur_half ? j - args.ratio : j;
+        const int idx_pos = (cur_half ? args.ratio*args.n_blocks : 0) + ib*args.ratio + jr;
+        idxs[j] = *(device const int32_t *) (read_idxs + idx_pos*args.nb_i0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int i0 = tgpig.x*ntg.x + tiitg;
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    float score_max = -INFINITY;
+    for (int j = 0; j < n_read; ++j) {
+        const int idx = idxs[j];
+        if (idx < 0 || idx >= args.n_rows) {
+            continue;
+        }
+
+        const bool cur_half = args.overlap && j >= args.ratio;
+        const int i_src = (cur_half ? args.n_embd : 0) + i0;
+        const float score = *(device const float *) (score_state + i_src*args.nb_s0 + idx*args.nb_s1);
+        score_max = max(score_max, score);
+    }
+
+    float sum_v = 0.0f;
+    float sum_w = 0.0f;
+    if (score_max != -INFINITY) {
+        for (int j = 0; j < n_read; ++j) {
+            const int idx = idxs[j];
+            if (idx < 0 || idx >= args.n_rows) {
+                continue;
+            }
+
+            const bool cur_half = args.overlap && j >= args.ratio;
+            const int i_src = (cur_half ? args.n_embd : 0) + i0;
+            const float score = *(device const float *) (score_state + i_src*args.nb_s0 + idx*args.nb_s1);
+            const float weight = exp(score - score_max);
+            const float value = *(device const float *) (kv_state + i_src*args.nb_k0 + idx*args.nb_k1);
+            sum_v += value*weight;
+            sum_w += weight;
+        }
+    }
+
+    *(device float *) (dst + i0*args.nb_d0 + ib*args.nb_d1) = sum_w > 0.0f ? sum_v/sum_w : 0.0f;
+}
+
+// Materialize raw visibility and the Lightning-Indexer selection in one pass.
+// TOP_K indices are unique, so selected rows can overwrite the initial -INF
+// fill without atomics after a single threadgroup barrier.
+kernel void kernel_dsv4_top_k_mask(
+        constant ggml_metal_kargs_dsv4_top_k_mask & args,
+        device const char * raw_mask,
+        device const char * comp_mask,
+        device const char * comp_idx,
+        device       char * dst,
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int iq = tgpig % args.n_query;
+    const int is = tgpig / args.n_query;
+
+    device const half * rm = (device const half *) (raw_mask + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
+    device const half * cm = (device const half *) (comp_mask + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+    device const int  * ci = (device const int  *) (comp_idx + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+    device       half * out = (device half *) (dst + (uint64_t) iq*args.nb_d1 + (uint64_t) is*args.nb_d3);
+
+    for (int i = tiitg; i < args.n_raw; i += ntg) {
+        out[i] = rm[i];
+    }
+    for (int i = tiitg; i < args.n_comp; i += ntg) {
+        out[args.n_raw + i] = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (int i = tiitg; i < args.n_select; i += ntg) {
+        const int idx = ci[i];
+        if (idx >= 0 && idx < args.n_comp) {
+            out[args.n_raw + idx] = cm[idx];
+        }
+    }
+}
+
+// Prefill assigns one threadgroup per token. Decode's compressed-only mode
+// assigns one threadgroup per selected row to expose enough random-read
+// parallelism. The packed masks remain adjacent to the F16 key storage.
 kernel void kernel_dsv4_sparse_pack(
         constant ggml_metal_kargs_dsv4_sparse_pack & args,
         device const char * raw_k,
@@ -606,18 +706,40 @@ kernel void kernel_dsv4_sparse_pack(
         device const char * comp_mask,
         device const char * comp_idx,
         device       char * dst,
-        uint    tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
+        ushort3  ntg[[threads_per_threadgroup]]) {
     constexpr int max_selected = 128 + 512;
     threadgroup int  selected_idx[max_selected];
     threadgroup half selected_mask[max_selected];
 
-    const int iq = tgpig % args.n_batch;
-    const int is = tgpig / args.n_batch;
+    if (args.n_raw == 0) {
+        const int i  = tgpig.x;
+        const int it = tgpig.y;
+        const int iq = it % args.n_batch;
+        const int is = it / args.n_batch;
+        const int idx = *(device const int *) (comp_idx +
+                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+
+        device const half * src = (device const half *) (comp_k +
+                (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+        device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
+        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
+            out[i*args.n_embd + e] = src[e];
+        }
+        if (tiitg == 0) {
+            out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
+                    (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+        }
+        return;
+    }
+
+    const int it = tgpig.x;
+    const int iq = it % args.n_batch;
+    const int is = it / args.n_batch;
     const int nk = args.n_raw + args.n_comp;
 
-    device half * out = (device half *) (dst + (uint64_t) tgpig*args.nb_d1);
+    device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
     device half * out_k = out;
     device half * out_m = out + args.n_embd*nk;
 
@@ -641,7 +763,7 @@ kernel void kernel_dsv4_sparse_pack(
             selected_mask[n] = -INFINITY;
         }
     }
-    for (int i = tiitg; i < args.n_comp; i += ntg) {
+    for (int i = tiitg; i < args.n_comp; i += ntg.x) {
         const int oi = args.n_raw + i;
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
@@ -656,11 +778,11 @@ kernel void kernel_dsv4_sparse_pack(
         if (idx >= 0) {
             device const half * src = (device const half *) (raw_k +
                     (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
-            for (int e = tiitg; e < args.n_embd; e += ntg) {
+            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
                 out_k[i*args.n_embd + e] = src[e];
             }
         } else {
-            for (int e = tiitg; e < args.n_embd; e += ntg) {
+            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
                 out_k[i*args.n_embd + e] = 0.0h;
             }
         }
@@ -674,7 +796,7 @@ kernel void kernel_dsv4_sparse_pack(
         const int idx = selected_idx[oi];
         device const half * src = (device const half *) (comp_k +
                 (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
-        for (int e = tiitg; e < args.n_embd; e += ntg) {
+        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
             out_k[oi*args.n_embd + e] = src[e];
         }
         if (tiitg == 0) {

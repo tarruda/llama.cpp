@@ -1248,6 +1248,36 @@ typedef struct {
 
 typedef struct {
     int32_t  n_embd;
+    int32_t  n_blocks;
+    int32_t  n_rows;
+    int32_t  ratio;
+    int32_t  overlap;
+    uint64_t nb_k0;
+    uint64_t nb_k1;
+    uint64_t nb_s0;
+    uint64_t nb_s1;
+    uint64_t nb_i0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_compress;
+
+typedef struct {
+    int32_t  n_raw;
+    int32_t  n_comp;
+    int32_t  n_select;
+    int32_t  n_query;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_dsv4_top_k_mask;
+
+typedef struct {
+    int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;
     uint64_t nb_x1;
