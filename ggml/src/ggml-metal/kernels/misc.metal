@@ -593,3 +593,93 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// One threadgroup owns one token.  The Lightning-Indexer selection is shared by
+// all 64 attention heads, so every cache row is fetched once and packed next to
+// a head-broadcast mask.  This layout lets the regular tiled FA kernel treat the
+// heads as query rows without materializing any dense top-k mask.
+kernel void kernel_dsv4_sparse_pack(
+        constant ggml_metal_kargs_dsv4_sparse_pack & args,
+        device const char * raw_k,
+        device const char * comp_k,
+        device const char * raw_mask,
+        device const char * comp_mask,
+        device const char * comp_idx,
+        device       char * dst,
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    constexpr int max_selected = 128 + 512;
+    threadgroup int  selected_idx[max_selected];
+    threadgroup half selected_mask[max_selected];
+
+    const int iq = tgpig % args.n_batch;
+    const int is = tgpig / args.n_batch;
+    const int nk = args.n_raw + args.n_comp;
+
+    device half * out = (device half *) (dst + (uint64_t) tgpig*args.nb_d1);
+    device half * out_k = out;
+    device half * out_m = out + args.n_embd*nk;
+
+    // Selection indices and masks are shared by every embedding lane/head. Load
+    // them once per token instead of issuing up to 512 identical device reads.
+    // The raw SWA mask has at most n_raw finite entries. Avoid a separate F32
+    // cast + top-k dispatch by compacting those entries directly here.
+    if (tiitg == 0) {
+        int n = 0;
+        for (int idx = 0; idx < args.n_raw_k && n < args.n_raw; ++idx) {
+            const half m = *(device const half *) (raw_mask +
+                    (uint64_t) idx*args.nb_rm0 + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
+            if (isfinite(m)) {
+                selected_idx[n] = idx;
+                selected_mask[n] = m;
+                ++n;
+            }
+        }
+        for (; n < args.n_raw; ++n) {
+            selected_idx[n] = -1;
+            selected_mask[n] = -INFINITY;
+        }
+    }
+    for (int i = tiitg; i < args.n_comp; i += ntg) {
+        const int oi = args.n_raw + i;
+        const int idx = *(device const int *) (comp_idx +
+                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+        selected_idx[oi] = idx;
+        selected_mask[oi] = *(device const half *) (comp_mask +
+                (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = 0; i < args.n_raw; ++i) {
+        const int idx = selected_idx[i];
+        if (idx >= 0) {
+            device const half * src = (device const half *) (raw_k +
+                    (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
+            for (int e = tiitg; e < args.n_embd; e += ntg) {
+                out_k[i*args.n_embd + e] = src[e];
+            }
+        } else {
+            for (int e = tiitg; e < args.n_embd; e += ntg) {
+                out_k[i*args.n_embd + e] = 0.0h;
+            }
+        }
+        if (tiitg == 0) {
+            out_m[i] = selected_mask[i];
+        }
+    }
+
+    for (int i = 0; i < args.n_comp; ++i) {
+        const int oi = args.n_raw + i;
+        const int idx = selected_idx[oi];
+        device const half * src = (device const half *) (comp_k +
+                (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+        for (int e = tiitg; e < args.n_embd; e += ntg) {
+            out_k[oi*args.n_embd + e] = src[e];
+        }
+        if (tiitg == 0) {
+            out_m[oi] = selected_mask[oi];
+        }
+    }
+
+}
