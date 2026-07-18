@@ -67,6 +67,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     const char * op_str = "undefined";
     switch (op) {
         case GGML_OP_ADD_ID: op_str = "add_id"; break;
+        case GGML_OP_DSV4_COMPRESS: op_str = "dsv4_compress"; break;
+        case GGML_OP_DSV4_TOP_K_MASK: op_str = "dsv4_top_k_mask"; break;
         case GGML_OP_DSV4_SPARSE_PACK: op_str = "dsv4_sparse_pack"; break;
         default: GGML_ABORT("fatal error");
     };
@@ -1603,6 +1605,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         snprintf(qne_suffix, sizeof(qne_suffix), "_q%d_ne%d", nqpsg, ne);
     }
 
+    // DSV4 decode has a single 512-wide KV head, 64 query heads and a
+    // one-row top-k mask. Specialize per-row mask skipping to this signature
+    // so the extra checks cannot affect ordinary causal-attention kernels.
+    const bool sparse_mask = has_mask && has_sinks && dk == 512 && dv == 512 &&
+        op->src[0]->ne[1] == 1 && op->src[0]->ne[2] == 64 &&
+        op->src[1]->ne[2] == 1 && op->src[3]->ne[1] == 1 && op->src[4]->ne[0] == 64;
+
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d%s",
             "flash_attn_ext_vec",
             type,
@@ -1610,13 +1619,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dv,
             qne_suffix);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_mskip=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
             has_mask,
             has_sinks,
             has_bias,
             has_scap,
             has_kvpad,
+            sparse_mask,
             ns10,
             ns20,
             nsg, nwg);
@@ -1630,6 +1640,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT_VEC + 2);
         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_VEC + 3);
         ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT_VEC + 4);
+        ggml_metal_cv_set_bool(cv, sparse_mask, FC_FLASH_ATTN_EXT_VEC + 5);
 
         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT_VEC + 20);
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);

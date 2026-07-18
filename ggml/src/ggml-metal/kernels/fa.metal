@@ -1063,6 +1063,7 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+constant bool FC_flash_attn_ext_vec_sparse_mask [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 
 //constant float FC_flash_attn_ext_vec_scale         [[function_constant(FC_FLASH_ATTN_EXT_VEC + 10)]];
 //constant float FC_flash_attn_ext_vec_max_bias      [[function_constant(FC_FLASH_ATTN_EXT_VEC + 11)]];
@@ -1308,6 +1309,23 @@ kernel void kernel_flash_attn_ext_vec(
 
                 // each simdgroup processes Q queries and NE (NW/NL) cache elements
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                    bool active = true;
+                    if (FC_flash_attn_ext_vec_sparse_mask) {
+                        active = false;
+                        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                            FOR_UNROLL (short ii = 0; ii < NE; ++ii) {
+                                active |= sm[qq*C + cc*NE + ii] > -MAXHALF;
+                            }
+                        }
+                    }
+
+                    // The mask decision is uniform across the simdgroup. Avoid
+                    // loading a full K row when all NE logits in this group are
+                    // masked (notably DSV4's 512-of-N compressed selection).
+                    if (!active) {
+                        continue;
+                    }
+
                     if (is_same<kd4_t, k4_t>::value) {
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             const k4_t k_elem = pk4[cc*NE*NS10/4 + ii*NL];
@@ -1429,6 +1447,19 @@ kernel void kernel_flash_attn_ext_vec(
                     pv4 += ty*NS20/4 + tx;
 
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                        bool active = true;
+                        if (FC_flash_attn_ext_vec_sparse_mask) {
+                            active = false;
+                            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[qq*C + cc*NE + jj] != 0.0f;
+                                }
+                            }
+                        }
+                        if (!active) {
+                            continue;
+                        }
+
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             const v4_t v_elem = pv4[cc*NE*NS20/4 + ii*NL];
                             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
@@ -1438,6 +1469,19 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                        bool active = true;
+                        if (FC_flash_attn_ext_vec_sparse_mask) {
+                            active = false;
+                            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[qq*C + cc*NE + jj] != 0.0f;
+                                }
+                            }
+                        }
+                        if (!active) {
+                            continue;
+                        }
+
                         device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
