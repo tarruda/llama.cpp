@@ -571,6 +571,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_COMPRESS,
+        GGML_OP_DSV4_TOP_K_MASK,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2607,6 +2609,29 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // DeepSeek V4 compressor weighted reduction.
+    //
+    // kv_state, score_state: [overlap ? 2*n_embd : n_embd, n_rows]
+    // read_idxs:             [(overlap ? 2 : 1)*ratio*n_blocks]
+    // res:                   [n_embd, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * read_idxs,
+            int32_t               ratio,
+            bool                  overlap);
+
+    // Builds the raw + selected-compressed F16 attention mask in one pass.
+    // raw_mask:  [n_raw, n_query, 1, n_stream]
+    // comp_mask: [n_comp, n_query, 1, n_stream]
+    // comp_idx:  [n_select, n_query, 1, n_stream]
+    GGML_API struct ggml_tensor * ggml_dsv4_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx);
 
     // Packs per-token raw-window and Lightning-Indexer selections into the
     // strided K + mask storage consumed by DeepSeek V4 sparse flash attention.
