@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_SPARSE_PACK",
 
     "UNARY",
 
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_sparse_pack(raw_k, comp_k, raw_mask, comp_mask, comp_idx)",
 
     "unary(x)",
 
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5416,7 +5418,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(ggml_is_contiguous_rows(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5477,6 +5479,18 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_sinks_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(a->src[0]->ne[1] == sinks->ne[0]);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+
+    a->src[4] = sinks;
+    ggml_set_op_params_i32(a, 4, 1);
 }
 
 // ggml_flash_attn_back
@@ -6340,6 +6354,54 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsv4_sparse_pack
+
+struct ggml_tensor * ggml_dsv4_sparse_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * comp_k,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx,
+        int64_t               n_raw) {
+    GGML_ASSERT(raw_k->type    == GGML_TYPE_F16);
+    GGML_ASSERT(comp_k->type   == GGML_TYPE_F16);
+    GGML_ASSERT(raw_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_idx->type == GGML_TYPE_I32);
+
+    const int64_t d        = raw_k->ne[0];
+    const int64_t n_stream = raw_k->ne[3];
+    const int64_t nq       = raw_mask->ne[1];
+    const int64_t nk       = n_raw + comp_idx->ne[0];
+
+    GGML_ASSERT(n_raw > 0 && n_raw <= raw_k->ne[2]);
+    GGML_ASSERT(comp_k->ne[0] == d);
+    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
+    GGML_ASSERT(comp_k->ne[3] == n_stream);
+    GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2]);
+    GGML_ASSERT(comp_mask->ne[0] == comp_k->ne[2]);
+    GGML_ASSERT(comp_mask->ne[1] == nq);
+    GGML_ASSERT(raw_mask->ne[2] == 1 && comp_mask->ne[2] == 1);
+    GGML_ASSERT(raw_mask->ne[3] == n_stream && comp_mask->ne[3] == n_stream);
+    GGML_ASSERT(comp_idx->ne[1] == nq && comp_idx->ne[2] == 1);
+    GGML_ASSERT(comp_idx->ne[3] == n_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+            nk*(d + 1), nq*n_stream);
+
+    result->op     = GGML_OP_DSV4_SPARSE_PACK;
+    result->src[0] = raw_k;
+    result->src[1] = comp_k;
+    result->src[2] = raw_mask;
+    result->src[3] = comp_mask;
+    result->src[4] = comp_idx;
+
+    ggml_set_op_params_i32(result, 0, n_raw);
 
     return result;
 }
