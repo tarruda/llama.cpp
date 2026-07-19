@@ -297,7 +297,7 @@ struct common_chat_parser_params {
     common_peg_arena        parser               = {};
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
-        format  = chat_params.format;
+        format            = chat_params.format;
         generation_prompt = chat_params.generation_prompt;
     }
 };
