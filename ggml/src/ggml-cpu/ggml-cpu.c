@@ -3054,6 +3054,12 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
                     } break;
+                case GGML_OP_DSV4_SPARSE_PACK:
+                    {
+                        if (node->src[0]->type != GGML_TYPE_F16) {
+                            cur += sizeof(float)*node->src[0]->ne[0]*n_tasks;
+                        }
+                    } break;
                 default:
                     break;
             }
