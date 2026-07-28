@@ -1355,8 +1355,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
         case GGML_OP_DSV4_SPARSE_PACK:
-            return op->src[0]->type == GGML_TYPE_F16 &&
-                op->src[1]->type == GGML_TYPE_F16 &&
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                op->src[1]->type == op->src[0]->type &&
                 op->src[2]->type == GGML_TYPE_F16 &&
                 op->src[3]->type == GGML_TYPE_F16 &&
                 op->src[4]->type == GGML_TYPE_I32 &&
@@ -1372,7 +1372,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_LIGHTNING_INDEXER:
             return has_simdgroup_mm &&
                 op->src[0]->type == GGML_TYPE_F32 &&
-                op->src[1]->type == GGML_TYPE_F16 &&
+                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_Q8_0) &&
                 op->src[2]->type == GGML_TYPE_F32 &&
                 op->src[3]->type == GGML_TYPE_F16 &&
                 op->type         == GGML_TYPE_F32 &&

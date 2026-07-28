@@ -6441,8 +6441,8 @@ struct ggml_tensor * ggml_dsv4_sparse_pack(
         struct ggml_tensor  * comp_mask,
         struct ggml_tensor  * comp_idx,
         int64_t               n_raw) {
-    GGML_ASSERT(raw_k->type    == GGML_TYPE_F16);
-    GGML_ASSERT(comp_k->type   == GGML_TYPE_F16);
+    GGML_ASSERT(raw_k->type == comp_k->type);
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(raw_mask->type == GGML_TYPE_F16);
     GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
     GGML_ASSERT(comp_idx->type == GGML_TYPE_I32);

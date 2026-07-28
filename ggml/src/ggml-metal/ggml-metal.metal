@@ -11706,6 +11706,7 @@ kernel void kernel_dsv4_hc_post_f32(
 // Prefill assigns one threadgroup per token. Decode's compressed-only mode
 // assigns one threadgroup per selected row to expose enough random-read
 // parallelism. The packed masks remain adjacent to the F16 key storage.
+template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &)>
 kernel void kernel_dsv4_sparse_pack(
         constant ggml_metal_kargs_dsv4_sparse_pack & args,
         device const char * raw_k,
@@ -11729,11 +11730,14 @@ kernel void kernel_dsv4_sparse_pack(
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
 
-        device const half * src = (device const half *) (comp_k +
+        device const k4_t * src = (device const k4_t *) (comp_k +
                 (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
         device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
-        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-            out[i*args.n_embd + e] = src[e];
+        device half4 * out_k = (device half4 *) out;
+        for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+            half4 values;
+            dequantize_func(src + e4/nl, e4%nl, values);
+            out_k[i*args.n_embd/4 + e4] = values;
         }
         if (tiitg == 0) {
             out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
@@ -11784,14 +11788,16 @@ kernel void kernel_dsv4_sparse_pack(
     for (int i = 0; i < args.n_raw; ++i) {
         const int idx = selected_idx[i];
         if (idx >= 0) {
-            device const half * src = (device const half *) (raw_k +
+            device const k4_t * src = (device const k4_t *) (raw_k +
                     (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
-            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-                out_k[i*args.n_embd + e] = src[e];
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                half4 values;
+                dequantize_func(src + e4/nl, e4%nl, values);
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = values;
             }
         } else {
-            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-                out_k[i*args.n_embd + e] = 0.0h;
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = 0.0h;
             }
         }
         if (tiitg == 0) {
@@ -11802,10 +11808,12 @@ kernel void kernel_dsv4_sparse_pack(
     for (int i = 0; i < args.n_comp; ++i) {
         const int oi = args.n_raw + i;
         const int idx = selected_idx[oi];
-        device const half * src = (device const half *) (comp_k +
+        device const k4_t * src = (device const k4_t *) (comp_k +
                 (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
-        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-            out_k[oi*args.n_embd + e] = src[e];
+        for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+            half4 values;
+            dequantize_func(src + e4/nl, e4%nl, values);
+            ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = values;
         }
         if (tiitg == 0) {
             out_m[oi] = selected_mask[oi];
@@ -11813,6 +11821,14 @@ kernel void kernel_dsv4_sparse_pack(
     }
 
 }
+
+typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_sparse_pack_t;
+
+template [[host_name("kernel_dsv4_sparse_pack_f16")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>;
+
+template [[host_name("kernel_dsv4_sparse_pack_q8_0")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4>;
 
 constexpr constant short LI_N_EMBD = 128;
 constexpr constant short LI_N_HEAD = 64;
@@ -11908,7 +11924,8 @@ kernel void kernel_lightning_indexer_f16(
     }
 }
 
-kernel void kernel_lightning_indexer_f16_tail(
+template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread float4 &)>
+kernel void kernel_lightning_indexer_tail(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,
         device const char * k,
@@ -11929,8 +11946,8 @@ kernel void kernel_lightning_indexer_f16_tail(
     float score[LI_N_KEY_SIMDGROUP] = { 0.0f };
 
     for (short ik = 0; ik < n_key; ++ik) {
-        device const half4 * row = (device const half4 *) (k_base + ik*args.nbk2);
-        k4[ik] = float4(row[tiisg]);
+        device const k4_t * row = (device const k4_t *) (k_base + ik*args.nbk2);
+        dequantize_func(row + tiisg/nl, tiisg%nl, k4[ik]);
     }
 
     FOR_UNROLL (short ih = 0; ih < LI_N_HEAD; ++ih) {
@@ -11951,6 +11968,115 @@ kernel void kernel_lightning_indexer_f16_tail(
         for (short ik = 0; ik < n_key; ++ik) {
             const int i = args.kv_offset + ik;
             out[i] = score[ik] + float(mask[i]);
+        }
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_tail<half4, 1, dequantize_f16_t4>) lightning_indexer_tail_t;
+
+template [[host_name("kernel_lightning_indexer_f16_tail")]]
+kernel lightning_indexer_tail_t kernel_lightning_indexer_tail<half4, 1, dequantize_f16_t4>;
+
+template [[host_name("kernel_lightning_indexer_q8_0_tail")]]
+kernel lightning_indexer_tail_t kernel_lightning_indexer_tail<block_q8_0, 8, dequantize_q8_0_t4>;
+
+kernel void kernel_lightning_indexer_q8_0(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr short n_embd8 = LI_N_EMBD/8;
+    constexpr short n_embd4 = LI_N_EMBD/4;
+    constexpr short n_head_tile = 8;
+    constexpr short n_key_tg = LI_N_KEY_SIMDGROUP*LI_N_SIMDGROUP;
+
+    const int i_stream = tgpig.z;
+    const int i_kv = args.kv_offset + tgpig.x*n_key_tg + sgitg*LI_N_KEY_SIMDGROUP;
+
+    device const char * k_base = k + i_kv*args.nbk2 + i_stream*args.nbk3;
+
+    simdgroup_half8x8 mk[n_embd8];
+    threadgroup half k_shared[LI_N_SIMDGROUP*LI_N_KEY_SIMDGROUP*LI_N_KEY_SIMDGROUP];
+    threadgroup half * k_tile = k_shared + sgitg*LI_N_KEY_SIMDGROUP*LI_N_KEY_SIMDGROUP;
+
+    const short ik = tiisg/4;
+    const short ie2 = 2*(tiisg%4);
+    device const block_q8_0 * row = (device const block_q8_0 *) (k_base + ik*args.nbk2);
+
+    FOR_UNROLL (short i = 0; i < n_embd8; ++i) {
+        const short ie = 8*i + ie2;
+        device const block_q8_0 * block = row + ie/QK8_0;
+        const short iq = ie%QK8_0;
+        const float d = block->d;
+        *(threadgroup half2 *) (k_tile + ik*LI_N_KEY_SIMDGROUP + ie2) =
+            half2(d*block->qs[iq], d*block->qs[iq + 1]);
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(mk[i], k_tile, LI_N_KEY_SIMDGROUP, 0, true);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup half  q_shared[n_head_tile*LI_N_EMBD];
+    threadgroup float w_shared[n_head_tile];
+    threadgroup float qk_shared[LI_N_SIMDGROUP*n_head_tile*LI_N_KEY_SIMDGROUP];
+
+    const int i_batch_0 = tgpig.y*LI_N_BATCH_TG;
+    const int n_batch = min((int) LI_N_BATCH_TG, args.n_batch - i_batch_0);
+
+    for (short ib = 0; ib < n_batch; ++ib) {
+        const int i_batch = i_batch_0 + ib;
+        device const char * q_base = q + i_batch*args.nbq2 + i_stream*args.nbq3;
+        device const char * w_base = w + i_batch*args.nbw1 + i_stream*args.nbw3;
+
+        float score = 0.0f;
+
+        FOR_UNROLL (short i_head = 0; i_head < LI_N_HEAD; i_head += n_head_tile) {
+            for (short i = tiitg; i < n_head_tile*n_embd4; i += ntg.x*ntg.y) {
+                const short ih = i/n_embd4;
+                const short i4 = i - ih*n_embd4;
+                device const float4 * q4 = (device const float4 *) (q_base + (i_head + ih)*args.nbq1);
+                *(threadgroup half4 *) (q_shared + ih*LI_N_EMBD + 4*i4) = half4(q4[i4]);
+            }
+
+            if (tiitg < n_head_tile) {
+                w_shared[tiitg] = *((device const float *) (w_base + (i_head + tiitg)*sizeof(float)));
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            FOR_UNROLL (short i = 0; i < n_embd8; ++i) {
+                simdgroup_half8x8 mq;
+                simdgroup_load(mq, q_shared + 8*i, LI_N_EMBD, 0, false);
+                simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
+            }
+
+            threadgroup float * qk = qk_shared + sgitg*n_head_tile*LI_N_KEY_SIMDGROUP;
+            simdgroup_store(mqk, qk, LI_N_KEY_SIMDGROUP, 0, false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tiisg < LI_N_KEY_SIMDGROUP) {
+                FOR_UNROLL (short ih = 0; ih < n_head_tile; ++ih) {
+                    score += max(qk[ih*LI_N_KEY_SIMDGROUP + tiisg], 0.0f)*w_shared[ih];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tiisg < LI_N_KEY_SIMDGROUP) {
+            const int i = i_kv + tiisg;
+            device const half * mask = (device const half *) (m + i_batch*args.nbm1 + (i_stream % args.mask_ne3)*args.nbm3);
+            device float * out = (device float *) (dst + i_batch*args.nb1 + i_stream*args.nb3);
+            out[i] = score + float(mask[i]);
         }
     }
 }
