@@ -7458,19 +7458,24 @@ struct test_dsv4_sparse_pack : public test_case {
     const int64_t nb;
     const int64_t ns;
     const int64_t kr;
+    const int64_t nr;
+    const int64_t nc;
+    const int64_t kc;
+    const ggml_type type_K;
 
-    std::string vars() override { return VARS_TO_STR3(nb, ns, kr); }
+    std::string vars() override { return VARS_TO_STR7(nb, ns, kr, nr, nc, kc, type_K); }
 
-    test_dsv4_sparse_pack(int64_t nb = 3, int64_t ns = 2, int64_t kr = 7) : nb(nb), ns(ns), kr(kr) {}
+    test_dsv4_sparse_pack(int64_t nb = 3, int64_t ns = 2, int64_t kr = 7, ggml_type type_K = GGML_TYPE_F16)
+        : test_dsv4_sparse_pack(nb, ns, kr, type_K, 11, kr == 0 ? 517 : 17, kr == 0 ? 512 : 13) {}
+
+    test_dsv4_sparse_pack(int64_t nb, int64_t ns, int64_t kr, ggml_type type_K, int64_t nr, int64_t nc, int64_t kc)
+        : nb(nb), ns(ns), kr(kr), nr(nr), nc(nc), kc(kc), type_K(type_K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         constexpr int64_t d  = 512;
-        constexpr int64_t nr = 11;
-        const int64_t nc = kr == 0 ? 517 : 17;
-        const int64_t kc = kr == 0 ? 512 : 13;
 
-        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nr, ns);
-        ggml_tensor * cmp_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nc, ns);
+        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, type_K, d, 1, nr, ns);
+        ggml_tensor * cmp_k = ggml_new_tensor_4d(ctx, type_K, d, 1, nc, ns);
         ggml_tensor * raw_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nr, nb, 1, ns);
         ggml_tensor * cmp_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nc, nb, 1, ns);
         ggml_tensor * cmp_i = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, kc, nb, 1, ns);
@@ -7489,10 +7494,9 @@ struct test_dsv4_sparse_pack : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
-                const int32_t limit = kr == 0 ? 517 : 17;
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = (int32_t) ((i*7 + 3) % limit);
+                    data[i] = (int32_t) ((i*7 + 3) % nc);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else {
@@ -9902,9 +9906,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 1, 4, 1, type_K));
         }
     }
+    for (int kv : { 7, 63, 65 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 9, 4, 1, GGML_TYPE_Q8_0));
+    }
 
     test_cases.emplace_back(new test_dsv4_sparse_pack());
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(3, 2, 7, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 128, GGML_TYPE_Q8_0, 128, 517, 512));
 
     return test_cases;
 }
@@ -9924,6 +9934,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {5128, 1, 1, 1}, 512));
     test_cases.emplace_back(new test_dsv4_top_k_mask(128, 2500, 512, 1, 1));
     test_cases.emplace_back(new test_dsv4_top_k_mask(128, 5000, 512, 1, 1));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;

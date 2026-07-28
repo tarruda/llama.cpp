@@ -11376,6 +11376,21 @@ void ggml_compute_forward_dsv4_sparse_pack(
 
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
 
+    ggml_to_float_t const k_to_float = raw_k->type == GGML_TYPE_F16 ?
+            nullptr : ggml_get_type_traits(raw_k->type)->to_float;
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || k_to_float);
+    float * k_row_f32 = k_to_float ? (float *) params->wdata + params->ith*d : nullptr;
+
+    const auto copy_k_row = [&](const ggml_tensor * k, int64_t idx, int64_t is, ggml_fp16_t * out) {
+        const char * row = (const char *) k->data + idx*k->nb[2] + is*k->nb[3];
+        if (k_to_float) {
+            k_to_float(row, k_row_f32, d);
+            ggml_fp32_to_fp16_row(k_row_f32, out, d);
+        } else {
+            memcpy(out, row, d*sizeof(ggml_fp16_t));
+        }
+    };
+
     for (int64_t it = params->ith; it < nt; it += params->nth) {
         const int64_t iq = it % nq;
         const int64_t is = it / nq;
@@ -11390,8 +11405,7 @@ void ggml_compute_forward_dsv4_sparse_pack(
             if (!std::isfinite(GGML_CPU_FP16_TO_FP32(m))) {
                 continue;
             }
-            memcpy(out_k + ir*d, (const char *) raw_k->data + idx*raw_k->nb[2] + is*raw_k->nb[3],
-                    d*sizeof(ggml_fp16_t));
+            copy_k_row(raw_k, idx, is, out_k + ir*d);
             out_m[ir] = m;
             ++ir;
         }
@@ -11405,8 +11419,7 @@ void ggml_compute_forward_dsv4_sparse_pack(
             const int32_t idx = *(const int32_t *) ((const char *) comp_idx->data +
                     i*comp_idx->nb[0] + iq*comp_idx->nb[1] + is*comp_idx->nb[3]);
             GGML_ASSERT(idx >= 0 && idx < comp_k->ne[2]);
-            memcpy(out_k + oi*d, (const char *) comp_k->data + idx*comp_k->nb[2] + is*comp_k->nb[3],
-                    d*sizeof(ggml_fp16_t));
+            copy_k_row(comp_k, idx, is, out_k + oi*d);
             const ggml_fp16_t m = *(const ggml_fp16_t *) ((const char *) comp_mask->data +
                     idx*comp_mask->nb[0] + iq*comp_mask->nb[1] + is*comp_mask->nb[3]);
             out_m[oi] = m;

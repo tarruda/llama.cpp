@@ -703,6 +703,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+    const bool sparse_k_type = raw_k->type == csa_k->type &&
+            (raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_Q8_0);
 
     // Selecting every compressed row is equivalent to using the visibility
     // mask directly. Avoid building the Lightning Indexer and TOP_K graph until
@@ -718,30 +720,43 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // Indexer's selected compressed keys. This preserves the regular head layout
     // used by Metal's vector Flash Attention while making its KV work fixed-size.
     const bool gather_decode = cparams.fused_dsv4_sparse && cparams.flash_attn &&
-            raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16 &&
+            sparse_k_type &&
             q->ne[2] == 1 && csa_k->ne[3] == 1 && top_k &&
             top_k->ne[1] == 1 && top_k->ne[3] == 1 &&
             n_csa >= 2*(int64_t) hparams.indexer_top_k;
     if (gather_decode) {
+        const int64_t n_raw = raw_k->type == GGML_TYPE_Q8_0 ?
+                std::min<int64_t>(hparams.n_swa, raw_k->ne[2]) : 0;
         ggml_tensor * packed = ggml_dsv4_sparse_pack(
-                ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, 0);
+                ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, n_raw);
         cb(packed, "csa_gathered_pack", il);
         res->add_fused_node({LLM_FUSED_OP_DSV4_SPARSE_PACK, packed, il});
 
-        const int64_t nk = top_k->ne[0];
-        ggml_tensor * gathered = ggml_view_4d(ctx0, packed, csa_k->ne[0], 1, nk, 1,
-                csa_k->ne[0]*sizeof(ggml_fp16_t), csa_k->ne[0]*sizeof(ggml_fp16_t), packed->nb[1], 0);
-        cb(gathered, "csa_gathered_k", il);
+        ggml_tensor * k_sel;
+        ggml_tensor * kq_mask;
+        if (n_raw > 0) {
+            const int64_t nk = n_raw + top_k->ne[0];
+            k_sel = ggml_view_4d(ctx0, packed, csa_k->ne[0], 1, nk, 1,
+                    csa_k->ne[0]*sizeof(ggml_fp16_t), csa_k->ne[0]*sizeof(ggml_fp16_t), packed->nb[1], 0);
+            kq_mask = ggml_view_4d(ctx0, packed, nk, 1, 1, 1,
+                    nk*sizeof(ggml_fp16_t), nk*sizeof(ggml_fp16_t), packed->nb[1],
+                    csa_k->ne[0]*nk*sizeof(ggml_fp16_t));
+        } else {
+            const int64_t nk = top_k->ne[0];
+            ggml_tensor * gathered = ggml_view_4d(ctx0, packed, csa_k->ne[0], 1, nk, 1,
+                    csa_k->ne[0]*sizeof(ggml_fp16_t), csa_k->ne[0]*sizeof(ggml_fp16_t), packed->nb[1], 0);
+            cb(gathered, "csa_gathered_k", il);
 
-        ggml_tensor * k_sel = ggml_concat(ctx0, raw_k, gathered, 2);
+            k_sel = ggml_concat(ctx0, raw_k, gathered, 2);
+
+            ggml_tensor * comp_mask = ggml_view_4d(ctx0, packed, nk, 1, 1, 1,
+                    nk*sizeof(ggml_fp16_t), nk*sizeof(ggml_fp16_t), packed->nb[1],
+                    csa_k->ne[0]*nk*sizeof(ggml_fp16_t));
+            cb(comp_mask, "csa_gathered_mask", il);
+
+            kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+        }
         cb(k_sel, "csa_k_selected", il);
-
-        ggml_tensor * comp_mask = ggml_view_4d(ctx0, packed, nk, 1, 1, 1,
-                nk*sizeof(ggml_fp16_t), nk*sizeof(ggml_fp16_t), packed->nb[1],
-                csa_k->ne[0]*nk*sizeof(ggml_fp16_t));
-        cb(comp_mask, "csa_gathered_mask", il);
-
-        ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
         cb(kq_mask, "csa_lid_kq_mask", il);
 
         ggml_tensor * out = build_attn_mha(
@@ -761,7 +776,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     const bool sparse_probe = cparams.auto_fdsv4_sparse;
     const bool sparse_prefill = q->ne[2] >= 8 && n_csa > (int64_t) hparams.indexer_top_k;
     if (cparams.fused_dsv4_sparse && cparams.flash_attn &&
-            raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16 &&
+            sparse_k_type &&
             (sparse_probe || sparse_prefill)) {
         GGML_ASSERT(top_k);
         const int64_t n_stream = csa_k->ne[3];
