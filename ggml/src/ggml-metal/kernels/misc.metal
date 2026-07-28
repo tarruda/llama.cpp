@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dequantize.h"
 
 kernel void kernel_argmax_f32(
         constant ggml_metal_kargs_argmax & args,
@@ -698,6 +699,7 @@ kernel void kernel_dsv4_top_k_mask(
 // Prefill assigns one threadgroup per token. Decode's compressed-only mode
 // assigns one threadgroup per selected row to expose enough random-read
 // parallelism. The packed masks remain adjacent to the F16 key storage.
+template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &)>
 kernel void kernel_dsv4_sparse_pack(
         constant ggml_metal_kargs_dsv4_sparse_pack & args,
         device const char * raw_k,
@@ -721,11 +723,14 @@ kernel void kernel_dsv4_sparse_pack(
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
 
-        device const half * src = (device const half *) (comp_k +
+        device const k4_t * src = (device const k4_t *) (comp_k +
                 (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
         device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
-        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-            out[i*args.n_embd + e] = src[e];
+        device half4 * out_k = (device half4 *) out;
+        for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+            half4 values;
+            dequantize_func(src + e4/nl, e4%nl, values);
+            out_k[i*args.n_embd/4 + e4] = values;
         }
         if (tiitg == 0) {
             out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
@@ -776,14 +781,16 @@ kernel void kernel_dsv4_sparse_pack(
     for (int i = 0; i < args.n_raw; ++i) {
         const int idx = selected_idx[i];
         if (idx >= 0) {
-            device const half * src = (device const half *) (raw_k +
+            device const k4_t * src = (device const k4_t *) (raw_k +
                     (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
-            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-                out_k[i*args.n_embd + e] = src[e];
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                half4 values;
+                dequantize_func(src + e4/nl, e4%nl, values);
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = values;
             }
         } else {
-            for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-                out_k[i*args.n_embd + e] = 0.0h;
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = 0.0h;
             }
         }
         if (tiitg == 0) {
@@ -794,10 +801,12 @@ kernel void kernel_dsv4_sparse_pack(
     for (int i = 0; i < args.n_comp; ++i) {
         const int oi = args.n_raw + i;
         const int idx = selected_idx[oi];
-        device const half * src = (device const half *) (comp_k +
+        device const k4_t * src = (device const k4_t *) (comp_k +
                 (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
-        for (int e = tiitg; e < args.n_embd; e += ntg.x) {
-            out_k[oi*args.n_embd + e] = src[e];
+        for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+            half4 values;
+            dequantize_func(src + e4/nl, e4%nl, values);
+            ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = values;
         }
         if (tiitg == 0) {
             out_m[oi] = selected_mask[oi];
@@ -805,3 +814,11 @@ kernel void kernel_dsv4_sparse_pack(
     }
 
 }
+
+typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_sparse_pack_t;
+
+template [[host_name("kernel_dsv4_sparse_pack_f16")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>;
+
+template [[host_name("kernel_dsv4_sparse_pack_q8_0")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4>;

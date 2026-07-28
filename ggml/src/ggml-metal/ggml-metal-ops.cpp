@@ -1645,7 +1645,7 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     };
 
     ggml_metal_encoder_t enc = ctx->enc;
-    auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_sparse_pack(ctx->lib, raw_k->type);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
@@ -1654,9 +1654,8 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
 
-    // Four 256-thread packers can reside per core; a 512-thread group only
-    // allows two and exposes the random selected-row reads to more latency.
-    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    // One thread per half4 covers a 512-element row while keeping more packers resident.
+    const int nth = std::min(128, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     if (args.n_raw == 0) {
         // Decode gathers independent compressed rows. Giving each row its own
         // threadgroup exposes enough parallelism to hide the random-read latency.
