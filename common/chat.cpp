@@ -1932,19 +1932,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
                                                                  const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    // V4 uses the same DSML markup as V3.2, but names the tool call block "tool_calls"
-    // instead of "function_calls", renders tool results in tool call order and its
-    // non-thinking generation prompt ends with a bare </think> instead of an empty
-    // <think></think> pair.
-    const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
-
-    std::optional<json> adjusted_messages;
-    if (is_v4) {
-        adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
-    }
-
-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
+    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = "<think>";
@@ -1963,9 +1952,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
+    const std::string FC_START     = "<" + DSML + "function_calls>";
+    const std::string FC_END       = "</" + DSML + "function_calls>";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
@@ -1992,11 +1980,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
-            // contains an empty <think></think> pair (V3.2) or a bare </think> (V4) that
-            // must still be consumed.
-            reasoning = is_v4
-                ? p.optional(p.literal(THINK_END))
-                : p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+            // contains an empty <think></think> pair that must still be consumed.
+            reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
         }
 
         if (has_response_format) {
@@ -2117,6 +2102,234 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+        };
+    }
+
+    return data;
+}
+
+static common_chat_params common_chat_params_init_deepseek_v4(const common_chat_template &    tmpl,
+                                                               const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    const bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    const bool has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+
+    std::optional<json> additional_context;
+    if (has_response_format) {
+        additional_context = json{ { "response_format", inputs.json_schema } };
+    }
+
+    auto adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
+    data.prompt = common_chat_template_direct_apply_impl(
+        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(
+        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking  = true;
+    data.thinking_start_tag = "<think>";
+    data.preserved_tokens   = {
+        "｜DSML｜",
+        "<think>",
+        "</think>",
+    };
+
+    const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    const bool parse_tool_calls  = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    const bool include_grammar   = has_response_format || parse_tool_calls;
+
+    const std::string DSML         = "｜DSML｜";
+    const std::string THINK_START  = "<think>";
+    const std::string THINK_END    = "</think>";
+    const std::string FC_START     = "<" + DSML + "tool_calls>";
+    const std::string FC_TRIGGER   = "\n\n" + FC_START;
+    const std::string FC_END       = "</" + DSML + "tool_calls>";
+    const std::string INVOKE_START = "<" + DSML + "invoke";
+    const std::string INVOKE_END   = "</" + DSML + "invoke>";
+    const std::string PARAM_START  = "<" + DSML + "parameter";
+    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string GEN_PROMPT   = "<｜Assistant｜>";
+
+    data.thinking_end_tags = {THINK_END};
+    if (parse_tool_calls) {
+        data.thinking_end_tags.push_back(FC_TRIGGER);
+    }
+
+    if (inputs.has_continuation()) {
+        const auto & msg = inputs.continue_msg;
+
+        if (inputs.enable_thinking) {
+            data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                data.generation_prompt += THINK_END + msg.render_content();
+            }
+        } else {
+            data.generation_prompt = GEN_PROMPT + THINK_END;
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                data.generation_prompt += msg.render_content();
+            }
+        }
+
+        data.prompt += data.generation_prompt;
+    }
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto generation_prompt = p.literal(GEN_PROMPT);
+        auto end               = p.end();
+
+        auto response_format = p.eps();
+        if (has_response_format) {
+            response_format = p.rule(
+                "response-format",
+                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
+        }
+
+        auto after_reasoning = p.eps();
+        auto tool_calls      = p.eps();
+        if (!parse_tool_calls) {
+            after_reasoning = has_response_format ? response_format : p.content(p.rest());
+        } else {
+            auto string_value = p.ac(
+                p.tool_arg_string_value(p.until(PARAM_END)) +
+                    p.tool_arg_close(p.literal(PARAM_END)),
+                PARAM_END);
+
+            auto tool_choice = p.choice();
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                std::string  name     = function.at("name");
+                auto params = function.contains("parameters") ? function.at("parameters") : json::object();
+                const auto & props = params.contains("properties") ? params.at("properties") : json::object();
+
+                std::set<std::string> required;
+                if (params.contains("required")) {
+                    params.at("required").get_to(required);
+                }
+
+                auto schema_info = common_schema_info();
+                schema_info.resolve_refs(params);
+
+                std::vector<bool>              required_args;
+                std::vector<common_peg_parser> arg_parsers;
+                for (const auto & [param_name, param_schema] : props.items()) {
+                    const bool is_required = required.find(param_name) != required.end();
+                    const bool is_string   = schema_info.resolves_to_string(param_schema);
+
+                    auto value = is_string
+                        ? string_value
+                        : p.tool_arg_json_value(p.schema(
+                              p.json(),
+                              "tool-" + name + "-arg-" + param_name + "-schema",
+                              param_schema,
+                              false)) +
+                              p.tool_arg_close(p.literal(PARAM_END));
+
+                    auto arg = p.tool_arg(
+                        p.tool_arg_open(
+                            p.literal(PARAM_START + " name=\"") +
+                            p.tool_arg_name(p.literal(param_name)) +
+                            p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
+                        value);
+
+                    arg_parsers.push_back(p.rule("tool-" + name + "-arg-" + param_name, arg));
+                    required_args.push_back(is_required);
+                }
+
+                auto args = p.eps();
+                if (!arg_parsers.empty()) {
+                    auto any_arg = p.choice(arg_parsers);
+                    for (size_t i = 0; i < arg_parsers.size(); i++) {
+                        if (!required_args[i]) {
+                            continue;
+                        }
+                        args = args + p.peek(
+                            p.zero_or_more(p.negate(arg_parsers[i]) + any_arg + p.space()) + arg_parsers[i]);
+                    }
+                    args = args + p.zero_or_more(any_arg + p.space());
+                }
+
+                auto func_parser = p.tool(
+                    p.tool_open(
+                        p.literal(INVOKE_START + " name=\"") +
+                        p.tool_name(p.literal(name)) +
+                        p.literal("\">\n")) +
+                    args + p.space() +
+                    p.tool_close(p.literal(INVOKE_END)));
+
+                tool_choice |= p.rule("tool-" + name, func_parser);
+            });
+
+            auto tool_calls_body = p.literal(FC_TRIGGER) + p.space() + tool_choice;
+            if (inputs.parallel_tool_calls) {
+                tool_calls_body = tool_calls_body + p.zero_or_more(p.space() + tool_choice);
+            }
+            tool_calls = p.trigger_rule(
+                "tool-call",
+                tool_calls_body + p.space() + p.literal(FC_END) +
+                    p.optional(p.space() + p.literal(THINK_END)));
+
+            const bool require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            auto content_before_tools = p.content(p.until(FC_TRIGGER));
+            if (has_response_format) {
+                auto tool_call_response = content_before_tools + tool_calls;
+                after_reasoning = require_tools
+                    ? tool_call_response
+                    : p.choice({tool_call_response, response_format});
+            } else {
+                after_reasoning = content_before_tools + (require_tools ? tool_calls : p.optional(tool_calls));
+            }
+        }
+
+        if (extract_reasoning && inputs.enable_thinking) {
+            auto reasoning_with_tool_calls =
+                p.literal(THINK_START) +
+                p.reasoning(p.until_one_of({THINK_END, FC_TRIGGER})) +
+                tool_calls;
+            auto closed_reasoning =
+                p.literal(THINK_START) +
+                p.reasoning(p.until(THINK_END)) +
+                p.literal(THINK_END) +
+                after_reasoning;
+            auto open_reasoning = p.literal(THINK_START) + p.reasoning(p.rest());
+
+            if (parse_tool_calls) {
+                return generation_prompt +
+                    p.choice({reasoning_with_tool_calls, closed_reasoning, open_reasoning}) + end;
+            }
+            return generation_prompt + p.choice({closed_reasoning, open_reasoning}) + end;
+        }
+
+        if (extract_reasoning) {
+            auto reasoning = p.optional(p.choice({
+                p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END),
+                p.literal(THINK_END),
+            }));
+            return generation_prompt + reasoning + after_reasoning + end;
+        }
+
+        return generation_prompt + after_reasoning + end;
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = !(has_response_format ||
+                             (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto schema = function.contains("parameters") ? function.at("parameters") : json::object();
+                builder.resolve_refs(schema);
+            });
+            if (has_response_format) {
+                auto schema = inputs.json_schema;
+                builder.resolve_refs(schema);
+            }
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            {COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_TRIGGER},
         };
     }
 
@@ -2978,13 +3191,19 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
 
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.
-    // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".
     if (src.find("dsml_token") != std::string::npos &&
-        src.find("DSML") != std::string::npos &&
-        (src.find("function_calls") != std::string::npos ||
-         src.find("tool_calls") != std::string::npos)) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2/V4\n");
+        src.find("function_calls") != std::string::npos &&
+        src.find("DSML") != std::string::npos) {
+        LOG_DBG("Using specialized template: DeepSeek V3.2\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
+    }
+
+    // DeepSeek V4 uses the DSML invoke/parameter format with a tool_calls outer block.
+    if (src.find("dsml_token") != std::string::npos &&
+        src.find("tool_calls>") != std::string::npos &&
+        src.find("DSML") != std::string::npos) {
+        LOG_DBG("Using specialized template: DeepSeek V4\n");
+        return common_chat_params_init_deepseek_v4(tmpl, params);
     }
 
     // Gemma4 format detection
