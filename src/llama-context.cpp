@@ -31,6 +31,15 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+static const char * llm_dsv4_prefill_mode_name(enum llm_dsv4_prefill_mode mode) {
+    switch (mode) {
+        case LLM_DSV4_PREFILL_MODE_DENSE:  return "dense";
+        case LLM_DSV4_PREFILL_MODE_SPARSE: return "sparse";
+    }
+
+    return "unknown";
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -283,6 +292,18 @@ llama_context::llama_context(
     cparams.fused_dsv4_sparse = true;
     cparams.auto_fdsv4_sparse = true;
 
+    cparams.dsv4_prefill_mode = LLM_DSV4_PREFILL_MODE_SPARSE;
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        const char * mode = getenv("LLAMA_DSV4_PREFILL_MODE");
+        if (mode) {
+            if (strcmp(mode, "dense") == 0) {
+                cparams.dsv4_prefill_mode = LLM_DSV4_PREFILL_MODE_DENSE;
+            } else if (strcmp(mode, "sparse") != 0) {
+                throw std::runtime_error("invalid LLAMA_DSV4_PREFILL_MODE: expected dense or sparse");
+            }
+        }
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -336,6 +357,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
+
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_INFO("%s: dsv4_prefill = %s\n", __func__, llm_dsv4_prefill_mode_name(cparams.dsv4_prefill_mode));
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",

@@ -705,21 +705,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     const bool sparse_k_type = raw_k->type == csa_k->type &&
             (raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_Q8_0);
+    const int64_t n_stream = csa_k->ne[3];
+    const bool sparse_attention =
+            cparams.dsv4_prefill_mode == LLM_DSV4_PREFILL_MODE_SPARSE ||
+            q->ne[2]/n_stream == 1 ||
+            cparams.auto_fdsv4_sparse;
 
     // Selecting every compressed row is equivalent to using the visibility
     // mask directly. Avoid building the Lightning Indexer and TOP_K graph until
     // the compressed cache grows beyond the selection size. Auto probes are
     // the only exception because they must materialize their fused ops.
     ggml_tensor * top_k = nullptr;
-    if (cparams.auto_fdsv4_aux || cparams.auto_fdsv4_sparse ||
-            n_csa > (int64_t) hparams.indexer_top_k) {
+    if (sparse_attention && (cparams.auto_fdsv4_aux || cparams.auto_fdsv4_sparse ||
+            n_csa > (int64_t) hparams.indexer_top_k)) {
         top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
     }
 
     // At sufficiently deep single-token decode, gather only the Lightning
     // Indexer's selected compressed keys. This preserves the regular head layout
     // used by Metal's vector Flash Attention while making its KV work fixed-size.
-    const bool gather_decode = cparams.fused_dsv4_sparse && cparams.flash_attn &&
+    const bool gather_decode = sparse_attention && cparams.fused_dsv4_sparse && cparams.flash_attn &&
             sparse_k_type &&
             q->ne[2] == 1 && csa_k->ne[3] == 1 && top_k &&
             top_k->ne[1] == 1 && top_k->ne[3] == 1 &&
@@ -775,11 +780,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // layer devices can disable it.
     const bool sparse_probe = cparams.auto_fdsv4_sparse;
     const bool sparse_prefill = q->ne[2] >= 8 && n_csa > (int64_t) hparams.indexer_top_k;
-    if (cparams.fused_dsv4_sparse && cparams.flash_attn &&
+    if (sparse_attention && cparams.fused_dsv4_sparse && cparams.flash_attn &&
             sparse_k_type &&
             (sparse_probe || sparse_prefill)) {
         GGML_ASSERT(top_k);
-        const int64_t n_stream = csa_k->ne[3];
         const int64_t nq       = q->ne[2]/n_stream;
         const int64_t nt       = q->ne[2];
         const int64_t n_head   = q->ne[1];

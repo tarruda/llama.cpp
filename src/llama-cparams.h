@@ -7,6 +7,11 @@
 
 #define LLAMA_MAX_SEQ 256
 
+enum llm_dsv4_prefill_mode {
+    LLM_DSV4_PREFILL_MODE_DENSE,
+    LLM_DSV4_PREFILL_MODE_SPARSE,
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -57,6 +62,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    enum llm_dsv4_prefill_mode dsv4_prefill_mode;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
