@@ -11639,6 +11639,54 @@ kernel void kernel_dsv4_hc_pre_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = result;
 }
 
+// Keep the weighted hyper-connection result in registers through RMSNorm.
+// DeepSeek V4's 4096-element rows map exactly to one float4 per thread.
+kernel void kernel_dsv4_hc_pre_norm_f32(
+        constant ggml_metal_kargs_dsv4_hc_pre_norm & args,
+        device const char * x,
+        device const char * weights,
+        device const char * norm,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort  tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    constexpr ushort hc = 4;
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    float weight_lane = 0.0f;
+    if (tiisg < hc) {
+        weight_lane = *(device const float *) (weights + tiisg*args.nb_w0 + tgpig*args.nb_w1);
+    }
+
+    float4 result = 0.0f;
+    device const char * xb = x + 4*tpitg*args.nb_x0 + tgpig*args.nb_x2;
+    FOR_UNROLL (ushort ih = 0; ih < hc; ++ih) {
+        const float weight = simd_shuffle(weight_lane, ih);
+        result = fma(*(device const float4 *) (xb + ih*args.nb_x1), weight, result);
+    }
+
+    float sumf = simd_sum(dot(result, result));
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(shmem_f32[tiisg]);
+    const float scale = 1.0f/sqrt(sumf/args.n_embd + args.eps);
+
+    const float4 norm_v = *(device const float4 *) (norm + 4*tpitg*args.nb_n0);
+    *(device float4 *) (dst + 4*tpitg*args.nb_d0 + tgpig*args.nb_d1) = result*scale*norm_v;
+}
+
 // A lane owns one embedding element and produces all four destination streams.
 // Reusing x and the four residual values cuts source traffic substantially versus
 // assigning a separate lane to each output stream. The 20 token-local coefficients

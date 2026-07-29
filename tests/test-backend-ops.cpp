@@ -3977,6 +3977,45 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+struct test_dsv4_hc_pre_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_NORM";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, eps);
+    }
+
+    test_dsv4_hc_pre_norm(int64_t n_embd = 4096, int64_t n_tokens = 17, float eps = 1e-6f)
+        : n_embd(n_embd), n_tokens(n_tokens), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm, "norm");
+
+        out = ggml_dsv4_hc_pre(ctx, x, weights);
+        out = ggml_rms_norm(ctx, out, eps);
+        out = ggml_mul(ctx, out, norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -8238,6 +8277,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
+    test_cases.emplace_back(new test_dsv4_hc_pre_norm(4096, 21));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
