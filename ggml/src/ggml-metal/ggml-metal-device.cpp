@@ -498,6 +498,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv4_hc_pre_norm_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack(ggml_metal_library_t lib, ggml_type type) {
     char name[256];
     snprintf(name, 256, "kernel_dsv4_sparse_pack_%s", ggml_type_name(type));

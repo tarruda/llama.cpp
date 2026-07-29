@@ -1485,13 +1485,13 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_encoder_t enc = ctx->enc;
-    auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc(ctx->lib, op->op);
-
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
 
     switch (op->op) {
         case GGML_OP_DSV4_HC_COMB:
             {
+                auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc(ctx->lib, op->op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+
                 const ggml_tensor * mixes = op->src[0];
                 const ggml_tensor * scale = op->src[1];
                 const ggml_tensor * base  = op->src[2];
@@ -1539,6 +1539,73 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 GGML_ASSERT(op->type      == GGML_TYPE_F32);
                 GGML_ASSERT(x->ne[1] == 4);
 
+                if (ctx->use_fusion && x->ne[0] == 4096 &&
+                    ggml_is_contiguous_rows(x) &&
+                    ggml_is_contiguous_rows(weights)) {
+                    const ggml_op fops[] = { GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL };
+
+                    if (ctx->can_fuse(idx, fops, 3)) {
+                        const ggml_tensor * norm = ctx->node(idx + 1);
+                        const ggml_tensor * mul  = ctx->node(idx + 2);
+                        const ggml_tensor * norm_weight = mul->src[1];
+
+                        const bool can_fuse =
+                            norm->src[0] == op &&
+                            mul->src[0] == norm &&
+                            norm->type == GGML_TYPE_F32 &&
+                            mul->type == GGML_TYPE_F32 &&
+                            norm_weight->type == GGML_TYPE_F32 &&
+                            ggml_are_same_shape(op, norm) &&
+                            ggml_are_same_shape(norm, mul) &&
+                            ggml_nelements(norm_weight) == x->ne[0] &&
+                            ggml_is_contiguous_rows(norm_weight) &&
+                            ggml_is_contiguous_rows(mul);
+
+                        if (can_fuse) {
+                            ggml_metal_kargs_dsv4_hc_pre_norm args = {
+                                /*.n_embd   =*/ (int32_t) x->ne[0],
+                                /*.n_tokens =*/ (int32_t) x->ne[2],
+                                /*.nb_x0    =*/ x->nb[0],
+                                /*.nb_x1    =*/ x->nb[1],
+                                /*.nb_x2    =*/ x->nb[2],
+                                /*.nb_w0    =*/ weights->nb[0],
+                                /*.nb_w1    =*/ weights->nb[1],
+                                /*.nb_n0    =*/ norm_weight->nb[0],
+                                /*.nb_d0    =*/ mul->nb[0],
+                                /*.nb_d1    =*/ mul->nb[1],
+                                /*.eps      =*/ ggml_get_op_params_f32(norm, 0),
+                            };
+
+                            auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc_pre_norm(ctx->lib);
+                            const int nth = args.n_embd/4;
+                            GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+                            ggml_metal_encoder_set_pipeline(enc, pipeline);
+                            ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+                            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),           1);
+                            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(weights),     2);
+                            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(norm_weight), 3);
+                            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mul),         4);
+                            ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+                            ggml_metal_encoder_dispatch_threadgroups(
+                                    enc, args.n_tokens, 1, 1, nth, 1, 1);
+
+                            for (int i = 1; i < 3; ++i) {
+                                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                                    ggml_metal_op_concurrency_reset(ctx);
+                                    break;
+                                }
+                            }
+
+                            if (ctx->debug_fusion > 1) {
+                                GGML_LOG_DEBUG("%s: fuse: DSV4_HC_PRE + RMS_NORM + MUL\n", __func__);
+                            }
+
+                            return 3;
+                        }
+                    }
+                }
+
                 ggml_metal_kargs_dsv4_hc_pre args = {
                     /*.n_embd   =*/ (int32_t) x->ne[0],
                     /*.n_tokens =*/ (int32_t) x->ne[2],
@@ -1551,6 +1618,8 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                     /*.nb_d1    =*/ op->nb[1],
                 };
 
+                auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc(ctx->lib, op->op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
                 ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),       1);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(weights), 2);
@@ -1563,6 +1632,9 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_DSV4_HC_POST:
             {
+                auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc(ctx->lib, op->op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+
                 const ggml_tensor * x        = op->src[0];
                 const ggml_tensor * residual = op->src[1];
                 const ggml_tensor * post     = op->src[2];

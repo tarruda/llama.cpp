@@ -1282,6 +1282,20 @@ typedef struct {
     int32_t  n_tokens;
     uint64_t nb_x0;
     uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_n0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_pre_norm;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
     uint64_t nb_r0;
     uint64_t nb_r1;
     uint64_t nb_r2;
