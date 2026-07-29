@@ -11855,7 +11855,8 @@ kernel void kernel_lightning_indexer(
     constexpr short n_embd8 = LI_N_EMBD/8;
     constexpr short n_embd16 = LI_N_EMBD/16;
     constexpr short n_embd4 = LI_N_EMBD/4;
-    constexpr short n_head_tile = 8;
+    constexpr short n_head_tile = 32;
+    constexpr short n_head_matrix = 8;
     constexpr short n_key_tg = LI_N_KEY_SIMDGROUP*LI_N_SIMDGROUP;
 
     const int i_stream = tgpig.z;
@@ -11893,7 +11894,7 @@ kernel void kernel_lightning_indexer(
 
     threadgroup half  q_shared[n_head_tile*LI_N_EMBD];
     threadgroup float w_shared[n_head_tile];
-    threadgroup float qk_shared[LI_N_SIMDGROUP*n_head_tile*LI_N_KEY_SIMDGROUP];
+    threadgroup float qk_shared[LI_N_SIMDGROUP*n_head_matrix*LI_N_KEY_SIMDGROUP];
 
     const int i_batch_0 = tgpig.y*LI_N_BATCH_TG;
     const int n_batch = min((int) LI_N_BATCH_TG, args.n_batch - i_batch_0);
@@ -11919,24 +11920,27 @@ kernel void kernel_lightning_indexer(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            FOR_UNROLL (short i_head_tile = 0; i_head_tile < n_head_tile; i_head_tile += n_head_matrix) {
+                simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
-            FOR_UNROLL (short i = 0; i < n_embd8; ++i) {
-                simdgroup_half8x8 mq;
-                simdgroup_load(mq, q_shared + 8*i, LI_N_EMBD, 0, false);
-                simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
-            }
-
-            threadgroup float * qk = qk_shared + sgitg*n_head_tile*LI_N_KEY_SIMDGROUP;
-            simdgroup_store(mqk, qk, LI_N_KEY_SIMDGROUP, 0, false);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-
-            if (tiisg < LI_N_KEY_SIMDGROUP) {
-                FOR_UNROLL (short ih = 0; ih < n_head_tile; ++ih) {
-                    score += max(qk[ih*LI_N_KEY_SIMDGROUP + tiisg], 0.0f)*w_shared[ih];
+                FOR_UNROLL (short i = 0; i < n_embd8; ++i) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, q_shared + i_head_tile*LI_N_EMBD + 8*i, LI_N_EMBD, 0, false);
+                    simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
                 }
-            }
 
+                threadgroup float * qk = qk_shared + sgitg*n_head_matrix*LI_N_KEY_SIMDGROUP;
+                simdgroup_store(mqk, qk, LI_N_KEY_SIMDGROUP, 0, false);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tiisg < LI_N_KEY_SIMDGROUP) {
+                    FOR_UNROLL (short ih = 0; ih < n_head_matrix; ++ih) {
+                        score += max(qk[ih*LI_N_KEY_SIMDGROUP + tiisg], 0.0f)*w_shared[i_head_tile + ih];
+                    }
+                }
+
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
