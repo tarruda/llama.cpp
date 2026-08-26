@@ -593,3 +593,30 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+kernel void kernel_qwen4exp_hc_reduce_f32(
+        constant ggml_metal_kargs_qwen4exp_hc_reduce & args,
+        device const float * x,
+        device const float * gate,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr ushort hc = 4;
+
+    const int it = tgpig.y;
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const int offset = it*hc*args.n_embd + i0;
+    float result = 0.0f;
+    FOR_UNROLL (ushort ih = 0; ih < hc; ++ih) {
+        const int idx = offset + ih*args.n_embd;
+        result = fma(x[idx], gate[idx], result);
+    }
+
+    dst[it*args.n_embd + i0] = result*0.25f;
+}

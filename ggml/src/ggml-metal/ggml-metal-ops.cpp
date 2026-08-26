@@ -331,6 +331,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
             } break;
+        case GGML_OP_QWEN4EXP_HC_REDUCE:
+            {
+                n_fuse = ggml_metal_op_qwen4exp_hc_reduce(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1505,6 +1509,44 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
         default:
             GGML_ABORT("fatal error");
     }
+
+    return 1;
+}
+
+int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * x    = op->src[0];
+    const ggml_tensor * gate = op->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[1] == 4);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(x, gate));
+    GGML_ASSERT(op->ne[0] == x->ne[0]);
+    GGML_ASSERT(op->ne[1] == x->ne[2]);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(gate));
+    GGML_ASSERT(ggml_is_contiguous(op));
+
+    ggml_metal_kargs_qwen4exp_hc_reduce args = {
+        /*.n_embd   =*/ (int32_t) x->ne[0],
+        /*.n_tokens =*/ (int32_t) x->ne[2],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_qwen4exp_hc_reduce(ctx->lib);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),    1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   3);
+
+    const int n_tiles = (args.n_embd + 31)/32;
+    const int nsg = std::min(4, n_tiles);
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, 32, nsg, 1);
 
     return 1;
 }
