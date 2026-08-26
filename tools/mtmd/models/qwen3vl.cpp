@@ -8,6 +8,12 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     const int batch_size       = 1;
     const int n_pos            = n_patches;
     const int num_position_ids = n_pos * 4; // m-rope requires 4 dim per position
+    const int merge            = hparams.n_merge;
+    const int merge_factor     = merge * merge;
+
+    GGML_ASSERT(merge > 0);
+    GGML_ASSERT(n_patches_x % merge == 0);
+    GGML_ASSERT(n_patches_y % merge == 0);
 
     norm_type norm_t = NORM_TYPE_NORMAL;
 
@@ -20,10 +26,10 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
         inp = ggml_cont_4d(
             ctx0, inp,
-            n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+            n_embd * merge, n_patches_x / merge, n_patches_y, batch_size);
         inp = ggml_reshape_4d(
             ctx0, inp,
-            n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+            n_embd * merge, n_patches_x / merge, merge, batch_size * (n_patches_y / merge));
         inp = ggml_permute(ctx0, inp, 0, 2, 1, 3);
         inp = ggml_cont_3d(
             ctx0, inp,
@@ -40,10 +46,10 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     ggml_tensor * learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
     learned_pos_embd = ggml_cont_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+        n_embd * merge, n_patches_x / merge, n_patches_y, batch_size);
     learned_pos_embd = ggml_reshape_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+        n_embd * merge, n_patches_x / merge, merge, batch_size * (n_patches_y / merge));
     learned_pos_embd = ggml_permute(ctx0, learned_pos_embd, 0, 2, 1, 3);
     learned_pos_embd = ggml_cont_3d(
         ctx0, learned_pos_embd,
@@ -64,7 +70,6 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     // deepstack features (stack along the feature dimension), [n_embd * len(deepstack_layers), n_patches_x * n_patches_y, batch_size]
     ggml_tensor * deepstack_features = nullptr;
-    const int merge_factor = hparams.n_merge > 0 ? hparams.n_merge * hparams.n_merge : 4; // default 2x2=4 for qwen3vl
 
     // loop over layers
     for (int il = 0; il < n_layer; il++) {
@@ -167,7 +172,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     // multimodal projection
     ggml_tensor * embeddings = inpL;
-    embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
+    embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * merge_factor, n_pos / merge_factor, batch_size);
 
     embeddings = build_ffn(embeddings,
         model.mm_0_w, model.mm_0_b,

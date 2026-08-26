@@ -3,8 +3,8 @@
 ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
     ggml_tensor * inp_raw = build_inp_raw();
 
-    GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
-    GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
+    GGML_ASSERT(img.nx() % (patch_size * hparams.n_merge) == 0);
+    GGML_ASSERT(img.ny() % (patch_size * hparams.n_merge) == 0);
 
     const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
     const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());

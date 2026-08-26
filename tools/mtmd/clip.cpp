@@ -3998,6 +3998,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+            return img->nx() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
@@ -4024,6 +4025,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+            return img->ny() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
@@ -4104,6 +4106,11 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+            {
+                int x_patch = img->nx() / (params.patch_size * params.n_merge);
+                int y_patch = img->ny() / (params.patch_size * params.n_merge);
+                n_patches = x_patch * y_patch;
+            } break;
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_MINIMAX_M3:
@@ -4741,8 +4748,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 int ptr = 0;
                 for (int y = 0; y < ph; y += merge_ratio) {
                     for (int x = 0; x < pw; x += merge_ratio) {
-                        for (int dy = 0; dy < 2; dy++) {
-                            for (int dx = 0; dx < 2; dx++) {
+                        for (int dy = 0; dy < merge_ratio; dy++) {
+                            for (int dx = 0; dx < merge_ratio; dx++) {
                                 positions[                  ptr] = y + dy;
                                 positions[    num_patches + ptr] = x + dx;
                                 positions[2 * num_patches + ptr] = y + dy;
@@ -4752,6 +4759,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
                 }
+                GGML_ASSERT(ptr == n_pos);
 
                 set_input_i32("positions", positions);
             } break;
