@@ -14,6 +14,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-qwen4.h"
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
@@ -1129,6 +1130,58 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    return res;
+}
+
+void llm_graph_input_mem_qwen4::set_input(const llama_ubatch * ubatch) {
+    inp_attn->set_input(ubatch);
+    if (inp_gdn) {
+        inp_gdn->set_input(ubatch);
+    }
+    if (inp_ple) {
+        inp_ple->set_input(ubatch);
+        mctx->set_input_ple_ids(ple_ids);
+    }
+}
+
+bool llm_graph_input_mem_qwen4::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_qwen4_context *>(params.mctx);
+    this->mctx = mctx;
+
+    const auto * mctx_attn = mctx->get_attn();
+    inp_attn->mctx_msa = mctx_attn;
+    inp_attn->mctx = mctx_attn->get_base();
+    if (inp_gdn) {
+        inp_gdn->mctx = mctx->get_gdn();
+    }
+    if (inp_ple) {
+        inp_ple->mctx = mctx->get_ple();
+    }
+
+    bool res = true;
+
+    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= inp_attn->self_k_idxs_idx->ne[0] == params.ubatch.n_tokens;
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx_attn->get_base(), params.ubatch, params.cparams);
+
+    const auto can_reuse_rs = [&](const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx_rs) {
+        bool ok = true;
+        ok &= inp->s_copy->ne[0] == mctx_rs->get_n_rs();
+        ok &= inp->s_copy_main->ne[0] == params.ubatch.n_seqs;
+        ok &= inp->s_copy_extra->ne[0] == mctx_rs->get_n_rs() - params.ubatch.n_seqs;
+        ok &= inp->head == mctx_rs->get_head();
+        ok &= inp->rs_z == mctx_rs->get_rs_z();
+        return ok;
+    };
+
+    if (inp_gdn) {
+        res &= can_reuse_rs(inp_gdn.get(), mctx->get_gdn());
+    }
+    if (inp_ple) {
+        res &= can_reuse_rs(inp_ple.get(), mctx->get_ple());
+        res &= ple_ids->ne[1] == params.ubatch.n_tokens;
+    }
 
     return res;
 }
@@ -3581,6 +3634,43 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_qwen4 * llm_graph_context::build_inp_mem_qwen4(bool with_recurrent) const {
+    const auto * mctx_cur = static_cast<const llama_memory_qwen4_context *>(mctx);
+    const auto * mctx_attn = mctx_cur->get_attn();
+    const auto * mctx_base = mctx_attn->get_base();
+    const auto * mctx_idx = mctx_attn->get_idx();
+
+    auto inp_attn = std::make_unique<llm_graph_input_attn_kv_msa>(hparams, cparams, mctx_attn);
+    inp_attn->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
+    inp_attn->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
+    inp_attn->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_base, ubatch, cparams);
+    inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
+    inp_attn->self_k_rot = mctx_base->build_input_k_rot(ctx0);
+    inp_attn->self_v_rot = mctx_base->build_input_v_rot(ctx0);
+    inp_attn->self_k_idxs_idx = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+
+    std::unique_ptr<llm_graph_input_rs> inp_gdn;
+    std::unique_ptr<llm_graph_input_rs> inp_ple;
+    if (with_recurrent && mctx_cur->get_gdn()) {
+        inp_gdn = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_gdn());
+    }
+    if (with_recurrent && mctx_cur->get_ple()) {
+        inp_ple = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_ple());
+    }
+
+    auto inp = std::make_unique<llm_graph_input_mem_qwen4>(
+            cparams, std::move(inp_attn), std::move(inp_gdn), std::move(inp_ple), mctx_cur);
+
+    if (inp->get_ple()) {
+        const int64_t n_ple_heads = (hparams.qwen4_ple_ngram - 1) * hparams.qwen4_ple_heads;
+        inp->ple_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_ple_heads, ubatch.n_tokens);
+        ggml_set_input(inp->ple_ids);
+        ggml_set_name(inp->ple_ids, "ple_ids");
+    }
+
+    return (llm_graph_input_mem_qwen4 *) res->add_input(std::move(inp));
 }
 
 void llm_graph_context::build_dense_out(

@@ -31,6 +31,7 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+class llama_memory_qwen4_context;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -741,6 +742,40 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+class llm_graph_input_mem_qwen4 : public llm_graph_input_i {
+public:
+    llm_graph_input_mem_qwen4(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv_msa> inp_attn,
+            std::unique_ptr<llm_graph_input_rs> inp_gdn,
+            std::unique_ptr<llm_graph_input_rs> inp_ple,
+            const llama_memory_qwen4_context * mctx) :
+        inp_attn(std::move(inp_attn)),
+        inp_gdn(std::move(inp_gdn)),
+        inp_ple(std::move(inp_ple)),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_mem_qwen4() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_kv_msa * get_attn() const { return inp_attn.get(); }
+    llm_graph_input_rs * get_gdn() const { return inp_gdn.get(); }
+    llm_graph_input_rs * get_ple() const { return inp_ple.get(); }
+    ggml_tensor * get_ple_ids() const { return ple_ids; }
+
+    std::unique_ptr<llm_graph_input_attn_kv_msa> inp_attn;
+    std::unique_ptr<llm_graph_input_rs> inp_gdn;
+    std::unique_ptr<llm_graph_input_rs> inp_ple;
+
+    ggml_tensor * ple_ids = nullptr;
+
+    const llama_cparams cparams;
+    const llama_memory_qwen4_context * mctx;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -1343,6 +1378,8 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    llm_graph_input_mem_qwen4 * build_inp_mem_qwen4(bool with_recurrent = true) const;
 
     //
     // pooling

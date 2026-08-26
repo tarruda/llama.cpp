@@ -273,6 +273,20 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // Qwen4 experimental
+    uint32_t qwen4_hc_count       = 0;
+    uint32_t qwen4_hc_low_rank    = 0;
+    uint32_t qwen4_ple_ngram      = 0;
+    uint32_t qwen4_ple_heads      = 0;
+    uint32_t qwen4_ple_vocab_div  = 128;
+    uint32_t qwen4_ple_conv       = 0;
+    uint32_t qwen4_ple_eos        = 0;
+    int32_t  qwen4_ple_layer      = -1;
+    std::array<int64_t, LLAMA_MAX_LAYERS> qwen4_ple_multipliers;
+    std::array<int64_t, LLAMA_MAX_LAYERS> qwen4_ple_offsets;
+    std::array<int64_t, LLAMA_MAX_LAYERS> qwen4_ple_vocab_sizes;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> qwen4_compress_ratios;
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more

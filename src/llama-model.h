@@ -226,6 +226,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    struct ggml_tensor * embed_proj            = nullptr;
+    struct ggml_tensor * hidden_proj           = nullptr;
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -555,6 +560,22 @@ struct llama_layer {
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
+    // Qwen4 experimental
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -607,6 +628,10 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // Qwen4 experimental
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;

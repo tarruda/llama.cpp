@@ -16,6 +16,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-qwen4.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -319,6 +320,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
+        case LLM_ARCH_QWEN4EXP:
+            return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -576,7 +579,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
             const int64_t n_k_heads  = hparams.ssm_n_group;
@@ -714,7 +717,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_QWEN4EXP) {
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
@@ -1981,6 +1984,7 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_QWEN3NEXT ||
                 arch == LLM_ARCH_QWEN35 ||
                 arch == LLM_ARCH_QWEN35MOE ||
+                arch == LLM_ARCH_QWEN4EXP ||
                 arch == LLM_ARCH_NEMOTRON_H ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
             LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);
@@ -2207,6 +2211,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RND1:
             {
                 res = nullptr;
+            } break;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                res = new llama_memory_qwen4(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.n_ctx_seq,
+                        1,
+                        cparams.n_seq_max,
+                        cparams.n_rs_seq,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
             } break;
         case LLM_ARCH_MINIMAX_M3:
             {
@@ -2895,6 +2914,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:
             return LLAMA_ROPE_TYPE_IMROPE;
 
