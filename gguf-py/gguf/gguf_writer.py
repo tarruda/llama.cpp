@@ -1017,17 +1017,65 @@ class GGUFWriter:
     def add_attention_compress_ratios(self, values: Sequence[int]) -> None:
         self.add_array(Keys.Attention.COMPRESS_RATIOS.format(arch=self.arch), values)
 
+    def add_attention_recurrent_layers(self, values: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), values)
+
     def add_attention_compress_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), value)
 
     def add_hyper_connection_count(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.COUNT.format(arch=self.arch), count)
 
+    def add_hyper_connection_low_rank(self, length: int) -> None:
+        self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), length)
+
     def add_hyper_connection_sinkhorn_iterations(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.SINKHORN_ITERATIONS.format(arch=self.arch), count)
 
     def add_hyper_connection_epsilon(self, value: float) -> None:
         self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_layers(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.PerLayerEmbedding.LAYERS.format(arch=self.arch), values)
+
+    def add_per_layer_embedding_ngram_size(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.NGRAM_SIZE.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_heads_per_ngram(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.HEADS_PER_NGRAM.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_vocab_size_divisor(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.VOCAB_SIZE_DIVISOR.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_conv_kernel(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.CONV_KERNEL.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_eos_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.EOS_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_per_layer_embedding_layer_multipliers(self, values: Sequence[int]) -> None:
+        self.add_key_value(
+            Keys.PerLayerEmbedding.LAYER_MULTIPLIERS.format(arch=self.arch),
+            values,
+            GGUFValueType.ARRAY,
+            GGUFValueType.INT64,
+        )
+
+    def add_per_layer_embedding_head_offsets(self, values: Sequence[int]) -> None:
+        self.add_key_value(
+            Keys.PerLayerEmbedding.HEAD_OFFSETS.format(arch=self.arch),
+            values,
+            GGUFValueType.ARRAY,
+            GGUFValueType.INT64,
+        )
+
+    def add_per_layer_embedding_head_vocab_sizes(self, values: Sequence[int]) -> None:
+        self.add_key_value(
+            Keys.PerLayerEmbedding.HEAD_VOCAB_SIZES.format(arch=self.arch),
+            values,
+            GGUFValueType.ARRAY,
+            GGUFValueType.INT64,
+        )
 
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
