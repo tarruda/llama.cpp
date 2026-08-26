@@ -4041,6 +4041,31 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+struct test_qwen4exp_hc_reduce : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_qwen4exp_hc_reduce(int64_t n_embd, int64_t hc, int64_t n_tokens)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * out = ggml_qwen4exp_hc_reduce(ctx, x, gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -8366,6 +8391,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(1, 2, 1));
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(31, 4, 17));
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(128, 4, 257));
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, 32));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

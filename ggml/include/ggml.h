@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QWEN4EXP_HC_REDUCE,
 
         GGML_OP_UNARY,
 
@@ -2653,6 +2654,15 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Qwen4-Exp hyper-connection reduction
+    // x, gate: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*gate[i, h, t]/hc
+    //
+    GGML_API struct ggml_tensor * ggml_qwen4exp_hc_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate);
 
     // custom operators
 

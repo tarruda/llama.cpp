@@ -49,6 +49,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_QWEN4EXP_HC_REDUCE,
 };
 
 enum llm_ffn_op_type : int {

@@ -2331,6 +2331,7 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     private:
         ggml_tensor * build_hc_norm(ggml_tensor * input, ggml_tensor * weight, int il);
+        ggml_tensor * build_hc_reduce(ggml_tensor * input, ggml_tensor * gate, int il);
         std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *> build_hc_mix(
                 ggml_tensor * input,
                 ggml_tensor * norm,

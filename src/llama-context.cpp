@@ -80,6 +80,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_qwen4exp_hc_reduce_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QWEN4EXP_HC_REDUCE,
+    /*.name             =*/ "fused Qwen4-Exp HC reduce",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -239,6 +245,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_qwen4exp_hc_reduce = true;
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
@@ -570,10 +577,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        LLAMA_LOG_INFO("%s: resolving fused hyper-connection support:\n", func);
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_qwen4exp_hc_reduce_probe, cparams.fused_qwen4exp_hc_reduce);
         cparams.auto_fhc = false;
     }
 }
