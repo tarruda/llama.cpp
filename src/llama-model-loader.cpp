@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -321,10 +322,13 @@ namespace GGUFMeta {
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
                                               (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:
+            case GGUF_TYPE_INT64:   type_ok = (std::is_same<T,     int64_t>::value) ||
+                                              (std::is_same<T,    uint64_t>::value); break;
             case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
             case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s has unsupported array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
         }
         if (!type_ok) {
             throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
@@ -337,6 +341,32 @@ namespace GGUFMeta {
             for (size_t i = 0; i < n_items; i++) {
                 const T value = gguf_get_arr_str(ctx, kid, i);
                 result.emplace_back(value);
+            }
+        } else if constexpr (std::is_same<T, int64_t>::value) {
+            result.resize(arr_info.length);
+            if (arr_info.gt == GGUF_TYPE_UINT64) {
+                const uint64_t * values = (const uint64_t *) arr_info.data;
+                std::transform(values, values + arr_info.length, result.begin(), [&](uint64_t value) {
+                    if (value > uint64_t(std::numeric_limits<int64_t>::max())) {
+                        throw std::runtime_error(format("%s contains a uint64 value that does not fit in int64", key.c_str()));
+                    }
+                    return static_cast<int64_t>(value);
+                });
+            } else {
+                result.assign((const int64_t *) arr_info.data, (const int64_t *) arr_info.data + arr_info.length);
+            }
+        } else if constexpr (std::is_same<T, uint64_t>::value) {
+            result.resize(arr_info.length);
+            if (arr_info.gt == GGUF_TYPE_INT64) {
+                const int64_t * values = (const int64_t *) arr_info.data;
+                std::transform(values, values + arr_info.length, result.begin(), [&](int64_t value) {
+                    if (value < 0) {
+                        throw std::runtime_error(format("%s contains a negative int64 value", key.c_str()));
+                    }
+                    return static_cast<uint64_t>(value);
+                });
+            } else {
+                result.assign((const uint64_t *) arr_info.data, (const uint64_t *) arr_info.data + arr_info.length);
             }
         } else {
             result.resize(arr_info.length);
@@ -409,7 +439,10 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<int64_t>>(enum llm_kv kid, std::vector<int64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+    template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<int64_t>(const std::string & key, std::vector<int64_t> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -436,6 +469,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
+    template bool llama_model_loader::get_key<uint32_t>(const std::string & key, uint32_t & result, bool required);
 
     template<>
     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
