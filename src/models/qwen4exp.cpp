@@ -459,16 +459,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_reduce(
     const int64_t n_hc = hparams.qwen4_hc_count;
     const int64_t n_tokens_cur = input->ne[1];
 
+    input = ggml_reshape_3d(ctx0, input, n_embd, n_hc, n_tokens_cur);
+    gate = ggml_reshape_3d(ctx0, gate, n_embd, n_hc, n_tokens_cur);
+    gate = ggml_sigmoid(ctx0, gate);
+    cb(gate, "hc_gate", il);
+
     if (cparams.fused_qwen4exp_hc_reduce && il >= 0) {
-        input = ggml_reshape_3d(ctx0, input, n_embd, n_hc, n_tokens_cur);
-        gate = ggml_reshape_3d(ctx0, gate, n_embd, n_hc, n_tokens_cur);
         ggml_tensor * result = ggml_qwen4exp_hc_reduce(ctx0, input, gate);
         res->add_fused_node({ LLM_FUSED_OP_QWEN4EXP_HC_REDUCE, result, il });
         return result;
     }
 
     ggml_tensor * result = ggml_mul(ctx0, gate, input);
-    result = ggml_reshape_3d(ctx0, result, n_embd, n_hc, n_tokens_cur);
     return qwen4_hc_mean(ctx0, result);
 }
 
@@ -486,8 +488,6 @@ std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::gr
     mix = ggml_scale(ctx0, mix, 1.0f / n_hc);
     mix = ggml_silu(ctx0, mix);
     mix = build_lora_mm(up, mix);
-    mix = ggml_sigmoid(ctx0, mix);
-    cb(mix, "hc_gate", il);
     mix = build_hc_reduce(normalized, mix, il);
 
     ggml_tensor * injection = build_lora_mm(inject, normalized);
@@ -538,7 +538,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_head(
     mix = ggml_scale(ctx0, mix, 1.0f / n_hc);
     mix = ggml_silu(ctx0, mix);
     mix = build_lora_mm(up, mix);
-    mix = ggml_sigmoid(ctx0, mix);
     return build_hc_reduce(normalized, mix, il);
 }
 

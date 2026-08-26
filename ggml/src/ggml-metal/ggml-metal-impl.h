@@ -1265,6 +1265,7 @@ typedef struct {
 typedef struct {
     int32_t n_embd;
     int32_t n_tokens;
+    int32_t gate_sigmoid;
 } ggml_metal_kargs_qwen4exp_hc_reduce;
 
 typedef struct {

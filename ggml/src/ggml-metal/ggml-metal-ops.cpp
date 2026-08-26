@@ -26,6 +26,13 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     return ggml_metal_buffer_get_id(ctx, t);
 }
 
+static int ggml_metal_op_qwen4exp_hc_reduce_impl(
+        ggml_metal_op_t     ctx,
+        int                 idx,
+        const ggml_tensor * gate,
+        bool                gate_sigmoid,
+        int                 n_fuse);
+
 struct ggml_metal_op {
     ggml_metal_op(
         ggml_metal_device_t dev,
@@ -87,6 +94,18 @@ struct ggml_metal_op {
         }
 
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
+    }
+
+    bool can_fuse_subgraph(int i0, const ggml_op * ops, int n_ops) const {
+        assert(use_fusion);
+        assert(i0 >= 0 && i0 < n_nodes());
+
+        if (i0 + n_ops > n_nodes()) {
+            return false;
+        }
+
+        const int output = idxs[i0 + n_ops - 1];
+        return ggml_can_fuse_subgraph_ext(gf, idxs.data() + i0, n_ops, ops, &output, 1);
     }
 
     ggml_metal_device_t  dev;
@@ -777,6 +796,19 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (ctx->use_fusion && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID) {
+        const ggml_op fops[] = { GGML_OP_UNARY, GGML_OP_QWEN4EXP_HC_REDUCE };
+        if (ctx->can_fuse_subgraph(idx, fops, 2)) {
+            ggml_tensor * reduce = ctx->node(idx + 1);
+            if (reduce->src[1] == op && ggml_metal_device_supports_op(ctx->dev, reduce)) {
+                if (ctx->debug_fusion > 1) {
+                    GGML_LOG_DEBUG("%s: fuse: SIGMOID + QWEN4EXP_HC_REDUCE\n", __func__);
+                }
+                return ggml_metal_op_qwen4exp_hc_reduce_impl(ctx, idx + 1, op->src[0], true, 2);
+            }
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -1517,16 +1549,21 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
+static int ggml_metal_op_qwen4exp_hc_reduce_impl(
+        ggml_metal_op_t     ctx,
+        int                 idx,
+        const ggml_tensor * gate,
+        bool                gate_sigmoid,
+        int                 n_fuse) {
     ggml_tensor * op = ctx->node(idx);
-    const ggml_tensor * x    = op->src[0];
-    const ggml_tensor * gate = op->src[1];
+    const ggml_tensor * x = op->src[0];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(gate->type == GGML_TYPE_F32);
     GGML_ASSERT(op->type == GGML_TYPE_F32);
     GGML_ASSERT(x->ne[1] == 4);
     GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(x, op->src[1]));
     GGML_ASSERT(ggml_are_same_shape(x, gate));
     GGML_ASSERT(op->ne[0] == x->ne[0]);
     GGML_ASSERT(op->ne[1] == x->ne[2]);
@@ -1535,9 +1572,14 @@ int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ggml_is_contiguous(op));
 
     ggml_metal_kargs_qwen4exp_hc_reduce args = {
-        /*.n_embd   =*/ (int32_t) x->ne[0],
-        /*.n_tokens =*/ (int32_t) x->ne[2],
+        /*.n_embd       =*/ (int32_t) x->ne[0],
+        /*.n_tokens     =*/ (int32_t) x->ne[2],
+        /*.gate_sigmoid =*/ (int32_t) gate_sigmoid,
     };
+
+    if (n_fuse > 1 && !ggml_metal_op_concurrency_check(ctx, op)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     ggml_metal_encoder_t enc = ctx->enc;
     auto pipeline = ggml_metal_library_get_pipeline_qwen4exp_hc_reduce(ctx->lib);
@@ -1552,7 +1594,12 @@ int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(
             enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
+}
+
+int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    return ggml_metal_op_qwen4exp_hc_reduce_impl(ctx, idx, op->src[1], false, 1);
 }
 
 int ggml_metal_op_qwen4exp_hc_combine(ggml_metal_op_t ctx, int idx) {

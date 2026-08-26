@@ -615,7 +615,11 @@ kernel void kernel_qwen4exp_hc_reduce_f32(
     float result = 0.0f;
     FOR_UNROLL (ushort ih = 0; ih < hc; ++ih) {
         const int idx = offset + ih*args.n_embd;
-        result = fma(x[idx], gate[idx], result);
+        float weight = gate[idx];
+        if (args.gate_sigmoid) {
+            weight = 1.0f/(1.0f + exp(-weight));
+        }
+        result = fma(x[idx], weight, result);
     }
 
     dst[it*args.n_embd + i0] = result*0.25f;

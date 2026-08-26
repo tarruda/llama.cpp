@@ -4045,13 +4045,18 @@ struct test_qwen4exp_hc_reduce : public test_case {
     const int64_t n_embd;
     const int64_t hc;
     const int64_t n_tokens;
+    const bool gate_sigmoid;
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, hc, n_tokens);
+        return VARS_TO_STR4(n_embd, hc, n_tokens, gate_sigmoid);
     }
 
-    test_qwen4exp_hc_reduce(int64_t n_embd, int64_t hc, int64_t n_tokens)
-        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+    test_qwen4exp_hc_reduce(int64_t n_embd, int64_t hc, int64_t n_tokens, bool gate_sigmoid = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), gate_sigmoid(gate_sigmoid) {}
+
+    bool run_whole_graph() override {
+        return gate_sigmoid;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
@@ -4059,6 +4064,9 @@ struct test_qwen4exp_hc_reduce : public test_case {
 
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
         ggml_set_name(gate, "gate");
+        if (gate_sigmoid) {
+            gate = ggml_sigmoid(ctx, gate);
+        }
 
         ggml_tensor * out = ggml_qwen4exp_hc_reduce(ctx, x, gate);
         ggml_set_name(out, "out");
@@ -8424,6 +8432,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(31, 4, 17));
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(128, 4, 257));
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, 32));
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(31, 4, 17, true));
+    test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, 32, true));
 
     test_cases.emplace_back(new test_qwen4exp_hc_combine(1, 2, 1));
     test_cases.emplace_back(new test_qwen4exp_hc_combine(31, 4, 17));
@@ -10200,6 +10210,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     for (int64_t n_tokens : {1, 8, 32, 512, 2048}) {
         test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens));
+        test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens, true));
         test_cases.emplace_back(new test_qwen4exp_hc_combine(2560, 4, n_tokens));
     }
 
