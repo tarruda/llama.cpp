@@ -24,7 +24,10 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+                     uint32_t   state_size_r = 0,
+                     uint32_t   state_size_s = 0,
+                   const char * cache_name = "cache");
 
     ~llama_memory_recurrent() = default;
 
@@ -115,6 +118,9 @@ public:
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
+
+    const uint32_t state_size_r;
+    const uint32_t state_size_s;
 
     const uint32_t n_seq_max = 1;
 
