@@ -217,6 +217,7 @@ bool llama_batch_allocr::init(
             /*.n_seqs_unq   =*/ (uint32_t) this->seq_id_unq.size(),
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
+            /*.token_orig   =*/ batch.token_orig,
             /*.embd         =*/ batch.embd,
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
@@ -401,6 +402,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
     udata->token     .resize(n_tokens);
+    udata->token_orig.clear();
     udata->embd      .clear();
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
@@ -423,6 +425,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ udata->token.data(),
+        /*.token_orig   =*/ nullptr,
         /*.embd         =*/ nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
@@ -757,6 +760,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
+    udata->token_orig.resize(batch.token_orig ? n_tokens : 0);
     udata->embd      .resize(n_embd_all);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
@@ -772,6 +776,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     for (size_t i = 0; i < idxs.size(); ++i) {
         if (batch.token) {
             udata->token[i] = batch.token[idxs[i]];
+        }
+
+        if (batch.token_orig) {
+            udata->token_orig[i] = batch.token_orig[idxs[i]];
         }
 
         if (batch.embd) {
@@ -824,6 +832,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
+        /*.token_orig   =*/ batch.token_orig ? udata->token_orig.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
@@ -939,6 +948,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*token_orig =*/ nullptr,
     };
 }
 
@@ -951,6 +961,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*token_orig =*/ nullptr,
     };
 
     if (embd) {

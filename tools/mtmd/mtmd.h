@@ -226,6 +226,8 @@ MTMD_API enum mtmd_input_chunk_type mtmd_input_chunk_get_type        (const mtmd
 MTMD_API const llama_token *        mtmd_input_chunk_get_tokens_text (const mtmd_input_chunk * chunk, size_t * n_tokens_output);
 MTMD_API const mtmd_image_tokens *  mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk);
 MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd_input_chunk * chunk);
+// original token ID corresponding to each embedding row, or LLAMA_TOKEN_NULL
+MTMD_API llama_token                mtmd_input_chunk_get_embd_token_id(const mtmd_input_chunk * chunk);
 // returns nullptr for ID on text chunk
 MTMD_API const char *               mtmd_input_chunk_get_id          (const mtmd_input_chunk * chunk);
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)

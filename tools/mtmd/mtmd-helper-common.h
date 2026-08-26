@@ -75,14 +75,18 @@ struct decode_embd_batch {
     int n_mmproj_embd;
     std::vector<llama_pos>      pos;
     std::vector<llama_pos>      pos_view; // used by mrope
+    std::vector<llama_token>    token_orig;
     std::vector<int32_t>        n_seq_id;
     std::vector<llama_seq_id>   seq_id_0;
     std::vector<llama_seq_id *> seq_ids;
     std::vector<int8_t>         logits;
     llama_batch batch;
-    decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
+    decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd, llama_token token_orig_id = LLAMA_TOKEN_NULL) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
         GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
         pos     .resize((size_t) n_tokens * (size_t) n_pos_per_embd);
+        if (token_orig_id != LLAMA_TOKEN_NULL) {
+            token_orig.resize(n_tokens, token_orig_id);
+        }
         n_seq_id.resize(n_tokens);
         seq_ids .resize(n_tokens + 1);
         logits  .resize(n_tokens);
@@ -96,6 +100,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ n_seq_id.data(),
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
+            /*token_orig     =*/ token_orig.empty() ? nullptr : token_orig.data(),
         };
     }
 
@@ -179,6 +184,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ batch.n_seq_id + offset,
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
+            /*token_orig     =*/ batch.token_orig ? batch.token_orig + offset : nullptr,
         };
     }
 };

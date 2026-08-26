@@ -130,6 +130,27 @@ static void test_init(testing & t) {
         }
     });
 
+    t.test("preserves_original_tokens_for_embeddings", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, false);
+        bb.add(2, {0}, true);
+
+        std::vector<llama_token> token_orig = { 11, 22, 33 };
+        llama_batch batch = bb.make();
+        batch.token_orig = token_orig.data();
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(batch, vocab, nullptr, bb.n_embd, 1, false));
+
+        const llama_ubatch ubatch = ba.split_simple(2);
+        t.assert_true(ubatch.token == nullptr);
+        t.assert_true(ubatch.embd != nullptr);
+        t.assert_true(ubatch.token_orig != nullptr);
+        t.assert_equal(11, ubatch.token_orig[0]);
+        t.assert_equal(22, ubatch.token_orig[1]);
+    });
+
     t.test("autofill_defaults", [&](testing & t) {
         batch_builder bb;
         for (int i = 0; i < 4; ++i) {

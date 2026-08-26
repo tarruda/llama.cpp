@@ -27,7 +27,7 @@
 #include <vector>
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 1
+#define MTMD_SERIALIZATION_VERSION 2
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -325,6 +325,7 @@ struct mtmd_input_chunk {
     std::vector<llama_token> tokens_text;
     mtmd_image_tokens_ptr tokens_image;
     mtmd_audio_tokens_ptr tokens_audio;
+    llama_token token_orig = LLAMA_TOKEN_NULL;
 
     bool can_batch_with(const mtmd_input_chunk & other) const {
         if (type != other.type) {
@@ -367,6 +368,8 @@ struct mtmd_input_chunk {
         if (tokens_audio) {
             tokens_audio->serialize(ser);
         }
+
+        ser.write((int32_t)token_orig);
     }
     void deserialize(mtmd_serialization & ser) {
         uint32_t type_raw = ser.read<uint32_t>();
@@ -398,6 +401,8 @@ struct mtmd_input_chunk {
         } else {
             tokens_audio.reset();
         }
+
+        token_orig = (llama_token)ser.read<int32_t>();
 
         // catch buffers where the declared type doesn't match which payload is actually present,
         // so a mismatched chunk can't slip through and null-deref/abort later in an accessor
@@ -511,6 +516,8 @@ struct mtmd_context {
     std::vector<llama_token> tok_sli_img_end;   // single slice end
     std::vector<llama_token> tok_sli_img_mid;   // between 2 slices
     std::vector<llama_token> tok_row_end;       // end of row
+    llama_token tok_image_embd = LLAMA_TOKEN_NULL;
+    llama_token tok_video_embd = LLAMA_TOKEN_NULL;
     bool tok_row_end_trail = false;
     bool ov_img_first      = false;
 
@@ -694,6 +701,10 @@ struct mtmd_context {
             case PROJECTOR_TYPE_QWEN3VL:
             case PROJECTOR_TYPE_MIMOVL:
                 {
+                    if (proj != PROJECTOR_TYPE_MIMOVL) {
+                        tok_image_embd = lookup_token("<|image_pad|>");
+                        tok_video_embd = lookup_token("<|video_pad|>");
+                    }
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
@@ -1501,6 +1512,7 @@ struct mtmd_tokenizer {
                     {}, // text tokens
                     std::move(image_tokens),
                     nullptr, // audio tokens
+                    bitmaps[0]->mergeable ? ctx->tok_video_embd : ctx->tok_image_embd,
                 };
                 cur.entries.emplace_back(std::move(chunk));
             }
@@ -2282,6 +2294,10 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
     }
 }
 
+llama_token mtmd_input_chunk_get_embd_token_id(const mtmd_input_chunk * chunk) {
+    return chunk->token_orig;
+}
+
 llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();
@@ -2309,6 +2325,7 @@ mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk) {
         chunk->tokens_text,
         nullptr,
         nullptr,
+        chunk->token_orig,
     };
     if (chunk->tokens_image) {
         // copy the image tokens
@@ -2500,6 +2517,7 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
         {}, // text tokens
         std::move(image_tokens),
         nullptr, // audio tokens
+        42,
     };
     chunks->entries.emplace_back(std::move(chunk_image));
 

@@ -141,7 +141,7 @@ int32_t mtmd_helper_decode_image_chunk(
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
-    decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
+    decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd, mtmd_input_chunk_get_embd_token_id(chunk));
 
     if (mtmd_decode_use_mrope(ctx)) {
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {

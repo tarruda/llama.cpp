@@ -185,6 +185,7 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.token_orig ? batch.token_orig + off : nullptr,
         };
 
         return view;

@@ -104,6 +104,7 @@ int main(void) {
         assert(mtmd_input_chunk_get_type(loaded) == type);
         assert(mtmd_input_chunk_get_n_tokens(loaded) == mtmd_input_chunk_get_n_tokens(chunk));
         assert(mtmd_input_chunk_get_n_pos(loaded) == mtmd_input_chunk_get_n_pos(chunk));
+        assert(mtmd_input_chunk_get_embd_token_id(loaded) == mtmd_input_chunk_get_embd_token_id(chunk));
 
         if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
             size_t n_tok_orig, n_tok_loaded;
