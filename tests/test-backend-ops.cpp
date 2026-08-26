@@ -10200,6 +10200,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     for (int64_t n_tokens : {1, 8, 32, 512, 2048}) {
         test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens));
+        test_cases.emplace_back(new test_qwen4exp_hc_combine(2560, 4, n_tokens));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

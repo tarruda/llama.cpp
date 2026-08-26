@@ -1268,6 +1268,11 @@ typedef struct {
 } ggml_metal_kargs_qwen4exp_hc_reduce;
 
 typedef struct {
+    int32_t n_embd;
+    int32_t n_tokens;
+} ggml_metal_kargs_qwen4exp_hc_combine;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

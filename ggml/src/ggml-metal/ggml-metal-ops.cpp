@@ -335,6 +335,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_qwen4exp_hc_reduce(ctx, idx);
             } break;
+        case GGML_OP_QWEN4EXP_HC_COMBINE:
+            {
+                n_fuse = ggml_metal_op_qwen4exp_hc_combine(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1542,6 +1546,50 @@ int ggml_metal_op_qwen4exp_hc_reduce(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),    1);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 2);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   3);
+
+    const int n_tiles = (args.n_embd + 31)/32;
+    const int nsg = std::min(4, n_tiles);
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, 32, nsg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_qwen4exp_hc_combine(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * residual  = op->src[0];
+    const ggml_tensor * x         = op->src[1];
+    const ggml_tensor * injection = op->src[2];
+
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(injection->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->ne[1] == 4);
+    GGML_ASSERT(residual->ne[3] == 1);
+    GGML_ASSERT(x->ne[0] == residual->ne[0]);
+    GGML_ASSERT(x->ne[1] == residual->ne[2]);
+    GGML_ASSERT(injection->ne[0] == 4);
+    GGML_ASSERT(injection->ne[1] == residual->ne[2]);
+    GGML_ASSERT(ggml_are_same_shape(op, residual));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(injection));
+    GGML_ASSERT(ggml_is_contiguous(op));
+
+    ggml_metal_kargs_qwen4exp_hc_combine args = {
+        /*.n_embd   =*/ (int32_t) residual->ne[0],
+        /*.n_tokens =*/ (int32_t) residual->ne[2],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_qwen4exp_hc_combine(ctx->lib);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(residual),  1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),         2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(injection), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),        4);
 
     const int n_tiles = (args.n_embd + 31)/32;
     const int nsg = std::min(4, n_tiles);
