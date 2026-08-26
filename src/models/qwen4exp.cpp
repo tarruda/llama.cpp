@@ -491,9 +491,6 @@ std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::gr
     mix = build_hc_reduce(normalized, mix, il);
 
     ggml_tensor * injection = build_lora_mm(inject, normalized);
-    injection = ggml_scale(ctx0, injection, 1.0f / n_hc);
-    injection = ggml_sigmoid(ctx0, injection);
-    injection = ggml_scale(ctx0, injection, 2.0f);
 
     return { mix, input, injection };
 }
@@ -506,6 +503,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t n_hc = hparams.qwen4_hc_count;
     const int64_t n_tokens_cur = output->ne[1];
 
+    if (cparams.fused_qwen4exp_hc_combine && il >= 0) {
+        residual = ggml_reshape_3d(ctx0, residual, n_embd, n_hc, n_tokens_cur);
+        ggml_tensor * result = ggml_qwen4exp_hc_combine(ctx0, residual, output, injection);
+        res->add_fused_node({ LLM_FUSED_OP_QWEN4EXP_HC_COMBINE, result, il });
+        result = ggml_reshape_2d(ctx0, result, n_embd * n_hc, n_tokens_cur);
+        cb(result, "hc_combine", il);
+        return result;
+    }
+
+    injection = ggml_scale(ctx0, injection, 1.0f / n_hc);
+    injection = ggml_sigmoid(ctx0, injection);
+    injection = ggml_scale(ctx0, injection, 2.0f);
     output = ggml_reshape_3d(ctx0, output, n_embd, 1, n_tokens_cur);
     output = ggml_repeat_4d(ctx0, output, n_embd, n_hc, n_tokens_cur, 1);
     injection = ggml_reshape_3d(ctx0, injection, 1, n_hc, n_tokens_cur);

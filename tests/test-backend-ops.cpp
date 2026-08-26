@@ -4066,6 +4066,34 @@ struct test_qwen4exp_hc_reduce : public test_case {
     }
 };
 
+struct test_qwen4exp_hc_combine : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_qwen4exp_hc_combine(int64_t n_embd, int64_t hc, int64_t n_tokens)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * injection = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(injection, "injection");
+
+        ggml_tensor * out = ggml_qwen4exp_hc_combine(ctx, residual, x, injection);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -8396,6 +8424,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(31, 4, 17));
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(128, 4, 257));
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, 32));
+
+    test_cases.emplace_back(new test_qwen4exp_hc_combine(1, 2, 1));
+    test_cases.emplace_back(new test_qwen4exp_hc_combine(31, 4, 17));
+    test_cases.emplace_back(new test_qwen4exp_hc_combine(128, 4, 257));
+    test_cases.emplace_back(new test_qwen4exp_hc_combine(2560, 4, 32));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
