@@ -2330,6 +2330,12 @@ struct llama_model_qwen4exp : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
     private:
+        struct qsa_selection {
+            ggml_tensor * mask = nullptr;
+            ggml_tensor * indices = nullptr;
+            ggml_tensor * index_mask = nullptr;
+        };
+
         ggml_tensor * build_hc_norm(ggml_tensor * input, ggml_tensor * weight, int il);
         ggml_tensor * build_hc_reduce(ggml_tensor * input, ggml_tensor * gate, int il);
         std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *> build_hc_mix(
@@ -2358,7 +2364,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                         ggml_tensor * inp_pos,
                                 int * sections,
                                 int   il);
-        ggml_tensor * build_qsa_mask(
+        qsa_selection build_qsa_selection(
                 llm_graph_input_attn_kv_msa * inp,
                 llm_graph_input_qwen4_qsa * qsa,
                         ggml_tensor * cur,

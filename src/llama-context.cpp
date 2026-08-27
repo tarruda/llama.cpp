@@ -98,6 +98,12 @@ static const llm_fused_op_probe llm_fused_op_qsa_block_score_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_qsa_attn_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_ATTN,
+    /*.name             =*/ "indexed QSA attention",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -263,6 +269,8 @@ llama_context::llama_context(
 
     cparams.fused_qsa_block_score = true;
     cparams.auto_fqsa_block_score  = true;
+    cparams.fused_qsa_attn = true;
+    cparams.auto_fqsa_attn  = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -606,6 +614,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving QSA block score support:\n", func);
         resolve(llm_fused_op_qsa_block_score_probe, cparams.fused_qsa_block_score);
         cparams.auto_fqsa_block_score = false;
+    }
+
+    if (cparams.auto_fqsa_attn) {
+        LLAMA_LOG_INFO("%s: resolving indexed QSA attention support:\n", func);
+        resolve(llm_fused_op_qsa_attn_probe, cparams.fused_qsa_attn);
+        cparams.auto_fqsa_attn = false;
     }
 }
 

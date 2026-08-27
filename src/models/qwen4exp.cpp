@@ -40,7 +40,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->set_input_qsa_layout(
-                block_cells, block_key_cells, block_mask, selected,
+                block_cells, block_key_cells, block_mask, selected, tail_cells,
                 update_cells, update_pos, update_idxs,
                 kq_mask, ubatch, ratio, block_topk, selected->ne[0], n_stream);
     }
@@ -62,6 +62,8 @@ public:
         result &= block_mask->ne[1] == params.ubatch.n_tokens;
         result &= selected->ne[0] == n_kv;
         result &= selected->ne[1] == params.ubatch.n_tokens;
+        result &= tail_cells->ne[0] == ratio - 1;
+        result &= tail_cells->ne[1] == params.ubatch.n_tokens;
         result &= update_cells->ne[1] == n_updates;
         result &= n_stream == n_stream_new;
         return result;
@@ -71,6 +73,7 @@ public:
     ggml_tensor * block_key_cells = nullptr;
     ggml_tensor * block_mask = nullptr;
     ggml_tensor * selected = nullptr;
+    ggml_tensor * tail_cells = nullptr;
     ggml_tensor * update_cells = nullptr;
     ggml_tensor * update_pos = nullptr;
     ggml_tensor * update_idxs = nullptr;
@@ -571,6 +574,7 @@ llm_graph_input_qwen4_qsa * llama_model_qwen4exp::graph::build_qsa_input(
     qsa_input->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_tokens);
     qsa_input->block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blocks, n_tokens);
     qsa_input->selected = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+    qsa_input->tail_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ratio - 1, n_tokens);
     qsa_input->update_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ratio, n_updates);
     qsa_input->update_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_updates, hparams.n_pos_per_embd());
     qsa_input->update_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_updates);
@@ -578,6 +582,7 @@ llm_graph_input_qwen4_qsa * llama_model_qwen4exp::graph::build_qsa_input(
     ggml_set_input(qsa_input->block_key_cells);
     ggml_set_input(qsa_input->block_mask);
     ggml_set_input(qsa_input->selected);
+    ggml_set_input(qsa_input->tail_cells);
     ggml_set_input(qsa_input->update_cells);
     ggml_set_input(qsa_input->update_pos);
     ggml_set_input(qsa_input->update_idxs);
@@ -585,6 +590,7 @@ llm_graph_input_qwen4_qsa * llama_model_qwen4exp::graph::build_qsa_input(
     ggml_set_name(qsa_input->block_key_cells, "qsa_block_key_cells");
     ggml_set_name(qsa_input->block_mask, "qsa_block_mask");
     ggml_set_name(qsa_input->selected, "qsa_selected_base");
+    ggml_set_name(qsa_input->tail_cells, "qsa_tail_cells");
     ggml_set_name(qsa_input->update_cells, "qsa_update_cells");
     ggml_set_name(qsa_input->update_pos, "qsa_update_pos");
     ggml_set_name(qsa_input->update_idxs, "qsa_update_idxs");
@@ -662,17 +668,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(k, "Kcur", il);
     cb(v, "Vcur", il);
 
-    inp->self_kq_mask_cnv = qsa ? build_qsa_mask(inp, qsa, cur, inp_pos, sections, il) : inp->self_kq_mask;
+    const qsa_selection selection = qsa ? build_qsa_selection(inp, qsa, cur, inp_pos, sections, il) : qsa_selection{};
+    inp->self_kq_mask_cnv = selection.mask ? selection.mask : inp->self_kq_mask;
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-    cur = build_attn(inp, nullptr, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, kq_scale, il);
+    cur = build_attn(inp, nullptr, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, kq_scale, il, selection.indices, selection.index_mask);
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_out", il);
     return cur;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
+llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qsa_selection(
         llm_graph_input_attn_kv_msa * inp,
         llm_graph_input_qwen4_qsa *   qsa,
         ggml_tensor *                 cur,
@@ -740,8 +747,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
             qsa->update_idxs);
 
     std::vector<ggml_tensor *> selected_streams;
+    std::vector<ggml_tensor *> index_streams;
+    std::vector<ggml_tensor *> index_mask_streams;
     selected_streams.reserve(n_stream);
+    index_streams.reserve(n_stream);
+    index_mask_streams.reserve(n_stream);
     const bool use_fused_block_score = cparams.fused_qsa_block_score && n_tps == 1;
+    const bool use_indexed_attn = cparams.fused_qsa_attn && cparams.flash_attn && n_tps == 1;
 
     for (int64_t is = 0; is < n_stream; ++is) {
         ggml_tensor * block_cells = ggml_view_3d(
@@ -782,16 +794,51 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         top_cells = ggml_reshape_2d(ctx0, top_cells, selected_per_query, n_tps);
         cb(top_cells, "index_selected_cells", il);
 
-        ggml_tensor * base_selected = ggml_view_2d(
-                ctx0, qsa->selected, n_kv, n_tps,
-                qsa->selected->nb[1], is * n_tps * qsa->selected->nb[1]);
-        base_selected = ggml_reshape_3d(ctx0, base_selected, 1, n_kv, n_tps);
-        ggml_tensor * selected_top = ggml_fill(ctx0, base_selected, 0.0f);
-        ggml_tensor * ones = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, selected_per_query, n_tps);
-        ones = ggml_fill(ctx0, ones, 1.0f);
-        selected_top = ggml_set_rows(ctx0, selected_top, ones, top_cells);
-        ggml_tensor * selected_stream = ggml_clamp(ctx0, ggml_add(ctx0, base_selected, selected_top), 0.0f, 1.0f);
-        selected_streams.push_back(ggml_reshape_2d(ctx0, selected_stream, n_kv, n_tps));
+        if (use_indexed_attn) {
+            ggml_tensor * top_mask = ggml_get_rows(
+                    ctx0, ggml_reshape_3d(ctx0, block_mask, 1, n_blocks, n_tps), top_blocks);
+            top_mask = ggml_repeat_4d(ctx0, top_mask, ratio, block_topk, n_tps, 1);
+            top_mask = ggml_reshape_2d(ctx0, top_mask, selected_per_query, n_tps);
+            top_mask = ggml_cast(ctx0, top_mask, GGML_TYPE_F16);
+
+            ggml_tensor * tail_cells = ggml_view_2d(
+                    ctx0, qsa->tail_cells, ratio - 1, n_tps,
+                    qsa->tail_cells->nb[1], is * n_tps * qsa->tail_cells->nb[1]);
+            // Keep the base mask allocated because the QSA layout uses it to resolve visible cells.
+            ggml_tensor * tail_mask = ggml_view_1d(ctx0, qsa->kq_mask, (ratio - 1)*n_tps, 0);
+            tail_mask = ggml_reshape_2d(ctx0, tail_mask, ratio - 1, n_tps);
+            tail_mask = ggml_fill(ctx0, tail_mask, 0.0f);
+
+            index_streams.push_back(ggml_concat(ctx0, top_cells, tail_cells, 0));
+            index_mask_streams.push_back(ggml_concat(ctx0, top_mask, tail_mask, 0));
+        } else {
+            ggml_tensor * base_selected = ggml_view_2d(
+                    ctx0, qsa->selected, n_kv, n_tps,
+                    qsa->selected->nb[1], is * n_tps * qsa->selected->nb[1]);
+            base_selected = ggml_reshape_3d(ctx0, base_selected, 1, n_kv, n_tps);
+            ggml_tensor * selected_top = ggml_fill(ctx0, base_selected, 0.0f);
+            ggml_tensor * ones = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, selected_per_query, n_tps);
+            ones = ggml_fill(ctx0, ones, 1.0f);
+            selected_top = ggml_set_rows(ctx0, selected_top, ones, top_cells);
+            ggml_tensor * selected_stream = ggml_clamp(ctx0, ggml_add(ctx0, base_selected, selected_top), 0.0f, 1.0f);
+            selected_streams.push_back(ggml_reshape_2d(ctx0, selected_stream, n_kv, n_tps));
+        }
+    }
+
+    if (use_indexed_attn) {
+        ggml_tensor * indices = index_streams[0];
+        ggml_tensor * index_mask = index_mask_streams[0];
+        for (int64_t is = 1; is < n_stream; ++is) {
+            indices = ggml_concat(ctx0, indices, index_streams[is], 1);
+            index_mask = ggml_concat(ctx0, index_mask, index_mask_streams[is], 1);
+        }
+
+        const int64_t n_select = selected_per_query + ratio - 1;
+        indices = ggml_reshape_4d(ctx0, indices, n_select, n_tps, 1, n_stream);
+        index_mask = ggml_reshape_4d(ctx0, index_mask, n_select, n_tps, 1, n_stream);
+        cb(indices, "qsa_indices", il);
+        cb(index_mask, "qsa_index_mask", il);
+        return { nullptr, indices, index_mask };
     }
 
     ggml_tensor * selected = selected_streams[0];
@@ -809,7 +856,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
     }
     cb(mask, "qsa_mask", il);
-    return mask;
+    return { mask, nullptr, nullptr };
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(

@@ -9223,6 +9223,96 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
+void ggml_compute_forward_flash_attn_ext_indexed(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * indices = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
+
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(k->type       == GGML_TYPE_F16);
+    GGML_ASSERT(v->type       == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+
+    GGML_ASSERT(q->nb[0]       == sizeof(float));
+    GGML_ASSERT(k->nb[0]       == sizeof(ggml_fp16_t));
+    GGML_ASSERT(v->nb[0]       == sizeof(ggml_fp16_t));
+    GGML_ASSERT(indices->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(mask->nb[0]    == sizeof(ggml_fp16_t));
+    GGML_ASSERT(dst->nb[0]     == sizeof(float));
+
+    float scale;
+    float logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(scale));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 1, sizeof(logit_softcap));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const int64_t dk       = q->ne[0];
+    const int64_t dv       = v->ne[0];
+    const int64_t nr       = q->ne[1]*q->ne[2]*q->ne[3];
+    const int64_t q_per_kv = q->ne[2]/k->ne[2];
+
+    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
+        const int64_t iq1 = ir % q->ne[1];
+        const int64_t iq2 = (ir/q->ne[1]) % q->ne[2];
+        const int64_t iq3 = ir/(q->ne[1]*q->ne[2]);
+        const int64_t ik2 = iq2/q_per_kv;
+
+        const float * pq = (const float *) ((const char *) q->data + iq1*q->nb[1] + iq2*q->nb[2] + iq3*q->nb[3]);
+        float * out = (float *) ((char *) dst->data + iq2*dst->nb[1] + iq1*dst->nb[2] + iq3*dst->nb[3]);
+
+        ggml_vec_set_f32(dv, out, 0.0f);
+        float m = -INFINITY;
+        float s = 0.0f;
+
+        for (int64_t ii = 0; ii < indices->ne[0]; ++ii) {
+            const int32_t idx = *(const int32_t *) ((const char *) indices->data + ii*indices->nb[0] + iq1*indices->nb[1] + iq3*indices->nb[3]);
+            if (idx < 0) {
+                continue;
+            }
+            GGML_ASSERT(idx < k->ne[1]);
+
+            const float mv = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + ii*mask->nb[0] + iq1*mask->nb[1] + iq3*mask->nb[3]));
+            if (mv == -INFINITY) {
+                continue;
+            }
+
+            const ggml_fp16_t * pk = (const ggml_fp16_t *) ((const char *) k->data + (int64_t) idx*k->nb[1] + ik2*k->nb[2] + iq3*k->nb[3]);
+            const ggml_fp16_t * pv = (const ggml_fp16_t *) ((const char *) v->data + (int64_t) idx*v->nb[1] + ik2*v->nb[2] + iq3*v->nb[3]);
+
+            float score = 0.0f;
+            for (int64_t id = 0; id < dk; ++id) {
+                score += pq[id]*GGML_CPU_FP16_TO_FP32(pk[id]);
+            }
+            score *= scale;
+            if (logit_softcap != 0.0f) {
+                score = logit_softcap*tanhf(score);
+            }
+            score += mv;
+
+            const float m_new = MAX(m, score);
+            const float alpha = expf(m - m_new);
+            const float beta  = expf(score - m_new);
+            for (int64_t id = 0; id < dv; ++id) {
+                out[id] = out[id]*alpha + GGML_CPU_FP16_TO_FP32(pv[id])*beta;
+            }
+            s = s*alpha + beta;
+            m = m_new;
+        }
+
+        if (s != 0.0f) {
+            ggml_vec_scale_f32(dv, out, 1.0f/s);
+        }
+    }
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(

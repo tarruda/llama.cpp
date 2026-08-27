@@ -613,6 +613,7 @@ void llama_memory_qwen4::set_input_qsa_layout(
         ggml_tensor * block_key_cells,
         ggml_tensor * block_mask,
         ggml_tensor * selected,
+        ggml_tensor * tail_cells,
         ggml_tensor * update_cells,
         ggml_tensor * update_pos,
         ggml_tensor * update_idxs,
@@ -625,7 +626,8 @@ void llama_memory_qwen4::set_input_qsa_layout(
     GGML_ASSERT(ggml_backend_buffer_is_host(block_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_mask->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(selected->buffer));
+    GGML_ASSERT(!selected->buffer || ggml_backend_buffer_is_host(selected->buffer));
+    GGML_ASSERT(!tail_cells->buffer || ggml_backend_buffer_is_host(tail_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_pos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_idxs->buffer));
@@ -634,6 +636,7 @@ void llama_memory_qwen4::set_input_qsa_layout(
     GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(block_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(selected->type == GGML_TYPE_F32);
+    GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(update_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(update_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(update_idxs->type == GGML_TYPE_I32);
@@ -657,12 +660,14 @@ void llama_memory_qwen4::set_input_qsa_layout(
     GGML_ASSERT(n_stream > 0 && n_tokens % n_stream == 0);
     GGML_ASSERT(selected->ne[1] == n_tokens);
     GGML_ASSERT(selected->ne[0] == n_kv);
+    GGML_ASSERT(tail_cells->ne[0] == ratio - 1 && tail_cells->ne[1] == n_tokens);
     GGML_ASSERT(kq_mask->ne[0] == n_kv);
 
     auto * cell_data = (int32_t *) block_cells->data;
     auto * key_cell_data = (int32_t *) block_key_cells->data;
     auto * mask_data = (float *) block_mask->data;
-    auto * selected_data = (float *) selected->data;
+    auto * selected_data = selected->buffer ? (float *) selected->data : nullptr;
+    auto * tail_cell_data = tail_cells->buffer ? (int32_t *) tail_cells->data : nullptr;
     auto * update_cell_data = (int32_t *) update_cells->data;
     auto * update_pos_data = (int32_t *) update_pos->data;
     auto * update_idx_data = (int32_t *) update_idxs->data;
@@ -670,7 +675,12 @@ void llama_memory_qwen4::set_input_qsa_layout(
     std::fill(cell_data, cell_data + ggml_nelements(block_cells), 0);
     std::fill(key_cell_data, key_cell_data + ggml_nelements(block_key_cells), 0);
     std::fill(mask_data, mask_data + ggml_nelements(block_mask), -INFINITY);
-    std::fill(selected_data, selected_data + ggml_nelements(selected), 0.0f);
+    if (selected_data) {
+        std::fill(selected_data, selected_data + ggml_nelements(selected), 0.0f);
+    }
+    if (tail_cell_data) {
+        std::fill(tail_cell_data, tail_cell_data + ggml_nelements(tail_cells), -1);
+    }
     std::fill(update_cell_data, update_cell_data + ggml_nelements(update_cells), 0);
     std::fill(update_pos_data, update_pos_data + ggml_nelements(update_pos), 0);
     std::fill(update_idx_data, update_idx_data + ggml_nelements(update_idxs), 0);
@@ -841,8 +851,16 @@ void llama_memory_qwen4::set_input_qsa_layout(
         }
 
         const size_t selected_start = n_complete <= block_topk ? 0 : n_complete * ratio;
-        for (size_t iv = selected_start; iv < visible.size(); ++iv) {
-            selected_data[iq * n_kv + visible[iv].second] = 1.0f;
+        if (selected_data) {
+            for (size_t iv = selected_start; iv < visible.size(); ++iv) {
+                selected_data[iq * n_kv + visible[iv].second] = 1.0f;
+            }
+        }
+
+        if (tail_cell_data) {
+            for (size_t iv = n_complete*ratio; iv < visible.size(); ++iv) {
+                tail_cell_data[iq*(ratio - 1) + iv - n_complete*ratio] = visible[iv].second;
+            }
         }
     }
 }
@@ -981,6 +999,7 @@ void llama_memory_qwen4_context::set_input_qsa_layout(
         ggml_tensor * block_key_cells,
         ggml_tensor * block_mask,
         ggml_tensor * selected,
+        ggml_tensor * tail_cells,
         ggml_tensor * update_cells,
         ggml_tensor * update_pos,
         ggml_tensor * update_idxs,
@@ -991,7 +1010,7 @@ void llama_memory_qwen4_context::set_input_qsa_layout(
         uint32_t n_kv,
         uint32_t n_stream) const {
     mem->set_input_qsa_layout(
-            block_cells, block_key_cells, block_mask, selected,
+            block_cells, block_key_cells, block_mask, selected, tail_cells,
             update_cells, update_pos, update_idxs,
             kq_mask, ubatch, ratio, block_topk, n_kv, n_stream);
 }

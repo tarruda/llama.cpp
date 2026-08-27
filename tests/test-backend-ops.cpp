@@ -7348,6 +7348,130 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT_INDEXED
+struct test_flash_attn_ext_indexed : public test_case {
+    const int64_t dk;
+    const int64_t dv;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_kv;
+    const int64_t n_select;
+    const int64_t n_query;
+    const int64_t n_stream;
+    const float logit_softcap;
+    const bool compare_generic;
+
+    test_flash_attn_ext_indexed(
+            int64_t dk = 256, int64_t dv = 256,
+            int64_t n_head = 24, int64_t n_head_kv = 2,
+            int64_t n_kv = 2304, int64_t n_select = 2051,
+            int64_t n_query = 1, int64_t n_stream = 1,
+            float logit_softcap = 0.0f, bool compare_generic = false) :
+        dk(dk), dv(dv), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_select(n_select),
+        n_query(n_query), n_stream(n_stream), logit_softcap(logit_softcap), compare_generic(compare_generic) {
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(dk, dv, n_head, n_head_kv, n_kv, n_select, n_query, n_stream, logit_softcap, compare_generic);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return compare_generic ? "FLASH_ATTN_EXT_INDEXED_EQ" : test_case::op_desc(t);
+    }
+
+    double max_nmse_err() override {
+        return compare_generic ? 1e-3 : 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!compare_generic) {
+            return nmse(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i]));
+            result = std::max(result, (double) fabsf(b[i]));
+        }
+        return result;
+    }
+
+    bool run_whole_graph() override {
+        return compare_generic;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*n_head*n_query*n_stream*(dk + dv)*n_select;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dk, n_query, n_head, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, dk, n_kv, n_head_kv, n_stream);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, dv, n_kv, n_head_kv, n_stream);
+        ggml_tensor * i = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_select, n_query, 1, n_stream);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_select, n_query, 1, n_stream);
+
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(i, "idx");
+        ggml_set_name(m, "mask");
+
+        ggml_tensor * out = ggml_flash_attn_ext_indexed(ctx, q, k, v, i, m, 1.0f/sqrtf(dk), logit_softcap);
+        if (compare_generic) {
+            ggml_tensor * full_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_query, 1, n_stream);
+            ggml_set_name(full_mask, "full_mask");
+            ggml_tensor * full = ggml_flash_attn_ext(ctx, q, k, v, full_mask, 1.0f/sqrtf(dk), 0.0f, logit_softcap);
+            ggml_flash_attn_ext_set_prec(full, GGML_PREC_F32);
+            out = ggml_sub(ctx, out, full);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_query; ++iq) {
+                        for (int64_t ii = 0; ii < n_select; ++ii) {
+                            const int64_t pos = (is*n_query + iq)*n_select + ii;
+                            data[pos] = ii % 97 == 0 ? -1 : (int32_t) ((ii*37 + iq*13 + is*19) % n_kv);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    const float value = i % 89 == 0 ? -INFINITY : 0.01f*((int) (i % 7) - 3);
+                    data[i] = ggml_fp32_to_fp16(value);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "full_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_query; ++iq) {
+                        for (int64_t ii = 0; ii < n_select; ++ii) {
+                            const int64_t pos = (is*n_query + iq)*n_select + ii;
+                            if (ii % 97 == 0 || pos % 89 == 0) {
+                                continue;
+                            }
+                            const int32_t idx = (int32_t) ((ii*37 + iq*13 + is*19) % n_kv);
+                            const float value = 0.01f*((int) (pos % 7) - 3);
+                            data[(is*n_query + iq)*n_kv + idx] = ggml_fp32_to_fp16(value);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10045,6 +10169,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
         }
     }
+
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(32, 48, 4, 2, 19, 13, 3, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 8, 2, 129, 97, 2, 1, 10.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 8, 2, 129, 97, 2, 1, 10.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed());
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

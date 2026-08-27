@@ -558,6 +558,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_INDEXED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2440,6 +2441,24 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             float                 max_bias,
+            float                 logit_softcap);
+
+    // q:       [n_embd_k, n_batch, n_head,    ne3]
+    // k:       [n_embd_k, n_kv,    n_head_kv, ne3]
+    // v:       [n_embd_v, n_kv,    n_head_kv, ne3]
+    // indices: [n_select, n_batch, 1,          ne3]
+    // mask:    [n_select, n_batch, 1,          ne3]
+    // res:     [n_embd_v, n_head,  n_batch,    ne3]
+    //
+    // Negative indices and entries masked with -INFINITY are skipped.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * mask,
+            float                 scale,
             float                 logit_softcap);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
