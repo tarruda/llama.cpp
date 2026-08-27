@@ -75,6 +75,93 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+kernel void kernel_top_k_radix_f32_i32(
+        constant ggml_metal_kargs_argsort & args,
+        device const char    * src0,
+        device       int32_t * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr ushort radix = 16;
+    constexpr ushort n_top = 512;
+
+    threadgroup atomic_uint histogram[radix];
+    threadgroup atomic_uint n_greater;
+    threadgroup atomic_uint n_equal;
+    threadgroup uint prefix;
+    threadgroup uint rank;
+    threadgroup int32_t selected[n_top];
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+    device const float * row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+
+    if (tiitg == 0) {
+        prefix = 0;
+        rank = n_top - 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Select the exact top-k partition with an MSD radix pass.
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        if (tiitg < radix) {
+            atomic_store_explicit(&histogram[tiitg], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint mask = shift == 28 ? 0u : 0xffffffffu << (shift + 4);
+        for (int i = tiitg; i < args.ne00; i += ntg.x) {
+            const uint bits = as_type<uint>(row[i]);
+            const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+            if ((key & mask) == prefix) {
+                atomic_fetch_add_explicit(&histogram[(key >> shift) & 0xfu], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiitg == 0) {
+            uint r = rank;
+            for (int digit = radix - 1; digit >= 0; --digit) {
+                const uint count = atomic_load_explicit(&histogram[digit], memory_order_relaxed);
+                if (r < count) {
+                    prefix |= uint(digit) << shift;
+                    rank = r;
+                    break;
+                }
+                r -= count;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiitg == 0) {
+        atomic_store_explicit(&n_greater, 0u, memory_order_relaxed);
+        atomic_store_explicit(&n_equal, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < args.ne00; i += ntg.x) {
+        const uint bits = as_type<uint>(row[i]);
+        const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+        if (key > prefix) {
+            const uint pos = atomic_fetch_add_explicit(&n_greater, 1u, memory_order_relaxed);
+            selected[pos] = i;
+        } else if (key == prefix) {
+            const uint pos = n_top - rank - 1 + atomic_fetch_add_explicit(&n_equal, 1u, memory_order_relaxed);
+            if (pos < n_top) {
+                selected[pos] = i;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dst += args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+    for (int i = tiitg; i < n_top; i += ntg.x) {
+        dst[i] = selected[i];
+    }
+}
+
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
         device const char    * src0,

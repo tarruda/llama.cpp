@@ -5337,6 +5337,34 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    if (ne0 == 512 && ne00 > 1024) {
+        ggml_metal_kargs_argsort args = {
+            /*.ne00  =*/ ne00,
+            /*.ne01  =*/ ne01,
+            /*.ne02  =*/ ne02,
+            /*.ne03  =*/ ne03,
+            /*.nb00  =*/ nb00,
+            /*.nb01  =*/ nb01,
+            /*.nb02  =*/ nb02,
+            /*.nb03  =*/ nb03,
+            /*.ne0   =*/ ne0,
+            /*.ne1   =*/ ne1,
+            /*.ne2   =*/ ne2,
+            /*.ne3   =*/ ne3,
+            /*.top_k =*/ ne0,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_top_k_radix(lib);
+        GGML_ASSERT(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 512);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
+        const int nth = std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_top_k(lib, op);
 
     // bitonic sort requires the number of elements to be power of 2
