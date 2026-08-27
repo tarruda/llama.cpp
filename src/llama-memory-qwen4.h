@@ -102,6 +102,7 @@ private:
 
     std::map<llama_seq_id, token_history> token_histories;
     mutable std::map<llama_seq_id, uint32_t> qsa_cached_blocks;
+    mutable std::map<llama_seq_id, std::vector<uint32_t>> qsa_mapped_cells;
 };
 
 class llama_memory_qwen4_context : public llama_memory_context_i {

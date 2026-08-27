@@ -182,6 +182,7 @@ void llama_memory_qwen4::clear(bool data) {
     }
     token_histories.clear();
     qsa_cached_blocks.clear();
+    qsa_mapped_cells.clear();
 }
 
 bool llama_memory_qwen4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -194,8 +195,10 @@ bool llama_memory_qwen4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
 
     if (seq_id < 0) {
         qsa_cached_blocks.clear();
+        qsa_mapped_cells.clear();
     } else {
         qsa_cached_blocks.erase(seq_id);
+        qsa_mapped_cells.erase(seq_id);
     }
 
     if (seq_id < 0) {
@@ -225,6 +228,7 @@ void llama_memory_qwen4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst
     }
 
     qsa_cached_blocks.erase(seq_id_dst);
+    qsa_mapped_cells.erase(seq_id_dst);
 
     token_history copied;
     const auto & cells_src = mem_attn->get_base()->get_cells(seq_id_src);
@@ -294,6 +298,7 @@ void llama_memory_qwen4::seq_keep(llama_seq_id seq_id) {
     if (qsa_blocks > 0) {
         qsa_cached_blocks.emplace(seq_id, qsa_blocks);
     }
+    qsa_mapped_cells.clear();
 
     auto it = token_histories.find(seq_id);
     token_history keep = it == token_histories.end() ? token_history{} : std::move(it->second);
@@ -458,8 +463,10 @@ void llama_memory_qwen4::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
 
     if (seq_id < 0) {
         qsa_cached_blocks.clear();
+        qsa_mapped_cells.clear();
     } else {
         qsa_cached_blocks.erase(seq_id);
+        qsa_mapped_cells.erase(seq_id);
     }
 }
 
@@ -712,31 +719,63 @@ void llama_memory_qwen4::set_input_qsa_layout(
             continue;
         }
 
+        const auto & history = found->second;
         const auto & cells = mem_attn->get_base()->get_cells(seq_id);
         using pos_key = std::tuple<llama_pos, llama_pos, llama_pos>;
-        std::map<pos_key, std::vector<uint32_t>> cells_by_pos;
-        for (uint32_t cell = 0; cell < cells.size() && cell < (uint32_t) n_kv; ++cell) {
-            if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
-                continue;
+        auto & mapped_cells = qsa_mapped_cells[seq_id];
+        bool mapping_valid = mapped_cells.size() <= history.size();
+        for (size_t i = 0; mapping_valid && i < mapped_cells.size(); ++i) {
+            const uint32_t cell = mapped_cells[i];
+            if (cell >= cells.size() || cell >= (uint32_t) n_kv || cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+                mapping_valid = false;
+                break;
             }
+            const auto & entry = history[i];
             const auto & ext = cells.ext_get(cell);
-            cells_by_pos[{ cells.pos_get(cell), ext.y, ext.x }].push_back(cell);
+            mapping_valid = cells.pos_get(cell) == entry.pos[0] && ext.y == entry.pos[1] && ext.x == entry.pos[2];
+        }
+        if (!mapping_valid) {
+            mapped_cells.clear();
         }
 
-        std::map<pos_key, size_t> next_cell;
+        if (mapped_cells.size() < history.size()) {
+            const size_t first_new = mapped_cells.size();
+            struct cell_candidates {
+                std::vector<uint32_t> cells;
+                size_t next = 0;
+            };
+            std::map<pos_key, cell_candidates> candidates;
+            for (size_t i = first_new; i < history.size(); ++i) {
+                candidates.try_emplace({ history[i].pos[0], history[i].pos[1], history[i].pos[2] });
+            }
+
+            std::vector<uint8_t> used_cells(std::min<size_t>(cells.size(), n_kv), 0);
+            for (uint32_t cell : mapped_cells) {
+                used_cells[cell] = 1;
+            }
+            for (uint32_t cell = 0; cell < cells.size() && cell < (uint32_t) n_kv; ++cell) {
+                if (used_cells[cell] || cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+                    continue;
+                }
+                const auto & ext = cells.ext_get(cell);
+                auto candidate = candidates.find({ cells.pos_get(cell), ext.y, ext.x });
+                if (candidate != candidates.end()) {
+                    candidate->second.cells.push_back(cell);
+                }
+            }
+
+            for (size_t i = first_new; i < history.size(); ++i) {
+                auto & candidate = candidates.at({ history[i].pos[0], history[i].pos[1], history[i].pos[2] });
+                mapped_cells.push_back(candidate.next < candidate.cells.size() ? candidate.cells[candidate.next++] : std::numeric_limits<uint32_t>::max());
+            }
+        }
+
         auto & mapped = mapped_by_seq[seq_id];
-        for (const auto & entry : found->second) {
-            const pos_key key = { entry.pos[0], entry.pos[1], entry.pos[2] };
-            auto cells_it = cells_by_pos.find(key);
-            if (cells_it == cells_by_pos.end()) {
-                continue;
+        mapped.reserve(history.size());
+        for (size_t i = 0; i < history.size(); ++i) {
+            if (mapped_cells[i] != std::numeric_limits<uint32_t>::max()) {
+                mapped.emplace_back(&history[i], mapped_cells[i]);
             }
-            size_t & index = next_cell[key];
-            if (index >= cells_it->second.size()) {
-                continue;
-            }
-            const uint32_t cell = cells_it->second[index++];
-            mapped.emplace_back(&entry, cell);
         }
     }
 
@@ -929,6 +968,7 @@ bool llama_memory_qwen4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
     if (ubatches.empty()) {
+        mem->qsa_mapped_cells.clear();
         bool result = true;
         result = result & ctx_attn->apply();
         if (ctx_gdn) {
