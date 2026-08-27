@@ -558,6 +558,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_block_score(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_indexed(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_indexed_pack_f16_d256";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
@@ -1627,7 +1638,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
@@ -1688,7 +1699,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         const ggml_tensor * op,
         int32_t dv,
         int32_t nwg) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];

@@ -1543,7 +1543,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
-            return has_simdgroup_reduction &&
+            return has_simdgroup_mm && has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
                 op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_I64;
@@ -1630,6 +1630,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[3]->type == GGML_TYPE_I32 &&
+                op->src[4]->type == GGML_TYPE_F16 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[0]->ne[1] == 1 &&
+                op->src[2]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[0]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_HEAD &&
+                op->src[1]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_KV &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op->src[4]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
                 op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {

@@ -493,6 +493,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            {
+                n_fuse = ggml_metal_op_flash_attn_ext_indexed(ctx, idx);
+            } break;
         case GGML_OP_SET:
             {
                 n_fuse = ggml_metal_op_set(ctx, idx);
@@ -1725,6 +1729,189 @@ int ggml_metal_op_qsa_block_score(ggml_metal_op_t ctx, int idx) {
     const int nkptg = OP_QSA_BLOCK_SCORE_NKPSG*nsg;
     ggml_metal_encoder_dispatch_threadgroups(
             enc, (args.n_blocks + nkptg - 1)/nkptg, q->ne[2], q->ne[3], 32, nsg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_flash_attn_ext_indexed(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * q       = op->src[0];
+    const ggml_tensor * k       = op->src[1];
+    const ggml_tensor * v       = op->src[2];
+    const ggml_tensor * indices = op->src[3];
+    const ggml_tensor * mask    = op->src[4];
+
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(k->type       == GGML_TYPE_F16);
+    GGML_ASSERT(v->type       == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F16);
+    GGML_ASSERT(op->type      == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D);
+    GGML_ASSERT(v->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D);
+    GGML_ASSERT(q->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_HEAD);
+    GGML_ASSERT(k->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_KV);
+    GGML_ASSERT(q->ne[1] == 1);
+
+    float scale = ggml_get_op_params_f32(op, 0);
+    const float logit_softcap = ggml_get_op_params_f32(op, 1);
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const int32_t n_padded = GGML_PAD(indices->ne[0], OP_FLASH_ATTN_EXT_VEC_NCPSG);
+    const size_t kv_size = sizeof(ggml_fp16_t)*(size_t) OP_FLASH_ATTN_EXT_INDEXED_D*n_padded*OP_FLASH_ATTN_EXT_INDEXED_N_KV;
+    const size_t stream_size = 2*kv_size + sizeof(ggml_fp16_t)*n_padded;
+    const size_t packed_size = q->ne[3]*stream_size;
+
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_pack = bid_dst;
+    bid_pack.offs += ggml_nbytes(op);
+
+    ggml_metal_buffer_id bid_k = bid_pack;
+    ggml_metal_buffer_id bid_v = bid_pack;
+    bid_v.offs += kv_size;
+
+    ggml_metal_buffer_id bid_mask = bid_pack;
+    bid_mask.offs += 2*kv_size;
+
+    ggml_metal_buffer_id bid_tmp = bid_pack;
+    bid_tmp.offs += GGML_PAD(packed_size, 16);
+
+    ggml_metal_kargs_flash_attn_ext_indexed args_pack = {
+        /*.n_kv     =*/ (int32_t) k->ne[1],
+        /*.n_select =*/ (int32_t) indices->ne[0],
+        /*.n_padded =*/ n_padded,
+        /*.nb_k1    =*/ k->nb[1],
+        /*.nb_k2    =*/ k->nb[2],
+        /*.nb_k3    =*/ k->nb[3],
+        /*.nb_v1    =*/ v->nb[1],
+        /*.nb_v2    =*/ v->nb[2],
+        /*.nb_v3    =*/ v->nb[3],
+        /*.nb_i3    =*/ indices->nb[3],
+        /*.nb_m3    =*/ mask->nb[3],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_library_t lib = ctx->lib;
+
+    auto pipeline_pack = ggml_metal_library_get_pipeline_flash_attn_ext_indexed(lib);
+    ggml_metal_encoder_set_pipeline(enc, pipeline_pack);
+    ggml_metal_encoder_set_bytes (enc, &args_pack, sizeof(args_pack), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),       1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v),       2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask),    4);
+    ggml_metal_encoder_set_buffer(enc, bid_pack,                           5);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_padded, q->ne[3], 1, OP_FLASH_ATTN_EXT_INDEXED_D, 1, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    auto cfg = ggml_metal_tuning::fa_vec_pick(
+            props_dev->device_id,
+            props_dev->gpu_family,
+            GGML_TYPE_F16,
+            OP_FLASH_ATTN_EXT_INDEXED_D,
+            OP_FLASH_ATTN_EXT_INDEXED_D,
+            n_padded,
+            1);
+
+    int nqptg = cfg.Q;
+    const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG;
+    const int nwg = 32;
+    GGML_ASSERT(nqptg == 1 || nqptg == 2 || nqptg == 4);
+    int nsg = 1;
+    while (2*nwg*nsg*ncpsg < n_padded && nsg < 4) {
+        nsg *= 2;
+    }
+
+    auto smem_size = [&]() {
+        return GGML_PAD(((GGML_PAD(OP_FLASH_ATTN_EXT_INDEXED_D, 128) + 4*OP_FLASH_ATTN_EXT_VEC_NCPSG + 2*GGML_PAD(OP_FLASH_ATTN_EXT_INDEXED_D, 128))*nsg*nqptg)*(sizeof(float)/2), 16);
+    };
+    if (smem_size() > props_dev->max_theadgroup_memory_size) {
+        cfg = ggml_metal_tuning::fa_vec_baseline_cfg(OP_FLASH_ATTN_EXT_INDEXED_D, OP_FLASH_ATTN_EXT_INDEXED_D);
+        nqptg = cfg.Q;
+    }
+    const size_t smem = smem_size();
+    GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
+    const uint64_t nb_k1 = sizeof(ggml_fp16_t)*OP_FLASH_ATTN_EXT_INDEXED_D;
+    const uint64_t nb_k2 = nb_k1*n_padded;
+    const uint64_t nb_k3 = stream_size;
+    const uint64_t nb_m1 = sizeof(ggml_fp16_t)*n_padded;
+    const uint64_t nb_m2 = nb_m1;
+    const uint64_t nb_m3 = stream_size;
+
+    ggml_metal_kargs_flash_attn_ext_vec args = {
+        /*.ne01          =*/ (int32_t) q->ne[1],
+        /*.ne02          =*/ (int32_t) q->ne[2],
+        /*.ne03          =*/ (int32_t) q->ne[3],
+        /*.nb01          =*/ q->nb[1],
+        /*.nb02          =*/ q->nb[2],
+        /*.nb03          =*/ q->nb[3],
+        /*.ne11          =*/ n_padded,
+        /*.ne_12_2       =*/ OP_FLASH_ATTN_EXT_INDEXED_N_KV,
+        /*.ne_12_3       =*/ (int32_t) q->ne[3],
+        /*.ns10          =*/ OP_FLASH_ATTN_EXT_INDEXED_D,
+        /*.nb11          =*/ nb_k1,
+        /*.nb12          =*/ nb_k2,
+        /*.nb13          =*/ nb_k3,
+        /*.ns20          =*/ OP_FLASH_ATTN_EXT_INDEXED_D,
+        /*.nb21          =*/ nb_k1,
+        /*.nb22          =*/ nb_k2,
+        /*.nb23          =*/ nb_k3,
+        /*.ne31          =*/ 1,
+        /*.ne32          =*/ 1,
+        /*.ne33          =*/ (int32_t) q->ne[3],
+        /*.nb31          =*/ nb_m1,
+        /*.nb32          =*/ nb_m2,
+        /*.nb33          =*/ nb_m3,
+        /*.ne1           =*/ (int32_t) op->ne[1],
+        /*.ne2           =*/ (int32_t) op->ne[2],
+        /*.ne3           =*/ (int32_t) op->ne[3],
+        /*.scale         =*/ scale,
+        /*.max_bias      =*/ 0.0f,
+        /*.m0            =*/ 1.0f,
+        /*.m1            =*/ 1.0f,
+        /*.n_head_log2   =*/ 16,
+        /*.logit_softcap =*/ logit_softcap,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+            lib, op, true, false, false, logit_softcap != 0.0f, false,
+            nqptg, cfg.NE, nsg, nwg, false,
+            OP_FLASH_ATTN_EXT_INDEXED_D, OP_FLASH_ATTN_EXT_INDEXED_D);
+
+    GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q), 1);
+    ggml_metal_encoder_set_buffer(enc, bid_k,                       2);
+    ggml_metal_encoder_set_buffer(enc, bid_v,                       3);
+    ggml_metal_encoder_set_buffer(enc, bid_mask,                    4);
+    ggml_metal_encoder_set_buffer(enc, bid_pack,                    5);
+    ggml_metal_encoder_set_buffer(enc, bid_pack,                    6);
+    ggml_metal_encoder_set_buffer(enc, bid_tmp,                     7);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, q->ne[2], q->ne[3]*nwg, 32, nsg, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    const uint64_t nrows_64 = op->ne[1]*op->ne[2]*op->ne[3];
+    GGML_ASSERT(nrows_64 <= (1u << 31));
+    const int32_t nrows = nrows_64;
+    ggml_metal_kargs_flash_attn_ext_vec_reduce args_reduce = {
+        nrows,
+    };
+    auto pipeline_reduce = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
+            lib, op, OP_FLASH_ATTN_EXT_INDEXED_D, nwg);
+    ggml_metal_encoder_set_pipeline(enc, pipeline_reduce);
+    ggml_metal_encoder_set_bytes (enc, &args_reduce, sizeof(args_reduce), 0);
+    ggml_metal_encoder_set_buffer(enc, bid_tmp, 1);
+    ggml_metal_encoder_set_buffer(enc, bid_dst, 2);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
 
     return 1;
 }
@@ -3244,6 +3431,17 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     const size_t v_size = GGML_PAD(sizeof(ggml_fp16_t)*(size_t) ne20*ne21*ne22*ne23, 16);
 
     return k_size + v_size;
+}
+
+size_t ggml_metal_op_flash_attn_ext_indexed_extra(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
+
+    const int64_t n_padded = GGML_PAD(op->src[3]->ne[0], OP_FLASH_ATTN_EXT_VEC_NCPSG);
+    const size_t kv_size = sizeof(ggml_fp16_t)*(size_t) OP_FLASH_ATTN_EXT_INDEXED_D*n_padded*OP_FLASH_ATTN_EXT_INDEXED_N_KV;
+    const size_t packed_size = op->src[0]->ne[3]*(2*kv_size + sizeof(ggml_fp16_t)*n_padded);
+    const size_t tmp_size = sizeof(float)*(size_t) op->src[0]->ne[1]*op->src[0]->ne[2]*op->src[0]->ne[3]*32*(OP_FLASH_ATTN_EXT_INDEXED_D + 2);
+
+    return GGML_PAD(packed_size, 16) + tmp_size;
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {

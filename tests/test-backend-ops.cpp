@@ -10173,6 +10173,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_indexed(32, 48, 4, 2, 19, 13, 3, 2));
     test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 8, 2, 129, 97, 2, 1, 10.0f));
     test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 8, 2, 129, 97, 2, 1, 10.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 19, 13, 1, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 129, 97, 1, 1, 10.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 129, 97, 1, 1, 10.0f, true));
     test_cases.emplace_back(new test_flash_attn_ext_indexed());
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
@@ -10688,6 +10691,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    for (int kv : { 2304, 10000, 20000, 30000, }) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, kv, 2051));
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
