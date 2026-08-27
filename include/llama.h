@@ -444,6 +444,7 @@ extern "C" {
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
         bool no_ngram;                                              // exclude the Qwen4 n-gram embedding table
+        enum llama_load_mode load_mode;                             // how to load the input model
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
