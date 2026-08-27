@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -19,9 +20,8 @@ static ggml_tensor * qwen4_hc_mean(ggml_context * ctx, ggml_tensor * input) {
 }
 
 static ggml_tensor * qwen4_l2_norm(ggml_context * ctx, ggml_tensor * input) {
-    ggml_tensor * norm = ggml_sum_rows(ctx, ggml_sqr(ctx, input));
-    norm = ggml_sqrt(ctx, ggml_scale_bias(ctx, norm, 1.0f, 1e-6f));
-    return ggml_div(ctx, input, norm);
+    const float n = input->ne[0];
+    return ggml_scale(ctx, ggml_rms_norm(ctx, input, 1e-6f / n), 1.0f / std::sqrt(n));
 }
 
 class llm_graph_input_qwen4_qsa : public llm_graph_input_i {
