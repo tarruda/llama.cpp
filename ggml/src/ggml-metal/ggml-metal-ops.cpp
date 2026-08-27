@@ -3218,11 +3218,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 nb21,
             };
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, ne21);
 
             const size_t smem = pipeline.smem;
 
-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+            GGML_ASSERT(pipeline.nr0 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -3234,7 +3234,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, pipeline.nr1, 1, 1, pipeline.nr0, 1, 1);
         }
 
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed

@@ -425,6 +425,59 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+template<short ne20>
+kernel void kernel_mul_mm_id_map0_parallel(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device  const char * src2,
+        device        char * htpe,
+        device        char * hids,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int ide = tgpig.x;
+    const int n_ids = args.ne21*ne20;
+
+    threadgroup atomic_uint n_all;
+
+    if (tiitg == 0) {
+        atomic_store_explicit(&n_all, 0u, memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+
+    for (int idx = tiitg; idx < n_ids; idx += ntg.x) {
+        const int i21 = idx/ne20;
+        const int i20 = idx - i21*ne20;
+        device const int32_t * src2_i32 = (device const int32_t *) (src2 + i21*args.nb21);
+
+        if (src2_i32[i20] == ide) {
+            const uint32_t pos = atomic_fetch_add_explicit(&n_all, 1u, memory_order_relaxed);
+            ids_i32[pos] = idx;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        device uint32_t * tpe_u32 = (device uint32_t *) htpe;
+        tpe_u32[ide] = atomic_load_explicit(&n_all, memory_order_relaxed);
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_map0_parallel<1>) kernel_mul_mm_id_map0_parallel_t;
+
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_1" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<1>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_2" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<2>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_4" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<4>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_5" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<5>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_6" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<6>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_8" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<8>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_10")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<10>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_16")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<16>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_22")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<22>;
+
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,

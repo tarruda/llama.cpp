@@ -1085,11 +1085,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20, int ne21) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    const bool use_parallel = ne02 >= 256 && ne21 >= 256;
+
+    if (use_parallel) {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_parallel_ne20_%d", ne20);
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    }
     snprintf(name, 256, "%s_ne02=%d", base, ne02);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1097,7 +1103,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = (size_t) ne02*ne20*sizeof(uint16_t);
+    res.nr0  = use_parallel ? 256 : ne02;
+    res.nr1  = use_parallel ? ne02 : 1;
+    res.smem = use_parallel ? 0 : (size_t) ne02*ne20*sizeof(uint16_t);
 
     return res;
 }
