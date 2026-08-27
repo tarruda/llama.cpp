@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "QWEN4EXP_HC_REDUCE",
     "QWEN4EXP_HC_COMBINE",
+    "QSA_BLOCK_SCORE",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1202,6 +1203,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "qwen4exp_hc_reduce(x, gate)",
     "qwen4exp_hc_combine(residual, x, injection)",
+    "qsa_block_score(q, k, cells, mask)",
 
     "unary(x)",
 
@@ -1219,7 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6567,6 +6569,45 @@ struct ggml_tensor * ggml_qwen4exp_hc_combine(
     result->src[0] = residual;
     result->src[1] = x;
     result->src[2] = injection;
+
+    return result;
+}
+
+// ggml_qsa_block_score
+
+struct ggml_tensor * ggml_qsa_block_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * mask,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(cells->ne[0] == mask->ne[0]);
+    GGML_ASSERT(cells->ne[1] == q->ne[2]);
+    GGML_ASSERT(cells->ne[1] == mask->ne[1]);
+    GGML_ASSERT(cells->ne[2] == 1 && mask->ne[2] == 1);
+    GGML_ASSERT(cells->ne[3] == q->ne[3]);
+    GGML_ASSERT(cells->ne[3] == mask->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cells->ne[0], cells->ne[1], 1, cells->ne[3]);
+
+    result->op     = GGML_OP_QSA_BLOCK_SCORE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = cells;
+    result->src[3] = mask;
+
+    ggml_set_op_params_f32(result, 0, scale);
 
     return result;
 }

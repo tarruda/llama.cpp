@@ -50,6 +50,8 @@ struct llama_cparams {
     bool fused_qwen4exp_hc_reduce;
     bool fused_qwen4exp_hc_combine;
     bool auto_fhc;
+    bool fused_qsa_block_score;
+    bool auto_fqsa_block_score;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

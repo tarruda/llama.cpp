@@ -11386,6 +11386,64 @@ void ggml_compute_forward_qwen4exp_hc_combine(
     }
 }
 
+// ggml_compute_forward_qsa_block_score
+
+void ggml_compute_forward_qsa_block_score(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * cells = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_LOCALS(size_t, nbq, q,     nb);
+    GGML_TENSOR_LOCALS(size_t, nbk, k,     nb);
+    GGML_TENSOR_LOCALS(size_t, nbc, cells, nb);
+    GGML_TENSOR_LOCALS(size_t, nbm, mask,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    const int64_t n_embd   = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_query  = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_blocks = cells->ne[0];
+    const int64_t n_cache  = k->ne[1];
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t nr  = n_blocks * n_query * n_stream;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ib = ir % n_blocks;
+        const int64_t iq = (ir / n_blocks) % n_query;
+        const int64_t is = ir / (n_blocks * n_query);
+        const int32_t cell = *(const int32_t *) ((const char *) cells->data + ib*nbc0 + iq*nbc1 + is*nbc3);
+        GGML_ASSERT(cell >= 0 && cell < n_cache);
+
+        const float * k_row = (const float *) ((const char *) k->data + cell*nbk1);
+        float score = 0.0f;
+        for (int64_t ih = 0; ih < n_head; ++ih) {
+            const float * q_row = (const float *) ((const char *) q->data + ih*nbq1 + iq*nbq2 + is*nbq3);
+            float qk = 0.0f;
+            ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row, 0, 1);
+            score += MAX(qk, 0.0f);
+        }
+
+        const float mv = *(const float *) ((const char *) mask->data + ib*nbm0 + iq*nbm1 + is*nbm3);
+        *(float *) ((char *) dst->data + ib*nbd0 + iq*nbd1 + is*nbd3) = score*scale + mv;
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

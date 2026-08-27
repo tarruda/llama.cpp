@@ -4137,6 +4137,65 @@ struct test_qwen4exp_hc_combine : public test_case {
     }
 };
 
+struct test_qsa_block_score : public test_case {
+    const int64_t n_embd;
+    const int64_t n_head;
+    const int64_t n_cache;
+    const int64_t n_blocks;
+    const int64_t n_query;
+    const int64_t n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, n_head, n_cache, n_blocks, n_query, n_stream);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ((2*n_embd + 2)*n_head + 2)*n_blocks*n_query*n_stream;
+    }
+
+    test_qsa_block_score(int64_t n_embd, int64_t n_head, int64_t n_cache, int64_t n_blocks, int64_t n_query, int64_t n_stream)
+        : n_embd(n_embd), n_head(n_head), n_cache(n_cache), n_blocks(n_blocks), n_query(n_query), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd, n_head, n_query, n_stream);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_cache);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_blocks, n_query, 1, n_stream);
+        ggml_set_name(cells, "cells");
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_blocks, n_query, 1, n_stream);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_qsa_block_score(ctx, q, k, cells, mask, 0.125f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (int32_t) ((17*i + 3) % n_cache);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                init_tensor_uniform(t, -2.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -8475,6 +8534,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qwen4exp_hc_combine(128, 4, 257));
     test_cases.emplace_back(new test_qwen4exp_hc_combine(2560, 4, 32));
 
+    test_cases.emplace_back(new test_qsa_block_score(8, 3, 17, 11, 4, 2));
+    test_cases.emplace_back(new test_qsa_block_score(128, 4, 37, 17, 3, 2));
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -10251,6 +10313,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens, true));
         test_cases.emplace_back(new test_qwen4exp_hc_combine(2560, 4, n_tokens));
     }
+
+    test_cases.emplace_back(new test_qsa_block_score(128, 4, 8192, 7500, 1, 1));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

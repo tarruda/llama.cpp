@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QWEN4EXP_HC_REDUCE,
         GGML_OP_QWEN4EXP_HC_COMBINE,
+        GGML_OP_QSA_BLOCK_SCORE,
 
         GGML_OP_UNARY,
 
@@ -2616,6 +2617,22 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // Qwen sparse-attention block score
+    //
+    // q:     [n_embd,   n_head,  n_query, ne3]
+    // k:     [n_embd,   n_cache, 1,       1  ]
+    // cells: [n_blocks, n_query, 1,       ne3]
+    // mask:  [n_blocks, n_query, 1,       ne3]
+    // res:   [n_blocks, n_query, 1,       ne3]
+    //
+    GGML_API struct ggml_tensor * ggml_qsa_block_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * mask,
+        float                 scale);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

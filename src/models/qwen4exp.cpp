@@ -741,6 +741,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
 
     std::vector<ggml_tensor *> selected_streams;
     selected_streams.reserve(n_stream);
+    const bool use_fused_block_score = cparams.fused_qsa_block_score && n_tps == 1;
 
     for (int64_t is = 0; is < n_stream; ++is) {
         ggml_tensor * block_cells = ggml_view_3d(
@@ -749,25 +750,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         ggml_tensor * block_key_cells = ggml_view_2d(
                 ctx0, qsa->block_key_cells, n_blocks, n_tps,
                 qsa->block_key_cells->nb[1], is * n_tps * qsa->block_key_cells->nb[1]);
-        ggml_tensor * block_keys = ggml_get_rows(
-                ctx0, block_key_cache,
-                ggml_reshape_1d(ctx0, block_key_cells, n_blocks * n_tps));
-        cb(block_keys, "index_Kblock", il);
-
-        block_keys = ggml_reshape_4d(ctx0, block_keys, index_dim, n_blocks, 1, n_tps);
         ggml_tensor * query = ggml_view_3d(
                 ctx0, index_q, index_dim, index_heads, n_tps,
                 index_q->nb[1], index_q->nb[2], is * n_tps * index_q->nb[2]);
-        query = ggml_reshape_4d(ctx0, query, index_dim, index_heads, 1, n_tps);
-        ggml_tensor * scores = ggml_mul_mat(ctx0, block_keys, query);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        scores = ggml_relu(ctx0, scores);
-        scores = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3)));
-        scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, scores, n_blocks, n_tps), 1.0f / sqrtf(float(index_dim)));
         ggml_tensor * block_mask = ggml_view_2d(
                 ctx0, qsa->block_mask, n_blocks, n_tps,
                 qsa->block_mask->nb[1], is * n_tps * qsa->block_mask->nb[1]);
-        scores = ggml_add(ctx0, scores, block_mask);
+        ggml_tensor * scores;
+        if (use_fused_block_score) {
+            query = ggml_reshape_4d(ctx0, query, index_dim, index_heads, n_tps, 1);
+            scores = ggml_qsa_block_score(ctx0, query, block_key_cache, block_key_cells, block_mask, 1.0f / sqrtf(float(index_dim)));
+            res->add_fused_node({ LLM_FUSED_OP_QSA_BLOCK_SCORE, scores, il });
+        } else {
+            ggml_tensor * block_keys = ggml_get_rows(
+                    ctx0, block_key_cache,
+                    ggml_reshape_1d(ctx0, block_key_cells, n_blocks * n_tps));
+            cb(block_keys, "index_Kblock", il);
+            block_keys = ggml_reshape_4d(ctx0, block_keys, index_dim, n_blocks, 1, n_tps);
+            query = ggml_reshape_4d(ctx0, query, index_dim, index_heads, 1, n_tps);
+            scores = ggml_mul_mat(ctx0, block_keys, query);
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            scores = ggml_relu(ctx0, scores);
+            scores = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3)));
+            scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, scores, n_blocks, n_tps), 1.0f / sqrtf(float(index_dim)));
+            scores = ggml_add(ctx0, scores, block_mask);
+        }
         cb(scores, "index_scores", il);
 
         ggml_tensor * top_blocks = ggml_top_k(ctx0, scores, block_topk);
