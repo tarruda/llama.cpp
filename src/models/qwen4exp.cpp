@@ -1282,6 +1282,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple_conv(
 
     std::vector<ggml_tensor *> outputs;
     outputs.reserve(n_seqs);
+    if (weight->type != GGML_TYPE_F32) {
+        weight = ggml_cast(ctx0, weight, GGML_TYPE_F32);
+    }
     weight = ggml_reshape_3d(ctx0, weight, hparams.qwen4_ple_conv, 1, n_hc_embd);
     for (int64_t is = 0; is < n_seqs; ++is) {
         ggml_tensor * seq_input = ggml_view_2d(
