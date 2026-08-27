@@ -138,8 +138,8 @@ def parse_args() -> argparse.Namespace:
         help="Exclude the n-gram embedding table from the converted GGUF.",
     )
     parser.add_argument(
-        "--ngram-type", choices=["bf16", "q4_0", "q8_0"],
-        help="storage type for an n-gram-only GGUF; required with --ngram",
+        "--ngram-type", choices=["f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "mxfp4"],
+        help="storage type for an n-gram-only GGUF (default: q8_0)",
     )
     parser.add_argument(
         "--dspark", action="store_true",
@@ -285,8 +285,7 @@ def main() -> None:
             logger.error("--ngram cannot be combined with --mtp, --dspark, or --mmproj")
             sys.exit(1)
         if args.ngram and args.ngram_type is None:
-            logger.error("--ngram-type is required with --ngram")
-            sys.exit(1)
+            args.ngram_type = "q8_0"
         if not args.ngram and args.ngram_type is not None:
             logger.error("--ngram-type requires --ngram")
             sys.exit(1)
@@ -316,9 +315,15 @@ def main() -> None:
             if args.ngram:
                 model_class.no_mtp = True
                 ngram_types = {
+                    "f32": (gguf.LlamaFileType.ALL_F32, gguf.GGMLQuantizationType.F32),
+                    "f16": (gguf.LlamaFileType.MOSTLY_F16, gguf.GGMLQuantizationType.F16),
                     "bf16": (gguf.LlamaFileType.MOSTLY_BF16, gguf.GGMLQuantizationType.BF16),
                     "q4_0": (gguf.LlamaFileType.MOSTLY_Q4_0, gguf.GGMLQuantizationType.Q4_0),
+                    "q4_1": (gguf.LlamaFileType.MOSTLY_Q4_1, gguf.GGMLQuantizationType.Q4_1),
+                    "q5_0": (gguf.LlamaFileType.MOSTLY_Q5_0, gguf.GGMLQuantizationType.Q5_0),
+                    "q5_1": (gguf.LlamaFileType.MOSTLY_Q5_1, gguf.GGMLQuantizationType.Q5_1),
                     "q8_0": (gguf.LlamaFileType.MOSTLY_Q8_0, gguf.GGMLQuantizationType.Q8_0),
+                    "mxfp4": (gguf.LlamaFileType.MOSTLY_MXFP4_MOE, gguf.GGMLQuantizationType.MXFP4),
                 }
                 output_type, model_class.ngram_qtype = ngram_types[args.ngram_type]
 
