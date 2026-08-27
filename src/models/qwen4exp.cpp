@@ -4,9 +4,14 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -25,6 +30,41 @@ static ggml_tensor * qwen4_hc_mean(ggml_context * ctx, ggml_tensor * input) {
 static ggml_tensor * qwen4_l2_norm(ggml_context * ctx, ggml_tensor * input) {
     const float n = input->ne[0];
     return ggml_scale(ctx, ggml_rms_norm(ctx, input, 1e-6f / n), 1.0f / std::sqrt(n));
+}
+
+static std::string qwen4_ngram_trace_timestamp() {
+    using clock = std::chrono::system_clock;
+
+    const auto now = clock::now();
+    const time_t now_time = clock::to_time_t(now);
+    const tm * local_time = std::localtime(&now_time);
+    if (!local_time) {
+        throw std::runtime_error("failed to get local time for Qwen4 n-gram trace");
+    }
+
+    char timestamp[32];
+    if (std::strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", local_time) == 0) {
+        throw std::runtime_error("failed to format Qwen4 n-gram trace timestamp");
+    }
+
+    const auto whole_seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - whole_seconds).count();
+    return format("%s.%09" PRId64, timestamp, ns);
+}
+
+static size_t qwen4_ngram_cache_budget() {
+    const char * value = std::getenv("LLAMA_QWEN4_NGRAM_CACHE_MIB");
+    if (!value) {
+        return size_t(1024) * 1024 * 1024;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || value[0] == '-' || mib > std::numeric_limits<size_t>::max() / 1024 / 1024) {
+        throw std::runtime_error(format("invalid LLAMA_QWEN4_NGRAM_CACHE_MIB value '%s'", value));
+    }
+    return size_t(mib) * 1024 * 1024;
 }
 
 class llama_qwen4_ngram_data final : public llama_ngram_data {
@@ -101,6 +141,47 @@ public:
 
         validate_metadata(hparams);
 
+        if (mode == LLAMA_NGRAM_LOAD_MODE_READ) {
+            const size_t cache_budget = qwen4_ngram_cache_budget();
+            const size_t cache_entry_size = row_size + sizeof(cache_tags[0]) + sizeof(cache_ages[0]);
+            cache_n_sets = cache_budget / cache_ways / cache_entry_size;
+            cache_n_entries = cache_n_sets * cache_ways;
+            cache_data_size = cache_n_entries * row_size;
+            cache_memory_size = cache_data_size + cache_n_entries * (sizeof(cache_tags[0]) + sizeof(cache_ages[0]));
+
+            if (!no_alloc && cache_n_entries > 0) {
+                cache_data.reset(new uint8_t[cache_data_size]);
+                cache_tags.assign(cache_n_entries, -1);
+                cache_ages.assign(cache_n_entries, 0);
+            }
+        }
+
+        if (!no_alloc) {
+            const char * home = std::getenv("HOME");
+            if (!home || home[0] == '\0') {
+                throw std::runtime_error("HOME is not set for Qwen4 n-gram trace");
+            }
+            trace_path = format("%s/%s-hit-rate-instrumentation.pid", home, qwen4_ngram_trace_timestamp().c_str());
+            trace.open(trace_path, std::ios::binary | std::ios::trunc);
+            if (!trace) {
+                throw std::runtime_error(format("failed to open Qwen4 n-gram trace '%s'", trace_path.c_str()));
+            }
+            const char magic[8] = { 'Q', '4', 'N', 'G', 'P', 'I', 'D', '1' };
+            const uint32_t n_heads_u32 = uint32_t(n_heads);
+            const uint64_t n_rows_u64 = uint64_t(n_rows);
+            const uint32_t row_width_u32 = uint32_t(row_width);
+            const uint32_t type_u32 = uint32_t(tensor->type);
+            trace.write(magic, sizeof(magic));
+            trace.write(reinterpret_cast<const char *>(&n_heads_u32), sizeof(n_heads_u32));
+            trace.write(reinterpret_cast<const char *>(&n_rows_u64), sizeof(n_rows_u64));
+            trace.write(reinterpret_cast<const char *>(&row_width_u32), sizeof(row_width_u32));
+            trace.write(reinterpret_cast<const char *>(&type_u32), sizeof(type_u32));
+            trace.flush();
+            if (!trace) {
+                throw std::runtime_error(format("failed to initialize Qwen4 n-gram trace '%s'", trace_path.c_str()));
+            }
+        }
+
         if (mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT && !no_alloc) {
             resident.resize(table_size);
             loader->files[weight->idx]->seek(weight->offs, SEEK_SET);
@@ -110,6 +191,13 @@ public:
         LLAMA_LOG_INFO("%s: Qwen4 n-gram table = %s, %.2f GiB, mode = %s\n",
                 __func__, ggml_type_name(tensor->type), table_size / 1024.0 / 1024.0 / 1024.0,
                 mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT ? "resident" : "read");
+        if (mode == LLAMA_NGRAM_LOAD_MODE_READ) {
+            LLAMA_LOG_INFO("%s: Qwen4 n-gram cache = %.2f MiB, %zu rows, %zu-way\n",
+                    __func__, cache_memory_size / 1024.0 / 1024.0, cache_n_entries, cache_ways);
+        }
+        if (trace.is_open()) {
+            LLAMA_LOG_INFO("%s: Qwen4 n-gram trace = %s\n", __func__, trace_path.c_str());
+        }
     }
 
     void set_input(ggml_tensor * dst, const int32_t * ids, size_t n_ids) const override {
@@ -126,7 +214,7 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex);
         staging.resize(n_elements);
-        if (resident.empty()) {
+        if (resident.empty() && !cache_data) {
             row.resize(row_size);
         }
 
@@ -144,6 +232,8 @@ public:
             const uint8_t * src;
             if (!resident.empty()) {
                 src = resident.data() + row_offset;
+            } else if (cache_data) {
+                src = get_cached_row(row_index, row_offset);
             } else {
                 loader->files[weight->idx]->seek(weight->offs + row_offset, SEEK_SET);
                 loader->files[weight->idx]->read_raw(row.data(), row.size());
@@ -158,14 +248,74 @@ public:
             }
         }
 
+        if (n_ids > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("Qwen4 n-gram trace record is too large");
+        }
+        const uint32_t n_ids_u32 = uint32_t(n_ids);
+        trace.write(reinterpret_cast<const char *>(&n_ids_u32), sizeof(n_ids_u32));
+        trace.write(reinterpret_cast<const char *>(ids), n_ids * sizeof(*ids));
+        if (!trace) {
+            throw std::runtime_error(format("failed to write Qwen4 n-gram trace '%s'", trace_path.c_str()));
+        }
+
         ggml_backend_tensor_set(dst, staging.data(), 0, staging.size() * sizeof(float));
     }
 
     size_t memory_size() const override {
-        return mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT ? table_size : 0;
+        return mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT ? table_size : cache_memory_size;
     }
 
 private:
+    const uint8_t * get_cached_row(size_t row_index, size_t row_offset) const {
+        const size_t first = row_index % cache_n_sets * cache_ways;
+        size_t hit = std::numeric_limits<size_t>::max();
+        size_t victim = first;
+        bool has_empty = false;
+        uint8_t oldest = 0;
+
+        for (size_t way = 0; way < cache_ways; ++way) {
+            const size_t slot = first + way;
+            if (cache_tags[slot] == int32_t(row_index)) {
+                hit = slot;
+                break;
+            }
+            if (cache_tags[slot] < 0) {
+                if (!has_empty) {
+                    victim = slot;
+                    has_empty = true;
+                }
+            } else if (!has_empty && cache_ages[slot] >= oldest) {
+                victim = slot;
+                oldest = cache_ages[slot];
+            }
+        }
+
+        if (hit != std::numeric_limits<size_t>::max()) {
+            const uint8_t age = cache_ages[hit];
+            for (size_t way = 0; way < cache_ways; ++way) {
+                const size_t slot = first + way;
+                if (cache_tags[slot] >= 0 && cache_ages[slot] < age) {
+                    ++cache_ages[slot];
+                }
+            }
+            cache_ages[hit] = 0;
+            return cache_data.get() + hit * row_size;
+        }
+
+        uint8_t * dst = cache_data.get() + victim * row_size;
+        loader->files[weight->idx]->seek(weight->offs + row_offset, SEEK_SET);
+        loader->files[weight->idx]->read_raw(dst, row_size);
+        for (size_t way = 0; way < cache_ways; ++way) {
+            const size_t slot = first + way;
+            if (cache_tags[slot] >= 0 && cache_ages[slot] < cache_ways - 1) {
+                ++cache_ages[slot];
+            }
+        }
+        cache_tags[victim] = int32_t(row_index);
+        cache_ages[victim] = 0;
+        return dst;
+    }
+
     void validate_metadata(const llama_hparams & hparams) const {
         uint32_t n_embd_per_layer = 0;
         uint32_t ngram = 0;
@@ -218,9 +368,19 @@ private:
     int64_t n_rows = 0;
     size_t row_size = 0;
     size_t table_size = 0;
+    static constexpr size_t cache_ways = 8;
+    size_t cache_n_sets = 0;
+    size_t cache_n_entries = 0;
+    size_t cache_data_size = 0;
+    size_t cache_memory_size = 0;
+    std::unique_ptr<uint8_t[]> cache_data;
+    mutable std::vector<int32_t> cache_tags;
+    mutable std::vector<uint8_t> cache_ages;
     std::vector<uint8_t> resident;
     mutable std::vector<uint8_t> row;
     mutable std::vector<float> staging;
+    std::string trace_path;
+    mutable std::ofstream trace;
     mutable std::mutex mutex;
 };
 
