@@ -18,6 +18,29 @@ static bool qwen4_pos_in(llama_pos pos, llama_pos p0, llama_pos p1) {
     return pos >= begin && pos < end;
 }
 
+static uint32_t qwen4_qsa_ratio(const llama_hparams & hparams, bool mtp) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if ((mtp ? il >= hparams.n_layer() : il < hparams.n_layer()) && !hparams.is_recr(il)) {
+            return hparams.qwen4_compress_ratios[il];
+        }
+    }
+
+    GGML_ABORT("Qwen4 memory has no sparse-attention layer");
+}
+
+static llama_hparams qwen4_qsa_hparams(const llama_hparams & hparams) {
+    llama_hparams result = hparams;
+    std::fill(result.n_head_kv_arr.begin(), result.n_head_kv_arr.end(), 1);
+    result.n_embd_head_k_full = hparams.indexer_head_size;
+    result.n_embd_head_v_full = hparams.indexer_head_size;
+    result.n_embd_head_k_swa = hparams.indexer_head_size;
+    result.n_embd_head_v_swa = hparams.indexer_head_size;
+    // llama_kv_cache uses MLA dimensions to allocate K-only storage.
+    result.n_embd_head_k_mla_impl = hparams.indexer_head_size;
+    result.n_embd_head_v_mla_impl = hparams.indexer_head_size;
+    return result;
+}
+
 llama_memory_qwen4::llama_memory_qwen4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -31,6 +54,7 @@ llama_memory_qwen4::llama_memory_qwen4(
                      bool   unified,
                      bool   mtp) :
     hparams(model.hparams),
+    hparams_qsa(qwen4_qsa_hparams(model.hparams)),
     mem_attn(new llama_kv_cache_msa(
         model,
         type_k,
@@ -45,6 +69,23 @@ llama_memory_qwen4::llama_memory_qwen4(
         LLAMA_SWA_TYPE_NONE,
         [&](int32_t il) { return mtp ? il >= (int32_t) hparams.n_layer() : il < (int32_t) hparams.n_layer() && !hparams.is_recr(il); },
         [&](int32_t il) { return mtp ? il >= (int32_t) hparams.n_layer() : il < (int32_t) hparams.n_layer() && !hparams.is_recr(il); },
+        nullptr)),
+    mem_qsa(new llama_kv_cache(
+        model,
+        hparams_qsa,
+        GGML_TYPE_F32,
+        GGML_TYPE_F32,
+        v_trans,
+        offload,
+        false,
+        GGML_PAD((kv_size + qwen4_qsa_ratio(hparams, mtp) - 1)/qwen4_qsa_ratio(hparams, mtp) + 1, 256u),
+        n_seq_max,
+        n_pad,
+        0,
+        LLAMA_SWA_TYPE_NONE,
+        nullptr,
+        [&](int32_t il) { return mtp ? il >= (int32_t) hparams.n_layer() : il < (int32_t) hparams.n_layer() && !hparams.is_recr(il); },
+        nullptr,
         nullptr)),
     mem_gdn(!mtp ? new llama_memory_recurrent(
         model,
@@ -132,6 +173,7 @@ bool llama_memory_qwen4::get_can_shift() const {
 
 void llama_memory_qwen4::clear(bool data) {
     mem_attn->clear(data);
+    mem_qsa->clear(data);
     if (mem_gdn) {
         mem_gdn->clear(data);
     }
@@ -139,6 +181,7 @@ void llama_memory_qwen4::clear(bool data) {
         mem_ple->clear(data);
     }
     token_histories.clear();
+    qsa_cached_blocks.clear();
 }
 
 bool llama_memory_qwen4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -147,6 +190,12 @@ bool llama_memory_qwen4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     }
     if (!mem_attn->seq_rm(seq_id, p0, p1)) {
         return false;
+    }
+
+    if (seq_id < 0) {
+        qsa_cached_blocks.clear();
+    } else {
+        qsa_cached_blocks.erase(seq_id);
     }
 
     if (seq_id < 0) {
@@ -174,6 +223,8 @@ void llama_memory_qwen4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst
     if (seq_id_src == seq_id_dst) {
         return;
     }
+
+    qsa_cached_blocks.erase(seq_id_dst);
 
     token_history copied;
     const auto & cells_src = mem_attn->get_base()->get_cells(seq_id_src);
@@ -237,6 +288,13 @@ void llama_memory_qwen4::seq_keep(llama_seq_id seq_id) {
         mem_ple->seq_keep(seq_id);
     }
 
+    const auto qsa_it = qsa_cached_blocks.find(seq_id);
+    const uint32_t qsa_blocks = qsa_it == qsa_cached_blocks.end() ? 0 : qsa_it->second;
+    qsa_cached_blocks.clear();
+    if (qsa_blocks > 0) {
+        qsa_cached_blocks.emplace(seq_id, qsa_blocks);
+    }
+
     auto it = token_histories.find(seq_id);
     token_history keep = it == token_histories.end() ? token_history{} : std::move(it->second);
     token_histories.clear();
@@ -253,6 +311,7 @@ void llama_memory_qwen4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (mem_ple) {
         mem_ple->seq_add(seq_id, p0, p1, shift);
     }
+    qsa_cached_blocks.erase(seq_id);
 
     auto it = token_histories.find(seq_id);
     if (it != token_histories.end()) {
@@ -272,6 +331,7 @@ void llama_memory_qwen4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (mem_ple) {
         mem_ple->seq_div(seq_id, p0, p1, d);
     }
+    qsa_cached_blocks.erase(seq_id);
 
     auto it = token_histories.find(seq_id);
     if (it != token_histories.end()) {
@@ -307,6 +367,9 @@ llama_pos llama_memory_qwen4::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_qwen4::memory_breakdown() const {
     auto result = mem_attn->memory_breakdown();
+    for (const auto & [buft, size] : mem_qsa->memory_breakdown()) {
+        result[buft] += size;
+    }
     if (mem_gdn) {
         for (const auto & [buft, size] : mem_gdn->memory_breakdown()) {
             result[buft] += size;
@@ -392,10 +455,20 @@ void llama_memory_qwen4::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
             io.read(&entry.token, sizeof(entry.token));
         }
     }
+
+    if (seq_id < 0) {
+        qsa_cached_blocks.clear();
+    } else {
+        qsa_cached_blocks.erase(seq_id);
+    }
 }
 
 llama_kv_cache_msa * llama_memory_qwen4::get_mem_attn() const {
     return mem_attn.get();
+}
+
+llama_kv_cache * llama_memory_qwen4::get_mem_qsa() const {
+    return mem_qsa.get();
 }
 
 llama_memory_recurrent * llama_memory_qwen4::get_mem_gdn() const {
@@ -506,45 +579,101 @@ void llama_memory_qwen4::commit_tokens(const llama_ubatch & ubatch) {
     }
 }
 
+uint32_t llama_memory_qwen4::get_qsa_update_capacity(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        uint32_t n_blocks,
+        bool reserve) const {
+    if (reserve) {
+        return n_blocks * std::max(1u, ubatch.n_seqs_unq);
+    }
+
+    std::map<llama_seq_id, bool> active;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t is = 0; is < ubatch.n_seq_id[i]; ++is) {
+            active.emplace(ubatch.seq_id[i][is], true);
+        }
+    }
+
+    uint32_t n_missing = 0;
+    for (const auto & [seq_id, _] : active) {
+        const auto history = token_histories.find(seq_id);
+        const uint32_t n_complete = history == token_histories.end() ? 0 : history->second.size()/ratio;
+        const auto cached = qsa_cached_blocks.find(seq_id);
+        const uint32_t n_cached = cached == qsa_cached_blocks.end() || cached->second > n_complete ? 0 : cached->second;
+        n_missing += n_complete - n_cached;
+    }
+
+    const uint32_t n_normal = ubatch.n_tokens/ratio + std::max(1u, ubatch.n_seqs_unq);
+    return std::max(n_normal, n_missing);
+}
+
 void llama_memory_qwen4::set_input_qsa_layout(
         ggml_tensor * block_cells,
-        ggml_tensor * block_pos,
+        ggml_tensor * block_key_cells,
         ggml_tensor * block_mask,
         ggml_tensor * selected,
+        ggml_tensor * update_cells,
+        ggml_tensor * update_pos,
+        ggml_tensor * update_idxs,
         const ggml_tensor * kq_mask,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        uint32_t block_topk) const {
+        uint32_t block_topk,
+        uint32_t n_kv,
+        uint32_t n_stream) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(block_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(block_pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_mask->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(selected->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(update_cells->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(update_pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(update_idxs->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
     GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(block_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(block_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(selected->type == GGML_TYPE_F32);
+    GGML_ASSERT(update_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(update_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(update_idxs->type == GGML_TYPE_I32);
 
     const int64_t n_blocks = block_cells->ne[1];
     const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_pos = block_pos->ne[1];
-    const int64_t n_kv = selected->ne[0];
+    const int64_t n_pos = update_pos->ne[1];
+    const int64_t n_updates = update_cells->ne[1];
+    const int64_t n_tps = n_tokens/n_stream;
+    const int64_t qsa_size = mem_qsa->get_size();
+    const int64_t qsa_streams = mem_qsa->get_n_stream();
+    const int64_t raw_size = mem_attn->get_idx()->get_size();
+    const int64_t raw_streams = mem_attn->get_idx()->get_n_stream();
 
     GGML_ASSERT(block_cells->ne[0] == ratio && block_cells->ne[2] == n_tokens);
-    GGML_ASSERT(block_pos->ne[0] == n_blocks && block_pos->ne[2] == n_tokens);
+    GGML_ASSERT(block_key_cells->ne[0] == n_blocks && block_key_cells->ne[1] == n_tokens);
     GGML_ASSERT(block_mask->ne[0] == n_blocks && block_mask->ne[1] == n_tokens);
+    GGML_ASSERT(update_cells->ne[0] == ratio);
+    GGML_ASSERT(update_pos->ne[0] == n_updates);
+    GGML_ASSERT(ggml_nelements(update_idxs) == n_updates);
+    GGML_ASSERT(n_stream > 0 && n_tokens % n_stream == 0);
     GGML_ASSERT(selected->ne[1] == n_tokens);
+    GGML_ASSERT(selected->ne[0] == n_kv);
     GGML_ASSERT(kq_mask->ne[0] == n_kv);
 
     auto * cell_data = (int32_t *) block_cells->data;
-    auto * pos_data = (int32_t *) block_pos->data;
+    auto * key_cell_data = (int32_t *) block_key_cells->data;
     auto * mask_data = (float *) block_mask->data;
     auto * selected_data = (float *) selected->data;
+    auto * update_cell_data = (int32_t *) update_cells->data;
+    auto * update_pos_data = (int32_t *) update_pos->data;
+    auto * update_idx_data = (int32_t *) update_idxs->data;
 
     std::fill(cell_data, cell_data + ggml_nelements(block_cells), 0);
-    std::fill(pos_data, pos_data + ggml_nelements(block_pos), 0);
+    std::fill(key_cell_data, key_cell_data + ggml_nelements(block_key_cells), 0);
     std::fill(mask_data, mask_data + ggml_nelements(block_mask), -INFINITY);
     std::fill(selected_data, selected_data + ggml_nelements(selected), 0.0f);
+    std::fill(update_cell_data, update_cell_data + ggml_nelements(update_cells), 0);
+    std::fill(update_pos_data, update_pos_data + ggml_nelements(update_pos), 0);
+    std::fill(update_idx_data, update_idx_data + ggml_nelements(update_idxs), 0);
 
     const auto mask_visible = [&](int64_t query, uint32_t cell) {
         const int64_t index = query * n_kv + cell;
@@ -554,8 +683,20 @@ void llama_memory_qwen4::set_input_qsa_layout(
         return std::isfinite(((const float *) kq_mask->data)[index]);
     };
 
+    using mapped_token = std::pair<const token_entry *, uint32_t>;
+    std::map<llama_seq_id, std::vector<mapped_token>> mapped_by_seq;
+    std::map<llama_seq_id, uint32_t> stream_by_seq;
+
     for (int64_t iq = 0; iq < n_tokens; ++iq) {
-        const llama_seq_id seq_id = ubatch->seq_id[iq][0];
+        const uint32_t stream = iq/n_tps;
+        for (int32_t is = 0; is < ubatch->n_seq_id[iq]; ++is) {
+            const llama_seq_id seq_id = ubatch->seq_id[iq][is];
+            const auto [it, inserted] = stream_by_seq.emplace(seq_id, stream);
+            GGML_ASSERT(inserted || it->second == stream);
+        }
+    }
+
+    for (const auto & [seq_id, _] : stream_by_seq) {
         const auto found = token_histories.find(seq_id);
         if (found == token_histories.end()) {
             continue;
@@ -573,7 +714,7 @@ void llama_memory_qwen4::set_input_qsa_layout(
         }
 
         std::map<pos_key, size_t> next_cell;
-        std::vector<std::pair<const token_entry *, uint32_t>> visible;
+        auto & mapped = mapped_by_seq[seq_id];
         for (const auto & entry : found->second) {
             const pos_key key = { entry.pos[0], entry.pos[1], entry.pos[2] };
             auto cells_it = cells_by_pos.find(key);
@@ -585,8 +726,87 @@ void llama_memory_qwen4::set_input_qsa_layout(
                 continue;
             }
             const uint32_t cell = cells_it->second[index++];
-            if (mask_visible(iq, cell)) {
-                visible.emplace_back(&entry, cell);
+            mapped.emplace_back(&entry, cell);
+        }
+    }
+
+    std::map<llama_seq_id, std::vector<int32_t>> block_by_first_cell;
+    for (const auto & [seq_id, mapped] : mapped_by_seq) {
+        auto & blocks = block_by_first_cell[seq_id];
+        blocks.resize(n_kv, -1);
+        for (size_t ib = 0; ib < mapped.size()/ratio; ++ib) {
+            GGML_ASSERT(ib <= (size_t) std::numeric_limits<int32_t>::max());
+            blocks[mapped[ib*ratio].second] = (int32_t) ib;
+        }
+    }
+
+    int64_t n_update = 0;
+    llama_seq_id dummy_seq = -1;
+    const mapped_token * dummy_token = nullptr;
+
+    for (const auto & [seq_id, mapped] : mapped_by_seq) {
+        GGML_ASSERT(seq_id >= 0 && seq_id < qsa_streams);
+        const uint32_t n_complete = mapped.size()/ratio;
+        const auto cached = qsa_cached_blocks.find(seq_id);
+        const uint32_t n_cached = cached == qsa_cached_blocks.end() || cached->second > n_complete ? 0 : cached->second;
+        const int64_t raw_stream = raw_streams == 1 ? 0 : seq_id;
+        GGML_ASSERT(raw_stream >= 0 && raw_stream < raw_streams);
+
+        if (!mapped.empty() && !dummy_token) {
+            dummy_seq = seq_id;
+            dummy_token = &mapped[0];
+        }
+
+        for (uint32_t ib = n_cached; ib < n_complete; ++ib) {
+            GGML_ASSERT(n_update < n_updates);
+            for (uint32_t ir = 0; ir < ratio; ++ir) {
+                const int64_t source = raw_stream*raw_size + mapped[(size_t) ib*ratio + ir].second;
+                GGML_ASSERT(source <= std::numeric_limits<int32_t>::max());
+                update_cell_data[n_update*ratio + ir] = source;
+            }
+            for (int64_t ip = 0; ip < n_pos; ++ip) {
+                update_pos_data[ip*n_updates + n_update] = mapped[(size_t) ib*ratio].first->pos[ip];
+            }
+            const int64_t dst = (int64_t) seq_id*qsa_size + ib;
+            GGML_ASSERT(dst <= std::numeric_limits<int32_t>::max());
+            update_idx_data[n_update++] = dst;
+        }
+        qsa_cached_blocks[seq_id] = n_complete;
+    }
+
+    GGML_ASSERT(dummy_token);
+    const int64_t dummy_raw_stream = raw_streams == 1 ? 0 : dummy_seq;
+    const int64_t dummy_source = dummy_raw_stream*raw_size + dummy_token->second;
+    const int64_t dummy_dst = (int64_t) dummy_seq*qsa_size + qsa_size - 1;
+    GGML_ASSERT(dummy_source <= std::numeric_limits<int32_t>::max());
+    GGML_ASSERT(dummy_dst <= std::numeric_limits<int32_t>::max());
+    while (n_update < n_updates) {
+        for (uint32_t ir = 0; ir < ratio; ++ir) {
+            update_cell_data[n_update*ratio + ir] = dummy_source;
+        }
+        for (int64_t ip = 0; ip < n_pos; ++ip) {
+            update_pos_data[ip*n_updates + n_update] = dummy_token->first->pos[ip];
+        }
+        update_idx_data[n_update++] = dummy_dst;
+    }
+
+    for (int64_t iq = 0; iq < n_tokens; ++iq) {
+        const llama_seq_id seq_id = ubatch->seq_id[iq][0];
+        const auto mapped_it = mapped_by_seq.find(seq_id);
+        if (mapped_it == mapped_by_seq.end()) {
+            continue;
+        }
+        const auto & mapped = mapped_it->second;
+        const auto & blocks = block_by_first_cell.at(seq_id);
+        const int64_t scratch = (int64_t) seq_id*qsa_size + qsa_size - 1;
+        GGML_ASSERT(scratch <= std::numeric_limits<int32_t>::max());
+        std::fill(key_cell_data + iq*n_blocks, key_cell_data + (iq + 1)*n_blocks, scratch);
+
+        std::vector<mapped_token> visible;
+        visible.reserve(mapped.size());
+        for (const auto & item : mapped) {
+            if (mask_visible(iq, item.second)) {
+                visible.push_back(item);
             }
         }
 
@@ -595,14 +815,18 @@ void llama_memory_qwen4::set_input_qsa_layout(
         std::vector<uint8_t> used_cells(n_kv, 0);
         for (size_t ib = 0; ib < n_write; ++ib) {
             mask_data[iq * n_blocks + ib] = 0.0f;
+            const uint32_t first_cell = visible[ib*ratio].second;
+            const int32_t full_block = blocks[first_cell];
+            GGML_ASSERT(full_block >= 0 && (size_t) full_block < mapped.size()/ratio);
             for (uint32_t ir = 0; ir < ratio; ++ir) {
                 const uint32_t cell = visible[ib * ratio + ir].second;
+                GGML_ASSERT(mapped[(size_t) full_block*ratio + ir].second == cell);
                 cell_data[(iq * n_blocks + ib) * ratio + ir] = cell;
                 used_cells[cell] = 1;
             }
-            for (int64_t ip = 0; ip < n_pos; ++ip) {
-                pos_data[(iq * n_pos + ip) * n_blocks + ib] = visible[ib * ratio].first->pos[ip];
-            }
+            const int64_t key_cell = (int64_t) seq_id*qsa_size + full_block;
+            GGML_ASSERT(key_cell <= std::numeric_limits<int32_t>::max());
+            key_cell_data[iq*n_blocks + ib] = key_cell;
         }
 
         uint32_t fallback_cell = 0;
@@ -631,6 +855,7 @@ llama_memory_qwen4_context::llama_memory_qwen4_context(llama_memory_qwen4 * mem)
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_gdn(mem->get_mem_gdn() ? mem->get_mem_gdn()->init_full() : nullptr),
     ctx_ple(mem->get_mem_ple() ? mem->get_mem_ple()->init_full() : nullptr),
+    reserve(true),
     status(llama_memory_status_combine(
             ctx_attn->get_status(),
             llama_memory_status_combine(
@@ -728,6 +953,14 @@ const llama_kv_cache_msa_context * llama_memory_qwen4_context::get_attn() const 
     return static_cast<const llama_kv_cache_msa_context *>(ctx_attn.get());
 }
 
+llama_kv_cache_msa * llama_memory_qwen4_context::get_attn_memory() const {
+    return mem->get_mem_attn();
+}
+
+llama_kv_cache * llama_memory_qwen4_context::get_qsa() const {
+    return mem->get_mem_qsa();
+}
+
 const llama_memory_recurrent_context * llama_memory_qwen4_context::get_gdn() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_gdn.get());
 }
@@ -745,12 +978,27 @@ void llama_memory_qwen4_context::set_input_ple_ids(ggml_tensor * dst) const {
 
 void llama_memory_qwen4_context::set_input_qsa_layout(
         ggml_tensor * block_cells,
-        ggml_tensor * block_pos,
+        ggml_tensor * block_key_cells,
         ggml_tensor * block_mask,
         ggml_tensor * selected,
+        ggml_tensor * update_cells,
+        ggml_tensor * update_pos,
+        ggml_tensor * update_idxs,
         const ggml_tensor * kq_mask,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        uint32_t block_topk) const {
-    mem->set_input_qsa_layout(block_cells, block_pos, block_mask, selected, kq_mask, ubatch, ratio, block_topk);
+        uint32_t block_topk,
+        uint32_t n_kv,
+        uint32_t n_stream) const {
+    mem->set_input_qsa_layout(
+            block_cells, block_key_cells, block_mask, selected,
+            update_cells, update_pos, update_idxs,
+            kq_mask, ubatch, ratio, block_topk, n_kv, n_stream);
+}
+
+uint32_t llama_memory_qwen4_context::get_qsa_update_capacity(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        uint32_t n_blocks) const {
+    return mem->get_qsa_update_capacity(ubatch, ratio, n_blocks, reserve);
 }

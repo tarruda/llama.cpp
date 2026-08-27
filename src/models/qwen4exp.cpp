@@ -34,11 +34,15 @@ public:
         mctx(mctx),
         kq_mask(kq_mask),
         ratio(ratio),
-        block_topk(block_topk) {
+        block_topk(block_topk),
+        n_stream(kq_mask->ne[3]) {
     }
 
     void set_input(const llama_ubatch * ubatch) override {
-        mctx->set_input_qsa_layout(block_cells, block_pos, block_mask, selected, kq_mask, ubatch, ratio, block_topk);
+        mctx->set_input_qsa_layout(
+                block_cells, block_key_cells, block_mask, selected,
+                update_cells, update_pos, update_idxs,
+                kq_mask, ubatch, ratio, block_topk, selected->ne[0], n_stream);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -47,27 +51,35 @@ public:
 
         const int64_t n_kv = mctx->get_attn()->get_base()->get_n_kv();
         const int64_t n_blocks = n_kv / ratio;
+        const int64_t n_updates = mctx->get_qsa_update_capacity(params.ubatch, ratio, n_blocks);
+        const int64_t n_stream_new = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
 
         bool result = true;
         result &= n_kv > (int64_t) block_topk * ratio + ratio - 1;
         result &= block_cells->ne[1] == n_blocks;
         result &= block_cells->ne[2] == params.ubatch.n_tokens;
-        result &= block_pos->ne[2] == params.ubatch.n_tokens;
+        result &= block_key_cells->ne[1] == params.ubatch.n_tokens;
         result &= block_mask->ne[1] == params.ubatch.n_tokens;
         result &= selected->ne[0] == n_kv;
         result &= selected->ne[1] == params.ubatch.n_tokens;
+        result &= update_cells->ne[1] == n_updates;
+        result &= n_stream == n_stream_new;
         return result;
     }
 
     ggml_tensor * block_cells = nullptr;
-    ggml_tensor * block_pos = nullptr;
+    ggml_tensor * block_key_cells = nullptr;
     ggml_tensor * block_mask = nullptr;
     ggml_tensor * selected = nullptr;
+    ggml_tensor * update_cells = nullptr;
+    ggml_tensor * update_pos = nullptr;
+    ggml_tensor * update_idxs = nullptr;
 
     const llama_memory_qwen4_context * mctx;
     ggml_tensor * kq_mask;
     const uint32_t ratio;
     const uint32_t block_topk;
+    const int64_t n_stream;
 };
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
@@ -551,21 +563,31 @@ llm_graph_input_qwen4_qsa * llama_model_qwen4exp::graph::build_qsa_input(
 
     const uint32_t block_topk = hparams.indexer_top_k / ratio;
     const int64_t n_blocks = n_kv / ratio;
+    const int64_t n_updates = static_cast<const llama_memory_qwen4_context *>(mctx)->get_qsa_update_capacity(ubatch, ratio, n_blocks);
     auto qsa_input = std::make_unique<llm_graph_input_qwen4_qsa>(
             static_cast<const llama_memory_qwen4_context *>(mctx),
             inp->get_attn()->get_kq_mask(), ratio, block_topk);
     qsa_input->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, ratio, n_blocks, n_tokens);
-    qsa_input->block_pos = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_blocks, hparams.n_pos_per_embd(), n_tokens);
+    qsa_input->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_tokens);
     qsa_input->block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blocks, n_tokens);
     qsa_input->selected = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+    qsa_input->update_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ratio, n_updates);
+    qsa_input->update_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_updates, hparams.n_pos_per_embd());
+    qsa_input->update_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_updates);
     ggml_set_input(qsa_input->block_cells);
-    ggml_set_input(qsa_input->block_pos);
+    ggml_set_input(qsa_input->block_key_cells);
     ggml_set_input(qsa_input->block_mask);
     ggml_set_input(qsa_input->selected);
+    ggml_set_input(qsa_input->update_cells);
+    ggml_set_input(qsa_input->update_pos);
+    ggml_set_input(qsa_input->update_idxs);
     ggml_set_name(qsa_input->block_cells, "qsa_block_cells");
-    ggml_set_name(qsa_input->block_pos, "qsa_block_pos");
+    ggml_set_name(qsa_input->block_key_cells, "qsa_block_key_cells");
     ggml_set_name(qsa_input->block_mask, "qsa_block_mask");
     ggml_set_name(qsa_input->selected, "qsa_selected_base");
+    ggml_set_name(qsa_input->update_cells, "qsa_update_cells");
+    ggml_set_name(qsa_input->update_pos, "qsa_update_pos");
+    ggml_set_name(qsa_input->update_idxs, "qsa_update_idxs");
     return (llm_graph_input_qwen4_qsa *) res->add_input(std::move(qsa_input));
 }
 
@@ -663,7 +685,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
     const int64_t block_topk = hparams.indexer_top_k / ratio;
     const int64_t n_blocks = qsa->block_cells->ne[1];
     const int64_t n_kv = qsa->selected->ne[0];
-    const int64_t n_pos = hparams.n_pos_per_embd();
 
     ggml_tensor * index_q = build_lora_mm(model.layers[il].index_q_proj, cur);
     index_q = ggml_reshape_3d(ctx0, index_q, index_dim, index_heads, n_tokens);
@@ -679,44 +700,58 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
     const auto * mctx_idx = inp->mctx_msa->get_idx();
     ggml_tensor * index_k_cache = mctx_idx->get_k(ctx0, il);
     const int64_t n_stream = index_k_cache->ne[3];
+    GGML_ASSERT(qsa->n_stream == n_stream);
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens / n_stream;
     const int64_t selected_per_query = ratio * block_topk;
     const ggml_type activation_type = mctx_idx->type_k();
     ggml_tensor * index_k_norm = model.layers[il].index_k_norm;
+
+    ggml_tensor * index_k_storage = qsa->mctx->get_attn_memory()->get_idx()->get_k_storage(il);
+    index_k_storage = ggml_reshape_2d(ctx0, index_k_storage, index_dim, index_k_storage->ne[1] * index_k_storage->ne[2]);
+    ggml_tensor * update_keys = ggml_get_rows(
+            ctx0, index_k_storage,
+            ggml_reshape_1d(ctx0, qsa->update_cells, ggml_nelements(qsa->update_cells)));
+    const int64_t n_updates = qsa->update_cells->ne[1];
+    update_keys = ggml_reshape_3d(ctx0, update_keys, index_dim, ratio, n_updates);
+    update_keys = ggml_cont(ctx0, ggml_transpose(ctx0, update_keys));
+    update_keys = ggml_mean(ctx0, update_keys);
+    update_keys = ggml_cont(ctx0, ggml_transpose(ctx0, update_keys));
+    update_keys = ggml_reshape_3d(ctx0, update_keys, index_dim, 1, n_updates);
+
+    if (update_keys->type != activation_type) {
+        update_keys = ggml_cast(ctx0, update_keys, activation_type);
+        update_keys = ggml_cast(ctx0, update_keys, GGML_TYPE_F32);
+    }
+    update_keys = build_norm(update_keys, index_k_norm, nullptr, LLM_NORM_RMS, il);
+
+    if (std::accumulate(sections, sections + 4, 0) <= index_dim) {
+        update_keys = ggml_rope_multi(ctx0, update_keys, ggml_reshape_1d(ctx0, qsa->update_pos, ggml_nelements(qsa->update_pos)), nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    } else {
+        update_keys = ggml_rope_ext(ctx0, update_keys, ggml_view_1d(ctx0, qsa->update_pos, n_updates, 0), nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+    cb(update_keys, "index_Kblock_update", il);
+
+    ggml_tensor * block_key_cache = qsa->mctx->get_qsa()->get_k_storage(il);
+    block_key_cache = ggml_reshape_2d(ctx0, block_key_cache, index_dim, block_key_cache->ne[1] * block_key_cache->ne[2]);
+    block_key_cache = ggml_set_rows(
+            ctx0, block_key_cache,
+            ggml_reshape_2d(ctx0, update_keys, index_dim, n_updates),
+            qsa->update_idxs);
+
     std::vector<ggml_tensor *> selected_streams;
     selected_streams.reserve(n_stream);
 
     for (int64_t is = 0; is < n_stream; ++is) {
-        ggml_tensor * cache = ggml_view_2d(
-                ctx0, index_k_cache, index_dim, n_kv,
-                index_k_cache->nb[2], is * index_k_cache->nb[3]);
         ggml_tensor * block_cells = ggml_view_3d(
                 ctx0, qsa->block_cells, ratio, n_blocks, n_tps,
                 qsa->block_cells->nb[1], qsa->block_cells->nb[2], is * n_tps * qsa->block_cells->nb[2]);
+        ggml_tensor * block_key_cells = ggml_view_2d(
+                ctx0, qsa->block_key_cells, n_blocks, n_tps,
+                qsa->block_key_cells->nb[1], is * n_tps * qsa->block_key_cells->nb[1]);
         ggml_tensor * block_keys = ggml_get_rows(
-                ctx0, cache, ggml_reshape_1d(ctx0, block_cells, ratio * n_blocks * n_tps));
-        block_keys = ggml_reshape_4d(ctx0, block_keys, index_dim, ratio, n_blocks, n_tps);
-        block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
-        block_keys = ggml_mean(ctx0, block_keys);
-        block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
-        block_keys = ggml_reshape_3d(ctx0, block_keys, index_dim, 1, n_blocks * n_tps);
-
-        if (block_keys->type != activation_type) {
-            block_keys = ggml_cast(ctx0, block_keys, activation_type);
-            block_keys = ggml_cast(ctx0, block_keys, GGML_TYPE_F32);
-        }
-        block_keys = build_norm(block_keys, index_k_norm, nullptr, LLM_NORM_RMS, il);
-
-        ggml_tensor * block_pos = ggml_view_3d(
-                ctx0, qsa->block_pos, n_blocks, n_pos, n_tps,
-                qsa->block_pos->nb[1], qsa->block_pos->nb[2], is * n_tps * qsa->block_pos->nb[2]);
-        if (std::accumulate(sections, sections + 4, 0) <= index_dim) {
-            block_keys = ggml_rope_multi(ctx0, block_keys, ggml_reshape_1d(ctx0, block_pos, n_blocks * n_pos * n_tps), nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        } else {
-            block_pos = ggml_view_2d(ctx0, block_pos, n_blocks, n_tps, block_pos->nb[2], 0);
-            block_keys = ggml_rope_ext(ctx0, block_keys, ggml_reshape_1d(ctx0, ggml_cont(ctx0, block_pos), n_blocks * n_tps), nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        }
+                ctx0, block_key_cache,
+                ggml_reshape_1d(ctx0, block_key_cells, n_blocks * n_tps));
         cb(block_keys, "index_Kblock", il);
 
         block_keys = ggml_reshape_4d(ctx0, block_keys, index_dim, n_blocks, 1, n_tps);

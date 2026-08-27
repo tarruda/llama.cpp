@@ -55,6 +55,7 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
     llama_kv_cache_msa * get_mem_attn() const;
+    llama_kv_cache * get_mem_qsa() const;
     llama_memory_recurrent * get_mem_gdn() const;
     llama_memory_recurrent * get_mem_ple() const;
 
@@ -72,20 +73,34 @@ private:
     void commit_tokens(const llama_ubatch & ubatch);
     void set_input_qsa_layout(
             ggml_tensor * block_cells,
-            ggml_tensor * block_pos,
+            ggml_tensor * block_key_cells,
             ggml_tensor * block_mask,
             ggml_tensor * selected,
+            ggml_tensor * update_cells,
+            ggml_tensor * update_pos,
+            ggml_tensor * update_idxs,
             const ggml_tensor * kq_mask,
             const llama_ubatch * ubatch,
             uint32_t ratio,
-            uint32_t block_topk) const;
+            uint32_t block_topk,
+            uint32_t n_kv,
+            uint32_t n_stream) const;
+
+    uint32_t get_qsa_update_capacity(
+            const llama_ubatch & ubatch,
+            uint32_t ratio,
+            uint32_t n_blocks,
+            bool reserve) const;
 
     const llama_hparams & hparams;
+    llama_hparams hparams_qsa;
     const std::unique_ptr<llama_kv_cache_msa> mem_attn;
+    const std::unique_ptr<llama_kv_cache> mem_qsa;
     const std::unique_ptr<llama_memory_recurrent> mem_gdn;
     const std::unique_ptr<llama_memory_recurrent> mem_ple;
 
     std::map<llama_seq_id, token_history> token_histories;
+    mutable std::map<llama_seq_id, uint32_t> qsa_cached_blocks;
 };
 
 class llama_memory_qwen4_context : public llama_memory_context_i {
@@ -110,19 +125,31 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     const llama_kv_cache_msa_context * get_attn() const;
+    llama_kv_cache_msa * get_attn_memory() const;
+    llama_kv_cache * get_qsa() const;
     const llama_memory_recurrent_context * get_gdn() const;
     const llama_memory_recurrent_context * get_ple() const;
 
     void set_input_ple_ids(ggml_tensor * dst) const;
     void set_input_qsa_layout(
             ggml_tensor * block_cells,
-            ggml_tensor * block_pos,
+            ggml_tensor * block_key_cells,
             ggml_tensor * block_mask,
             ggml_tensor * selected,
+            ggml_tensor * update_cells,
+            ggml_tensor * update_pos,
+            ggml_tensor * update_idxs,
             const ggml_tensor * kq_mask,
             const llama_ubatch * ubatch,
             uint32_t ratio,
-            uint32_t block_topk) const;
+            uint32_t block_topk,
+            uint32_t n_kv,
+            uint32_t n_stream) const;
+
+    uint32_t get_qsa_update_capacity(
+            const llama_ubatch & ubatch,
+            uint32_t ratio,
+            uint32_t n_blocks) const;
 
 private:
     llama_memory_qwen4 * mem = nullptr;
@@ -135,5 +162,6 @@ private:
     const llama_memory_context_ptr ctx_gdn;
     const llama_memory_context_ptr ctx_ple;
 
+    const bool reserve = false;
     const llama_memory_status status;
 };
