@@ -770,7 +770,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         scores = ggml_add(ctx0, scores, block_mask);
         cb(scores, "index_scores", il);
 
-        ggml_tensor * top_blocks = ggml_argsort_top_k(ctx0, scores, block_topk);
+        ggml_tensor * top_blocks = ggml_top_k(ctx0, scores, block_topk);
         ggml_tensor * top_cells = ggml_get_rows(ctx0, block_cells, top_blocks);
         top_cells = ggml_reshape_2d(ctx0, top_cells, selected_per_query, n_tps);
         cb(top_cells, "index_selected_cells", il);
