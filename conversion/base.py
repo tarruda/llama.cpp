@@ -121,8 +121,13 @@ class ModelBase:
     mtp_only: bool = False
     no_mtp: bool = False
 
+    supports_ngram_export: bool = False
+    ngram_only: bool = False
+    no_ngram: bool = False
+    ngram_qtype: gguf.GGMLQuantizationType | None = None
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
-                 use_temp_file: bool = False, eager: bool = False,
+                 use_temp_file: bool = False, eager: bool = False, use_mmap: bool = True,
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
@@ -145,6 +150,7 @@ class ModelBase:
         self.is_big_endian = is_big_endian
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
         self.use_temp_file = use_temp_file
+        self.use_mmap = use_mmap
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
@@ -252,9 +258,9 @@ class ModelBase:
             logger.info(f"gguf: indexing model part '{part_name}'")
             ctx: ContextManager[Any]
             if is_safetensors:
-                ctx = cast(ContextManager[Any], gguf.utility.SafetensorsLocal(self.dir_model / part_name))
+                ctx = cast(ContextManager[Any], gguf.utility.SafetensorsLocal(self.dir_model / part_name, use_mmap=self.use_mmap))
             else:
-                ctx = contextlib.nullcontext(torch.load(str(self.dir_model / part_name), map_location="cpu", mmap=True, weights_only=True))
+                ctx = contextlib.nullcontext(torch.load(str(self.dir_model / part_name), map_location="cpu", mmap=self.use_mmap, weights_only=True))
 
             with ctx as model_part:
                 assert model_part is not None
@@ -267,7 +273,7 @@ class ModelBase:
                             data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
                         else:
                             dtype = LazyTorchTensor._dtype_str_map[data.dtype]
-                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.load_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
                     else:
                         data_torch: Tensor = model_part[name]
                         if self.lazy:
@@ -2646,7 +2652,7 @@ class LazyTorchTensor(gguf.LazyBase):
                 return tensor
             dtype = cls._dtype_str_map[tensor.dtype]
             numpy_dtype = cls._dtype_byteswap_map[dtype]
-            return torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            return torch.from_numpy(byteswap_tensor(tensor.load_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
         dtype = cls._dtype_str_map[t.dtype]
         shape = t.shape
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(t,), func=lambda r: load_tensor(r))

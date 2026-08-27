@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from collections import OrderedDict
-from typing import Any, Literal, NamedTuple, TypeVar, Union
+from typing import Any, BinaryIO, Literal, NamedTuple, TypeVar, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -134,8 +134,16 @@ class GGUFReader:
         GGUFValueType.BOOL:    np.bool_,
     }
 
-    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r'):
-        self.data = np.memmap(path, mode = mode)
+    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r', *, use_mmap: bool = True, metadata_only: bool = False):
+        if not use_mmap and not metadata_only:
+            raise ValueError('Buffered GGUF reading requires metadata_only=True')
+        if not use_mmap and mode != 'r':
+            raise ValueError('Buffered GGUF reading only supports mode="r"')
+
+        self.data: np.memmap | None = np.memmap(path, mode=mode) if use_mmap else None
+        self._file: BinaryIO | None = open(path, 'rb', buffering=1024 * 1024) if not use_mmap else None
+        self._file_size = os.path.getsize(path)
+        self.metadata_only = metadata_only
         offs = 0
 
         # Check for GGUF magic
@@ -192,6 +200,9 @@ class GGUFReader:
             offs += self.alignment - padding
         self.data_offset = offs
         self._build_tensors(offs, tensors_fields)
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
     _DT = TypeVar('_DT', bound = npt.DTypeLike)
 
@@ -209,7 +220,17 @@ class GGUFReader:
         count = int(count)
         itemsize = int(np.empty([], dtype = dtype).itemsize)
         end_offs = offset + itemsize * count
-        arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
+        if end_offs > self._file_size:
+            raise ValueError(f'Read at offset {offset} exceeds file size {self._file_size}')
+        if self.data is not None:
+            arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
+        else:
+            assert self._file is not None
+            self._file.seek(offset)
+            raw = self._file.read(end_offs - offset)
+            if len(raw) != end_offs - offset:
+                raise ValueError(f'Could not read {end_offs - offset} bytes at offset {offset}')
+            arr = np.frombuffer(raw, dtype=dtype, count=count)
         return arr.view(arr.dtype.newbyteorder(self.byte_order if override_order is None else override_order))
 
     def _push_field(self, field: ReaderField, skip_sum: bool = False) -> int:
@@ -227,8 +248,8 @@ class GGUFReader:
         slen = self._get(offset, np.uint64)
         if int(slen[0]) > GGUF_MAX_STRING_LENGTH:
             raise ValueError(f'String length {int(slen[0])} exceeds maximum {GGUF_MAX_STRING_LENGTH}')
-        if offset + 8 + int(slen[0]) > self.data.nbytes:
-            raise ValueError(f'String length {int(slen[0])} exceeds remaining file size {self.data.nbytes - offset - 8}')
+        if offset + 8 + int(slen[0]) > self._file_size:
+            raise ValueError(f'String length {int(slen[0])} exceeds remaining file size {self._file_size - offset - 8}')
         return slen, self._get(offset + 8, np.uint8, slen[0])
 
     def _get_field_parts(
@@ -351,6 +372,8 @@ class GGUFReader:
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
             n_bytes = n_elems * type_size // block_size
             data_offs = int(start_offs + offset_tensor[0])
+            if data_offs > self._file_size or n_bytes > self._file_size - data_offs:
+                raise ValueError(f'Tensor {tensor_name} data exceeds file size {self._file_size}')
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
                 item_count = n_elems
@@ -377,6 +400,7 @@ class GGUFReader:
                 item_count = n_bytes
                 item_type = np.uint8
                 np_dims = quant_shape_to_byte_shape(np_dims, ggml_type)
+            data = np.empty(0, dtype=np.uint8) if self.metadata_only else self._get(data_offs, item_type, item_count).reshape(np_dims)
             tensors.append(ReaderTensor(
                 name = tensor_name,
                 tensor_type = ggml_type,
@@ -384,7 +408,7 @@ class GGUFReader:
                 n_elements = n_elems,
                 n_bytes = n_bytes,
                 data_offset = data_offs,
-                data = self._get(data_offs, item_type, item_count).reshape(np_dims),
+                data = data,
                 field = field,
             ))
         self.tensors = tensors

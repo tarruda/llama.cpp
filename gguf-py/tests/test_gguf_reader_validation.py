@@ -35,3 +35,30 @@ def test_dims_product_no_uint64_wraparound(tmp_path):
     _write_gguf(p, len(dims), dims)
     with pytest.raises(ValueError):
         GGUFReader(p)
+
+
+def test_buffered_metadata_only_reader(tmp_path):
+    p = tmp_path / 'metadata_only.gguf'
+    _write_gguf(p, 1, [1])
+
+    reader = GGUFReader(p, use_mmap=False, metadata_only=True)
+
+    assert reader.data is None
+    assert len(reader.tensors) == 1
+    assert reader.tensors[0].data.size == 0
+
+
+def test_buffered_reader_requires_metadata_only(tmp_path):
+    p = tmp_path / 'buffered.gguf'
+    _write_gguf(p, 1, [1])
+
+    with pytest.raises(ValueError, match='metadata_only'):
+        GGUFReader(p, use_mmap=False)
+
+
+def test_metadata_only_checks_tensor_data_bounds(tmp_path):
+    p = tmp_path / 'truncated.gguf'
+    _write_gguf(p, 1, [1_000_000])
+
+    with pytest.raises(ValueError, match='data exceeds file size'):
+        GGUFReader(p, use_mmap=False, metadata_only=True)

@@ -209,10 +209,16 @@ extern "C" {
         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5, // memory map the model without prefetching mapped data
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+
+    enum llama_ngram_load_mode {
+        LLAMA_NGRAM_LOAD_MODE_RESIDENT = 0,
+        LLAMA_NGRAM_LOAD_MODE_READ     = 1,
+    };
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -316,6 +322,8 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
+        const char * path_ngram; // optional Qwen4 n-gram table GGUF
+        enum llama_ngram_load_mode ngram_load_mode; // how to access the n-gram table
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -435,6 +443,7 @@ extern "C" {
         bool pure;                                                  // quantize all tensors to the default type
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
+        bool no_ngram;                                              // exclude the Qwen4 n-gram embedding table
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides

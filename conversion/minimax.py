@@ -36,7 +36,7 @@ class MiniMaxText01Model(TextModel):
             embeddings_data = model_shard[embeddings_tensor_name]
 
         embeddings_weights_dtype = LazyTorchTensor._dtype_str_map[embeddings_data.dtype]
-        embeddings_weights = torch.from_numpy(embeddings_data.mmap_bytes()).view(embeddings_weights_dtype).reshape(embeddings_data.shape)
+        embeddings_weights = torch.from_numpy(embeddings_data.load_bytes()).view(embeddings_weights_dtype).reshape(embeddings_data.shape)
         embeddings_vocab_size = embeddings_weights.shape[0]
 
         embeddings_added_tokens = embeddings_weights[tokenizer_vocab_size:embeddings_vocab_size]

@@ -131,6 +131,7 @@ public:
     llama_kv_cache * get_qsa() const;
     const llama_memory_recurrent_context * get_gdn() const;
     const llama_memory_recurrent_context * get_ple() const;
+    const std::vector<int32_t> & get_ple_ids() const;
 
     void set_input_ple_ids(ggml_tensor * dst) const;
     void set_input_qsa_layout(

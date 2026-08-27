@@ -282,9 +282,27 @@ class LocalTensor:
     dtype: str
     shape: tuple[int, ...]
     data_range: LocalTensorRange
+    use_mmap: bool = True
 
     def mmap_bytes(self) -> np.ndarray:
         return np.memmap(self.data_range.filename, mode='c', offset=self.data_range.offset, shape=self.data_range.size)
+
+    def load_bytes(self) -> np.ndarray:
+        if self.use_mmap:
+            return self.mmap_bytes()
+
+        data = np.empty(self.data_range.size, dtype=np.uint8)
+        view = memoryview(data)
+        offset = 0
+        with open(self.data_range.filename, "rb", buffering=0) as f:
+            f.seek(self.data_range.offset)
+            while offset < len(view):
+                end = min(offset + 16 * 1024 * 1024, len(view))
+                n_read = f.readinto(view[offset:end])
+                if not n_read:
+                    raise ValueError(f"Could not read complete tensor data from {self.data_range.filename}")
+                offset += n_read
+        return data
 
 
 class SafetensorsLocal:
@@ -297,7 +315,7 @@ class SafetensorsLocal:
 
     tensors: dict[str, LocalTensor]
 
-    def __init__(self, filename: Path):
+    def __init__(self, filename: Path, use_mmap: bool = True):
         with open(filename, "rb") as f:
             metadata_length = int.from_bytes(f.read(8), byteorder='little')
             file_size = os.stat(filename).st_size
@@ -326,6 +344,7 @@ class SafetensorsLocal:
                         data_start_offset + meta["data_offsets"][0],
                         meta["data_offsets"][1] - meta["data_offsets"][0],
                     ),
+                    use_mmap=use_mmap,
                 )
 
             # order by name (same as default safetensors behavior)

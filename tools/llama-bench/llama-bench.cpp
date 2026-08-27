@@ -271,6 +271,17 @@ static const char * split_mode_str(llama_split_mode mode) {
     }
 }
 
+static const char * ngram_load_mode_str(llama_ngram_load_mode mode) {
+    switch (mode) {
+        case LLAMA_NGRAM_LOAD_MODE_RESIDENT:
+            return "resident";
+        case LLAMA_NGRAM_LOAD_MODE_READ:
+            return "read";
+        default:
+            GGML_ABORT("invalid n-gram load mode");
+    }
+}
+
 static std::string pair_str(const std::pair<int, int> & p) {
     static char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d", p.first, p.second);
@@ -321,6 +332,7 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
 
 struct cmd_params {
     std::vector<std::string>         model;
+    std::string                      model_ngram;
     std::vector<std::string>         hf_repo;
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
@@ -341,6 +353,7 @@ struct cmd_params {
     std::vector<int>                 n_cpu_moe;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
+    std::vector<llama_ngram_load_mode> ngram_load_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -365,6 +378,7 @@ struct cmd_params {
 
 static const cmd_params cmd_params_defaults = {
     /* model                */ { "models/7B/ggml-model-q4_0.gguf" },
+    /* model_ngram          */ "",
     /* hf_repo              */ {},
     /* hf_file              */ {},
     /* hf_token             */ "",
@@ -385,6 +399,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
+    /* ngram_load_mode      */ { LLAMA_NGRAM_LOAD_MODE_READ },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -430,6 +445,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                            (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
+    printf("  --model-ngram <filename>                          separate Qwen4 n-gram table GGUF (default: unused)\n");
     printf("  -hf, -hfr, --hf-repo <user>/<model>[:quant]       Hugging Face model repository; quant is optional, case-insensitive\n");
     printf("                                                    default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n");
     printf("                                                    example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n");
@@ -459,7 +475,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
-    printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  -lm, --load-mode <auto|none|mmap|mmap-no-prefetch|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  --ngram-load-mode <resident|read>                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.ngram_load_mode, ngram_load_mode_str), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -543,6 +560,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
                 params.model.insert(params.model.end(), p.begin(), p.end());
+            } else if (arg == "--model-ngram") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.model_ngram = argv[i];
             } else if (arg == "-hf" || arg == "-hfr" || arg == "--hf-repo") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -770,6 +793,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_LOAD_MODE_NONE;
                     } else if (m == "mmap") {
                         mode = LLAMA_LOAD_MODE_MMAP;
+                    } else if (m == "mmap-no-prefetch") {
+                        mode = LLAMA_LOAD_MODE_MMAP_NO_PREFETCH;
                     } else if (m == "mlock") {
                         mode = LLAMA_LOAD_MODE_MLOCK;
                     } else if (m == "mmap+mlock") {
@@ -786,6 +811,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--ngram-load-mode") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<llama_ngram_load_mode> modes;
+                for (const auto & m : p) {
+                    if (m == "resident") {
+                        modes.push_back(LLAMA_NGRAM_LOAD_MODE_RESIDENT);
+                    } else if (m == "read") {
+                        modes.push_back(LLAMA_NGRAM_LOAD_MODE_READ);
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.ngram_load_mode.insert(params.ngram_load_mode.end(), modes.begin(), modes.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1137,6 +1183,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.load_mode.empty()) {
         params.load_mode = cmd_params_defaults.load_mode;
     }
+    if (params.ngram_load_mode.empty()) {
+        params.ngram_load_mode = cmd_params_defaults.ngram_load_mode;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1188,6 +1237,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
 struct cmd_params_instance {
     std::string        model;
+    std::string        model_ngram;
     int                n_prompt;
     int                n_gen;
     int                n_depth;
@@ -1203,6 +1253,7 @@ struct cmd_params_instance {
     int                n_cpu_moe;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
+    llama_ngram_load_mode ngram_load_mode;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1224,6 +1275,8 @@ struct cmd_params_instance {
         }
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
+        mparams.path_ngram    = model_ngram.empty() ? nullptr : model_ngram.c_str();
+        mparams.ngram_load_mode = ngram_load_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1268,10 +1321,10 @@ struct cmd_params_instance {
     }
 
     bool equal_mparams(const cmd_params_instance & other) const {
-        return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+        return model == other.model && model_ngram == other.model_ngram && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
+               load_mode == other.load_mode && ngram_load_mode == other.ngram_load_mode && devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1305,6 +1358,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
+    for (const auto & ngm : params.ngram_load_mode)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1329,6 +1383,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .model_ngram           = */ params.model_ngram,
                 /* .n_prompt              = */ n_prompt,
                 /* .n_gen                 = */ 0,
                 /* .n_depth               = */ nd,
@@ -1344,6 +1399,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .ngram_load_mode       = */ ngm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1365,6 +1421,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .model_ngram           = */ params.model_ngram,
                 /* .n_prompt              = */ 0,
                 /* .n_gen                 = */ n_gen,
                 /* .n_depth               = */ nd,
@@ -1380,6 +1437,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .ngram_load_mode       = */ ngm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1401,6 +1459,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .model_ngram           = */ params.model_ngram,
                 /* .n_prompt              = */ n_pg.first,
                 /* .n_gen                 = */ n_pg.second,
                 /* .n_depth               = */ nd,
@@ -1416,6 +1475,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .ngram_load_mode       = */ ngm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1442,6 +1502,7 @@ struct test {
     const std::string        cpu_info;
     const std::string        gpu_info;
     std::string              model_filename;
+    std::string              model_ngram;
     std::string              model_type;
     uint64_t                 model_size;
     uint64_t                 model_n_params;
@@ -1457,6 +1518,7 @@ struct test {
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
+    llama_ngram_load_mode    ngram_load_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1479,6 +1541,7 @@ struct test {
         gpu_info(get_gpu_info()) {
 
         model_filename = inst.model;
+        model_ngram    = inst.model_ngram;
         char buf[128];
         llama_model_desc(lmodel, buf, sizeof(buf));
         model_type     = buf;
@@ -1496,6 +1559,7 @@ struct test {
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
+        ngram_load_mode = inst.ngram_load_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1559,11 +1623,11 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
-            "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+            "model_filename", "model_ngram",    "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "load_mode",     "embeddings",
+            "tensor_buft_overrides",            "load_mode",     "ngram_load_mode", "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1637,6 +1701,7 @@ struct test {
                                             gpu_info,
                                             get_backend(),
                                             model_filename,
+                                            model_ngram,
                                             model_type,
                                             std::to_string(model_size),
                                             std::to_string(model_n_params),
@@ -1658,6 +1723,7 @@ struct test {
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
+                                            ngram_load_mode_str(ngram_load_mode),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -1839,6 +1905,9 @@ struct markdown_printer : public printer {
         if (field == "load_mode") {
             return 10;
         }
+        if (field == "ngram_load_mode") {
+            return 8;
+        }
         if (field == "flash_attn") {
             return 3;
         }
@@ -1881,6 +1950,9 @@ struct markdown_printer : public printer {
         }
         if (field == "load_mode") {
             return "lm";
+        }
+        if (field == "ngram_load_mode") {
+            return "ngram";
         }
         if (field == "embeddings") {
             return "embd";
@@ -1971,6 +2043,9 @@ struct markdown_printer : public printer {
         }
         if (params.load_mode.size() > 1 || params.load_mode != cmd_params_defaults.load_mode) {
             fields.emplace_back("load_mode");
+        }
+        if (!params.model_ngram.empty()) {
+            fields.emplace_back("ngram_load_mode");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");

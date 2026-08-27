@@ -2686,6 +2686,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- auto: mmap, unless a device does not support it\n"
         "- none: no special loading mode\n"
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
+        "- mmap-no-prefetch: memory-map model without prefetching mapped data\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
         "- dio: use DirectIO if available\n",
@@ -2693,12 +2694,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
             else if (value == "mmap")       { params.load_mode = LLAMA_LOAD_MODE_MMAP;       }
+            else if (value == "mmap-no-prefetch") { params.load_mode = LLAMA_LOAD_MODE_MMAP_NO_PREFETCH; }
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
+        {"--model-ngram"}, "FNAME",
+        "separate Qwen4 n-gram embedding table GGUF",
+        [](common_params & params, const std::string & value) {
+            params.path_ngram = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_NGRAM"));
+    add_opt(common_arg(
+        {"--ngram-load-mode"}, "MODE",
+        "n-gram table loading mode (default: read)\n"
+        "- resident: load the complete table into RAM\n"
+        "- read: read selected rows from the file on demand\n",
+        [](common_params & params, const std::string & value) {
+            if (value == "resident") {
+                params.ngram_load_mode = LLAMA_NGRAM_LOAD_MODE_RESIDENT;
+            } else if (value == "read") {
+                params.ngram_load_mode = LLAMA_NGRAM_LOAD_MODE_READ;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_NGRAM_LOAD_MODE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"

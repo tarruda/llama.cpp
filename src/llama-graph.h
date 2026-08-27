@@ -32,6 +32,7 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 class llama_memory_qwen4_context;
+class llama_ngram_data;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -753,12 +754,14 @@ public:
             std::unique_ptr<llm_graph_input_attn_kv_msa> inp_attn,
             std::unique_ptr<llm_graph_input_rs> inp_gdn,
             std::unique_ptr<llm_graph_input_rs> inp_ple,
-            const llama_memory_qwen4_context * mctx) :
+            const llama_memory_qwen4_context * mctx,
+            const llama_ngram_data * ngram_data) :
         inp_attn(std::move(inp_attn)),
         inp_gdn(std::move(inp_gdn)),
         inp_ple(std::move(inp_ple)),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        ngram_data(ngram_data) {
     }
     ~llm_graph_input_mem_qwen4() = default;
 
@@ -769,15 +772,18 @@ public:
     llm_graph_input_rs * get_gdn() const { return inp_gdn.get(); }
     llm_graph_input_rs * get_ple() const { return inp_ple.get(); }
     ggml_tensor * get_ple_ids() const { return ple_ids; }
+    ggml_tensor * get_ple_embd() const { return ple_embd; }
 
     std::unique_ptr<llm_graph_input_attn_kv_msa> inp_attn;
     std::unique_ptr<llm_graph_input_rs> inp_gdn;
     std::unique_ptr<llm_graph_input_rs> inp_ple;
 
     ggml_tensor * ple_ids = nullptr;
+    ggml_tensor * ple_embd = nullptr;
 
     const llama_cparams cparams;
     const llama_memory_qwen4_context * mctx;
+    const llama_ngram_data * ngram_data;
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {
@@ -1387,7 +1393,7 @@ struct llm_graph_context {
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 
-    llm_graph_input_mem_qwen4 * build_inp_mem_qwen4(bool with_recurrent = true) const;
+    llm_graph_input_mem_qwen4 * build_inp_mem_qwen4(bool with_recurrent = true, const llama_ngram_data * ngram_data = nullptr) const;
 
     //
     // pooling

@@ -18,6 +18,14 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+class llama_ngram_data {
+public:
+    virtual ~llama_ngram_data() = default;
+
+    virtual void set_input(ggml_tensor * dst, const int32_t * ids, size_t n_ids) const = 0;
+    virtual size_t memory_size() const = 0;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -662,6 +670,7 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+    std::unique_ptr<llama_ngram_data> ngram_data;
 
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;

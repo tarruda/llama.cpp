@@ -60,6 +60,7 @@ Options:
 * `--output-tensor-type` use a specific quant type for the output.weight tensor
 * `--token-embedding-type` use a specific quant type for the token embeddings tensor
 * `--keep-split` generate the quantized model in the same shards as the input file instead of a single quantized file
+* `--no-ngram` exclude the Qwen4 n-gram embedding table from the output
 
 Advanced options:
 * `--tensor-type` quantize specific tensor(s) to specific quant types. Supports regex syntax. May be specified multiple times.

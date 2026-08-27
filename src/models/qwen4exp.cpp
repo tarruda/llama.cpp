@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 static ggml_tensor * qwen4_hc_mean(ggml_context * ctx, ggml_tensor * input) {
     const int64_t n_hc = input->ne[1];
@@ -23,6 +26,203 @@ static ggml_tensor * qwen4_l2_norm(ggml_context * ctx, ggml_tensor * input) {
     const float n = input->ne[0];
     return ggml_scale(ctx, ggml_rms_norm(ctx, input, 1e-6f / n), 1.0f / std::sqrt(n));
 }
+
+class llama_qwen4_ngram_data final : public llama_ngram_data {
+public:
+    llama_qwen4_ngram_data(
+            const char * path,
+            llama_ngram_load_mode mode,
+            const llama_hparams & hparams,
+            bool no_alloc) : mode(mode) {
+        if (!path || path[0] == '\0') {
+            throw std::runtime_error("Qwen4 n-gram file path is empty");
+        }
+        if (mode != LLAMA_NGRAM_LOAD_MODE_RESIDENT && mode != LLAMA_NGRAM_LOAD_MODE_READ) {
+            throw std::runtime_error("invalid Qwen4 n-gram load mode");
+        }
+
+        loader = std::make_unique<llama_model_loader>(
+                nullptr, nullptr, nullptr, path, splits, nullptr,
+                LLAMA_LOAD_MODE_NONE, true, true, false, nullptr, nullptr);
+
+        if (loader->get_arch() != LLM_ARCH_QWEN4EXP) {
+            throw std::runtime_error(format("Qwen4 n-gram file has architecture %s", loader->get_arch_name().c_str()));
+        }
+        if (loader->n_tensors != 1 || loader->files.size() != 1) {
+            throw std::runtime_error(format("Qwen4 n-gram file must contain one tensor in one GGUF, found %d tensors in %zu files", loader->n_tensors, loader->files.size()));
+        }
+
+        const std::string tensor_name = LLM_TN(LLM_ARCH_QWEN4EXP)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        weight = loader->get_weight(tensor_name.c_str());
+        if (!weight) {
+            throw std::runtime_error(format("Qwen4 n-gram file does not contain tensor '%s'", tensor_name.c_str()));
+        }
+
+        tensor = weight->tensor;
+        const size_t n_heads = size_t(hparams.qwen4_ple_ngram - 1) * hparams.qwen4_ple_heads;
+        if (n_heads > hparams.qwen4_ple_vocab_sizes.size()) {
+            throw std::runtime_error("invalid Qwen4 n-gram head count");
+        }
+        int64_t n_rows_valid = 0;
+        for (size_t i = 0; i < n_heads; ++i) {
+            const int64_t n_rows_head = hparams.qwen4_ple_vocab_sizes[i];
+            if (n_rows_head <= 0 || n_rows_head > std::numeric_limits<int64_t>::max() - n_rows_valid) {
+                throw std::runtime_error("invalid Qwen4 n-gram row count");
+            }
+            n_rows_valid += n_rows_head;
+        }
+        const int64_t remainder = n_rows_valid % hparams.qwen4_ple_vocab_div;
+        const int64_t padding = remainder == 0 ? 0 : hparams.qwen4_ple_vocab_div - remainder;
+        if (padding > std::numeric_limits<int64_t>::max() - n_rows_valid) {
+            throw std::runtime_error("Qwen4 n-gram table is too large");
+        }
+        const int64_t n_rows_padded = n_rows_valid + padding;
+        if (tensor->ne[0] != hparams.n_embd_per_layer ||
+                (tensor->ne[1] != n_rows_valid && tensor->ne[1] != n_rows_padded) ||
+                tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            throw std::runtime_error(format("invalid Qwen4 n-gram tensor shape: %s", llama_format_tensor_shape(tensor).c_str()));
+        }
+        if (!ggml_is_contiguous(tensor)) {
+            throw std::runtime_error("Qwen4 n-gram tensor must be contiguous");
+        }
+
+        row_width = tensor->ne[0];
+        n_rows = tensor->ne[1];
+        row_size = ggml_row_size(tensor->type, row_width);
+        table_size = ggml_nbytes(tensor);
+        if (row_size == 0 || n_rows <= 0 || uint64_t(n_rows) > std::numeric_limits<size_t>::max() / row_size ||
+                table_size != size_t(n_rows) * row_size) {
+            throw std::runtime_error("invalid Qwen4 n-gram tensor size");
+        }
+        const auto * traits = ggml_get_type_traits(tensor->type);
+        if (!traits || (tensor->type != GGML_TYPE_F32 && !traits->to_float)) {
+            throw std::runtime_error(format("unsupported Qwen4 n-gram tensor type %s", ggml_type_name(tensor->type)));
+        }
+
+        validate_metadata(hparams);
+
+        if (mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT && !no_alloc) {
+            resident.resize(table_size);
+            loader->files[weight->idx]->seek(weight->offs, SEEK_SET);
+            loader->files[weight->idx]->read_raw(resident.data(), resident.size());
+        }
+
+        LLAMA_LOG_INFO("%s: Qwen4 n-gram table = %s, %.2f GiB, mode = %s\n",
+                __func__, ggml_type_name(tensor->type), table_size / 1024.0 / 1024.0 / 1024.0,
+                mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT ? "resident" : "read");
+    }
+
+    void set_input(ggml_tensor * dst, const int32_t * ids, size_t n_ids) const override {
+        const size_t row_width_size = size_t(row_width);
+        if (dst->type != GGML_TYPE_F32 || n_ids > size_t(std::numeric_limits<int64_t>::max()) / row_width_size ||
+                n_ids > std::numeric_limits<size_t>::max() / row_width_size) {
+            throw std::runtime_error("invalid Qwen4 n-gram graph input");
+        }
+        const size_t n_elements = n_ids * row_width_size;
+        if (n_elements > std::numeric_limits<size_t>::max() / sizeof(float) ||
+                ggml_nelements(dst) != int64_t(n_elements)) {
+            throw std::runtime_error("invalid Qwen4 n-gram graph input");
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        staging.resize(n_elements);
+        if (resident.empty()) {
+            row.resize(row_size);
+        }
+
+        const auto * traits = ggml_get_type_traits(tensor->type);
+        for (size_t i = 0; i < n_ids; ++i) {
+            if (ids[i] < 0 || int64_t(ids[i]) >= n_rows) {
+                throw std::runtime_error(format("Qwen4 n-gram row index %d is out of range", ids[i]));
+            }
+            const size_t row_index = size_t(ids[i]);
+            if (row_index > (table_size - row_size) / row_size) {
+                throw std::runtime_error(format("Qwen4 n-gram row index %d exceeds table data", ids[i]));
+            }
+            const size_t row_offset = row_index * row_size;
+
+            const uint8_t * src;
+            if (!resident.empty()) {
+                src = resident.data() + row_offset;
+            } else {
+                loader->files[weight->idx]->seek(weight->offs + row_offset, SEEK_SET);
+                loader->files[weight->idx]->read_raw(row.data(), row.size());
+                src = row.data();
+            }
+
+            float * output = staging.data() + i * row_width_size;
+            if (tensor->type == GGML_TYPE_F32) {
+                std::memcpy(output, src, row_width_size * sizeof(float));
+            } else {
+                traits->to_float(src, output, row_width);
+            }
+        }
+
+        ggml_backend_tensor_set(dst, staging.data(), 0, staging.size() * sizeof(float));
+    }
+
+    size_t memory_size() const override {
+        return mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT ? table_size : 0;
+    }
+
+private:
+    void validate_metadata(const llama_hparams & hparams) const {
+        uint32_t n_embd_per_layer = 0;
+        uint32_t ngram = 0;
+        uint32_t heads = 0;
+        uint32_t vocab_div = 0;
+        uint32_t conv = 0;
+        uint32_t eos = 0;
+        std::vector<int32_t> layers;
+        std::vector<int64_t> multipliers;
+        std::vector<int64_t> offsets;
+        std::vector<int64_t> vocab_sizes;
+
+        loader->get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, n_embd_per_layer);
+        loader->get_key(LLM_KV_PER_LAYER_EMBEDDING_NGRAM_SIZE, ngram);
+        loader->get_key(LLM_KV_PER_LAYER_EMBEDDING_HEADS_PER_NGRAM, heads);
+        loader->get_key(LLM_KV_PER_LAYER_EMBEDDING_VOCAB_SIZE_DIVISOR, vocab_div);
+        loader->get_key(LLM_KV_PER_LAYER_EMBEDDING_CONV_KERNEL, conv);
+        loader->get_key(LLM_KV_PER_LAYER_EMBEDDING_EOS_TOKEN_ID, eos);
+        loader->get_arr(LLM_KV_PER_LAYER_EMBEDDING_LAYERS, layers);
+        loader->get_arr(LLM_KV_PER_LAYER_EMBEDDING_LAYER_MULTIPLIERS, multipliers);
+        loader->get_arr(LLM_KV_PER_LAYER_EMBEDDING_HEAD_OFFSETS, offsets);
+        loader->get_arr(LLM_KV_PER_LAYER_EMBEDDING_HEAD_VOCAB_SIZES, vocab_sizes);
+
+        const size_t n_heads = size_t(hparams.qwen4_ple_ngram - 1) * hparams.qwen4_ple_heads;
+        const bool matches =
+                n_embd_per_layer == hparams.n_embd_per_layer &&
+                ngram == hparams.qwen4_ple_ngram &&
+                heads == hparams.qwen4_ple_heads &&
+                vocab_div == hparams.qwen4_ple_vocab_div &&
+                conv == hparams.qwen4_ple_conv &&
+                eos == hparams.qwen4_ple_eos &&
+                layers == std::vector<int32_t>{hparams.qwen4_ple_layer} &&
+                multipliers.size() == hparams.qwen4_ple_ngram &&
+                offsets.size() == n_heads &&
+                vocab_sizes.size() == n_heads &&
+                std::equal(multipliers.begin(), multipliers.end(), hparams.qwen4_ple_multipliers.begin()) &&
+                std::equal(offsets.begin(), offsets.end(), hparams.qwen4_ple_offsets.begin()) &&
+                std::equal(vocab_sizes.begin(), vocab_sizes.end(), hparams.qwen4_ple_vocab_sizes.begin());
+        if (!matches) {
+            throw std::runtime_error("Qwen4 n-gram metadata does not match the main model");
+        }
+    }
+
+    const llama_ngram_load_mode mode;
+    std::vector<std::string> splits;
+    std::unique_ptr<llama_model_loader> loader;
+    const llama_model_loader::llama_tensor_weight * weight = nullptr;
+    const ggml_tensor * tensor = nullptr;
+    int64_t row_width = 0;
+    int64_t n_rows = 0;
+    size_t row_size = 0;
+    size_t table_size = 0;
+    std::vector<uint8_t> resident;
+    mutable std::vector<uint8_t> row;
+    mutable std::vector<float> staging;
+    mutable std::mutex mutex;
+};
 
 class llm_graph_input_qwen4_qsa : public llm_graph_input_i {
 public:
@@ -249,7 +449,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             }
             n_rows = tensor->ne[1];
         }
-        per_layer_tok_embd = create_tensor(tensor_name, { hparams.n_embd_per_layer, n_rows }, trunk_flags);
+        if (params.path_ngram) {
+            if (mtp_only) {
+                throw std::runtime_error("Qwen4 MTP-only models cannot use an n-gram sidecar");
+            }
+            ngram_data = std::make_unique<llama_qwen4_ngram_data>(
+                    params.path_ngram, params.ngram_load_mode, hparams, params.no_alloc);
+            per_layer_tok_embd = create_tensor(
+                    tensor_name, { hparams.n_embd_per_layer, n_rows }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        } else {
+            per_layer_tok_embd = create_tensor(tensor_name, { hparams.n_embd_per_layer, n_rows }, trunk_flags);
+        }
+    } else if (params.path_ngram) {
+        throw std::runtime_error("Qwen4 model has no n-gram table metadata");
     }
 
     const int64_t head_k_dim = hparams.ssm_d_state;
@@ -359,7 +571,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     inpL = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
     cb(inpL, "hc_init", -1);
 
-    auto * inp = build_inp_mem_qwen4();
+    auto * inp = build_inp_mem_qwen4(true, model.ngram_data.get());
 
     uint32_t qsa_ratio = 0;
     for (int il = 0; il < n_layer; ++il) {
@@ -381,7 +593,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = inpL;
 
         if (il == hparams.qwen4_ple_layer) {
-            inpL = ggml_add(ctx0, inpL, build_ple(inp->get_ple(), inp->get_ple_ids(), inpL, il));
+            inpL = ggml_add(ctx0, inpL, build_ple(inp->get_ple(), inp->get_ple_ids(), inp->get_ple_embd(), inpL, il));
             cb(inpL, "ple_out", il);
         }
 
@@ -980,6 +1192,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, in
 ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         llm_graph_input_rs * inp,
         ggml_tensor *        ple_ids,
+        ggml_tensor *        ple_embd,
         ggml_tensor *        input,
         int                  il) {
     const auto & layer = model.layers[il];
@@ -987,8 +1200,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_ple_heads = (hparams.qwen4_ple_ngram - 1) * hparams.qwen4_ple_heads;
     const int64_t n_ple_embd = hparams.n_embd_per_layer * n_ple_heads;
 
-    ggml_tensor * embedding = ggml_get_rows(ctx0, model.per_layer_tok_embd, ggml_reshape_1d(ctx0, ple_ids, n_ple_heads * n_tokens));
-    embedding = ggml_reshape_2d(ctx0, embedding, n_ple_embd, n_tokens);
+    ggml_tensor * embedding = ple_embd;
+    if (!embedding) {
+        embedding = ggml_get_rows(ctx0, model.per_layer_tok_embd, ggml_reshape_1d(ctx0, ple_ids, n_ple_heads * n_tokens));
+        embedding = ggml_reshape_2d(ctx0, embedding, n_ple_embd, n_tokens);
+    }
     cb(embedding, "ple_embedding", il);
 
     ggml_tensor * key = build_lora_mm(layer.ple_key, embedding);

@@ -1141,7 +1141,12 @@ void llm_graph_input_mem_qwen4::set_input(const llama_ubatch * ubatch) {
     }
     if (inp_ple) {
         inp_ple->set_input(ubatch);
-        mctx->set_input_ple_ids(ple_ids);
+        if (ngram_data) {
+            const auto & ids = mctx->get_ple_ids();
+            ngram_data->set_input(ple_embd, ids.data(), ids.size());
+        } else {
+            mctx->set_input_ple_ids(ple_ids);
+        }
     }
 }
 
@@ -1180,7 +1185,7 @@ bool llm_graph_input_mem_qwen4::can_reuse(const llm_graph_params & params) {
     }
     if (inp_ple) {
         res &= can_reuse_rs(inp_ple.get(), mctx->get_ple());
-        res &= ple_ids->ne[1] == params.ubatch.n_tokens;
+        res &= (ngram_data ? ple_embd : ple_ids)->ne[1] == params.ubatch.n_tokens;
     }
 
     return res;
@@ -3654,7 +3659,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
 }
 
-llm_graph_input_mem_qwen4 * llm_graph_context::build_inp_mem_qwen4(bool with_recurrent) const {
+llm_graph_input_mem_qwen4 * llm_graph_context::build_inp_mem_qwen4(bool with_recurrent, const llama_ngram_data * ngram_data) const {
     const auto * mctx_cur = static_cast<const llama_memory_qwen4_context *>(mctx);
     const auto * mctx_attn = mctx_cur->get_attn();
     const auto * mctx_base = mctx_attn->get_base();
@@ -3679,13 +3684,19 @@ llm_graph_input_mem_qwen4 * llm_graph_context::build_inp_mem_qwen4(bool with_rec
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_qwen4>(
-            cparams, std::move(inp_attn), std::move(inp_gdn), std::move(inp_ple), mctx_cur);
+            cparams, std::move(inp_attn), std::move(inp_gdn), std::move(inp_ple), mctx_cur, ngram_data);
 
     if (inp->get_ple()) {
         const int64_t n_ple_heads = (hparams.qwen4_ple_ngram - 1) * hparams.qwen4_ple_heads;
-        inp->ple_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_ple_heads, ubatch.n_tokens);
-        ggml_set_input(inp->ple_ids);
-        ggml_set_name(inp->ple_ids, "ple_ids");
+        if (ngram_data) {
+            inp->ple_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_per_layer * n_ple_heads, ubatch.n_tokens);
+            ggml_set_input(inp->ple_embd);
+            ggml_set_name(inp->ple_embd, "ple_embd");
+        } else {
+            inp->ple_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_ple_heads, ubatch.n_tokens);
+            ggml_set_input(inp->ple_ids);
+            ggml_set_name(inp->ple_ids, "ple_ids");
+        }
     }
 
     return (llm_graph_input_mem_qwen4 *) res->add_input(std::move(inp));

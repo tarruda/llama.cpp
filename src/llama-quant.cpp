@@ -982,7 +982,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // make a list of weights
     std::vector<const llama_model_loader::llama_tensor_weight *> tensors;
     tensors.reserve(ml.weights_map.size());
+    if (params->no_ngram && model->arch != LLM_ARCH_QWEN4EXP) {
+        throw std::runtime_error("--no-ngram is only supported for Qwen4 models");
+    }
+    const std::string ngram_tensor_name = params->no_ngram ? LLM_TN(model->arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str() : "";
+    bool skipped_ngram = false;
     for (const auto & it : ml.weights_map) {
+        if (params->no_ngram && it.first == ngram_tensor_name) {
+            LLAMA_LOG_INFO("%s: excluding tensor %s\n", __func__, it.first.c_str());
+            skipped_ngram = true;
+            continue;
+        }
         const std::string remapped_name(remap_layer(it.first, prune_list, mapped, blk_id));
         if (remapped_name.empty()) {
             LLAMA_LOG_DEBUG("%s: pruning tensor %s\n", __func__, it.first.c_str());
@@ -994,6 +1004,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             LLAMA_LOG_DEBUG("%s: tensor %s remapped to %s\n", __func__, it.first.c_str(), ggml_get_name(it.second.tensor));
         }
         tensors.push_back(&it.second);
+    }
+    if (params->no_ngram && !skipped_ngram) {
+        throw std::runtime_error(format("--no-ngram requested but tensor '%s' was not found", ngram_tensor_name.c_str()));
     }
     if (!prune_list.empty()) {
         gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_BLOCK_COUNT).c_str(), blk_id);
@@ -1085,6 +1098,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
+    uint64_t total_elements = 0;
+    for (const auto * weight : tensors) {
+        total_elements += ggml_nelements(weight->tensor);
+    }
+    if (total_elements == 0) {
+        throw std::runtime_error("no tensors to quantize");
+    }
 
     std::vector<std::thread> workers;
     workers.reserve(nthread);
@@ -1154,7 +1174,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
 
         LLAMA_LOG_INFO("[%4d/%4d] %-36s - [%s], type = %6s, ",
-               ++idx, ml.n_tensors,
+               ++idx, (int) tensors.size(),
                ggml_get_name(tensor),
                llama_format_tensor_shape(tensor).c_str(),
                ggml_type_name(tensor->type));
@@ -1289,8 +1309,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         close_ofstream();
     }
 
-    LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
-    LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
+    LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/total_elements);
+    LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/total_elements);
 
     if (!params->imatrix && params->dry_run && will_require_imatrix) {
         LLAMA_LOG_WARN("%s: WARNING: dry run completed successfully, but actually completing this quantization will require an imatrix!\n",
@@ -1300,7 +1320,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     if (qs.n_fallback > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %d of %d tensor(s) required fallback quantization\n",
-                __func__, qs.n_fallback, ml.n_tensors);
+                __func__, qs.n_fallback, (int) tensors.size());
     }
 }
 
@@ -1320,6 +1340,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.dry_run                     =*/ false,
+        /*.no_ngram                    =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,

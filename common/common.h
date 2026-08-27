@@ -474,6 +474,8 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+    std::string path_ngram = ""; // separate Qwen4 n-gram table GGUF
+    enum llama_ngram_load_mode ngram_load_mode = LLAMA_NGRAM_LOAD_MODE_READ;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

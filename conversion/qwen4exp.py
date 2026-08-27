@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable, Iterable
+from math import prod
 from pathlib import Path
+from typing import Any, BinaryIO, cast
 
 import numpy as np
 import torch
@@ -12,24 +14,53 @@ from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 
 
+class _BufferedFileTensor:
+    def __init__(self, path: Path, dtype: np.dtype, shape: tuple[int, ...]):
+        self.path = path
+        self.dtype = np.dtype(dtype)
+        self.shape = shape
+        self.nbytes = prod(shape) * self.dtype.itemsize
+        if self.path.stat().st_size != self.nbytes:
+            raise ValueError(f"Unexpected buffered tensor size in {self.path}")
+
+    def tofile(self, output: BinaryIO) -> None:
+        buffer = bytearray(16 * 1024 * 1024)
+        view = memoryview(buffer)
+        with open(self.path, "rb", buffering=0) as source:
+            while n_read := source.readinto(buffer):
+                offset = 0
+                while offset < n_read:
+                    n_written = output.write(view[offset:n_read])
+                    if not n_written:
+                        raise OSError(f"Could not write buffered tensor from {self.path}")
+                    offset += n_written
+
+    def byteswap(self, inplace: bool = False) -> _BufferedFileTensor:
+        del inplace
+        raise ValueError("Buffered PLE conversion does not support changing endianness")
+
+
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 @ModelBase.example("Qwen/Qwen3.8-Flash-Next")
 class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
+    supports_ngram_export = True
+
+    _ple_marker = ".ple_embedding.ngram_embedding.shard_"
+    _ple_constant_suffixes = (
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_offsets",
+        "ple_embedding.ngram_heads_vocab_sizes",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._ple_constants: dict[str, list[int]] = {}
-        self._ple_table: np.memmap | None = None
+        self._ple_table: _BufferedFileTensor | None = None
         self._ple_temp_path: Path | None = None
 
         if self.hparams.get("ple_layer_ids") and not self.mtp_only:
-            suffixes = (
-                "ple_embedding.layer_multipliers",
-                "ple_embedding.ngram_heads_offsets",
-                "ple_embedding.ngram_heads_vocab_sizes",
-            )
-            for suffix in suffixes:
+            for suffix in self._ple_constant_suffixes:
                 matches = [
                     (name, gen)
                     for name, gen in self.model_tensors.items()
@@ -57,6 +88,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return None
 
         name, gen = item
+        is_ple_shard = cls._ple_marker in name
+        is_ple_constant = name.endswith(cls._ple_constant_suffixes)
+        if cls.ngram_only and not (is_ple_shard or is_ple_constant):
+            return None
+        if cls.no_ngram and is_ple_shard:
+            return None
+
         if name.startswith("model.mtp."):
             name = name.removeprefix("model.")
 
@@ -248,6 +286,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_per_layer_embedding_head_vocab_sizes(head_vocab_sizes)
 
     def _ple_qtype(self) -> gguf.GGMLQuantizationType:
+        if self.ngram_only:
+            if self.ngram_qtype is None:
+                raise ValueError("N-gram-only conversion requires an explicit n-gram type")
+            return self.ngram_qtype
         if self.ftype == gguf.LlamaFileType.ALL_F32:
             return gguf.GGMLQuantizationType.F32
         if self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
@@ -257,15 +299,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return gguf.GGMLQuantizationType.F16
 
     def _prepare_ple_table(self) -> None:
-        if self.mtp_only:
+        if self.mtp_only or self.no_ngram:
             return
 
         shard_items: list[tuple[int, str, Callable[[], Tensor]]] = []
-        marker = ".ple_embedding.ngram_embedding.shard_"
         for name, gen in self.model_tensors.items():
-            if marker not in name:
+            if self._ple_marker not in name:
                 continue
-            index_text = name.split(marker, 1)[1].split(".", 1)[0]
+            index_text = name.split(self._ple_marker, 1)[1].split(".", 1)[0]
             if not index_text.isdecimal():
                 raise ValueError(f"Invalid PLE shard name {name!r}")
             shard_items.append((int(index_text), name, gen))
@@ -327,31 +368,32 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_temp_path = Path(fp.name)
 
         offset = 0
-        table: np.memmap | None = None
-        for _, _, gen in shard_items:
-            tensor = gen()
-            rows = int(tensor.shape[0])
-            source = LazyTorchTensor.to_eager(tensor).to(torch.float32).numpy()
-            encoded = gguf.quants.quantize(source, qtype)
-            if table is None:
-                table = np.memmap(
-                    self._ple_temp_path,
-                    dtype=encoded.dtype,
-                    mode="w+",
-                    shape=(total_rows, int(encoded.shape[1])),
-                )
-            if encoded.ndim != 2 or encoded.shape[1] != table.shape[1]:
-                raise ValueError("PLE shards produced inconsistent encoded row widths")
-            table[offset : offset + rows] = encoded
-            offset += rows
-            del encoded, source, tensor
+        encoded_dtype: np.dtype | None = None
+        encoded_width: int | None = None
+        with open(self._ple_temp_path, "wb", buffering=0) as table_file:
+            for part, (_, _, gen) in enumerate(shard_items, start=1):
+                logger.info(f"Assembling PLE shard {part}/{len(shard_items)} with buffered I/O")
+                tensor = gen()
+                rows = int(tensor.shape[0])
+                source = LazyTorchTensor.to_eager(tensor).to(torch.float32).numpy()
+                encoded = gguf.quants.quantize(source, qtype)
+                if encoded.ndim != 2 or int(encoded.shape[0]) != rows:
+                    raise ValueError("PLE shard produced an invalid encoded shape")
+                if encoded_dtype is None:
+                    encoded_dtype = encoded.dtype
+                    encoded_width = int(encoded.shape[1])
+                elif encoded.dtype != encoded_dtype or int(encoded.shape[1]) != encoded_width:
+                    raise ValueError("PLE shards produced inconsistent encoded row widths")
+                encoded.tofile(table_file)
+                offset += rows
+                del encoded, source, tensor
 
-        if table is None or offset != total_rows:
+        if encoded_dtype is None or encoded_width is None or offset != total_rows:
             raise ValueError("PLE table assembly did not consume every row")
-        table.flush()
+        table = _BufferedFileTensor(self._ple_temp_path, encoded_dtype, (total_rows, encoded_width))
         self._ple_table = table
         table_name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
-        self.gguf_writer.add_tensor(table_name, table, raw_dtype=qtype)
+        self.gguf_writer.add_tensor(table_name, cast(Any, table), raw_dtype=qtype)
         for _, name, _ in shard_items:
             del self.model_tensors[name]
         logger.info(
@@ -394,6 +436,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def prepare_tensors(self):
         self._prepare_ple_table()
         super().prepare_tensors()
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+
+        if self.ngram_only and from_dir:
+            self.fname_out = self.fname_out.with_name(f"ngram-{self.fname_out.name}")
 
     def write(self):
         try:

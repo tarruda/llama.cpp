@@ -1027,6 +1027,10 @@ const llama_memory_recurrent_context * llama_memory_qwen4_context::get_ple() con
     return static_cast<const llama_memory_recurrent_context *>(ctx_ple.get());
 }
 
+const std::vector<int32_t> & llama_memory_qwen4_context::get_ple_ids() const {
+    return ple_ids;
+}
+
 void llama_memory_qwen4_context::set_input_ple_ids(ggml_tensor * dst) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));

@@ -78,6 +78,10 @@ def parse_args() -> argparse.Namespace:
         help="use more RAM by computing all outputs before writing (use in case lazy evaluation is broken)",
     )
     parser.add_argument(
+        "--no-mmap", action="store_true",
+        help="read model files with buffered I/O instead of memory mapping",
+    )
+    parser.add_argument(
         "--model-name", type=str, default=None,
         help="name of the model",
     )
@@ -124,6 +128,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-nextn", "--no-mtp", dest="no_mtp", action="store_true",
         help="Exclude NextN speculative draft tensors from the converted GGUF. Pair with --mtp or --dspark on a second run to publish target and draft as two files.",
+    )
+    parser.add_argument(
+        "--ngram", action="store_true",
+        help="Export only the n-gram embedding table as a separate GGUF. An 'ngram-' prefix will be added to the output file name.",
+    )
+    parser.add_argument(
+        "--no-ngram", action="store_true",
+        help="Exclude the n-gram embedding table from the converted GGUF.",
+    )
+    parser.add_argument(
+        "--ngram-type", choices=["bf16", "q4_0", "q8_0"],
+        help="storage type for an n-gram-only GGUF; required with --ngram",
     )
     parser.add_argument(
         "--dspark", action="store_true",
@@ -262,6 +278,19 @@ def main() -> None:
             logger.error("--mtp, --no-nextn, and --dspark are mutually exclusive")
             sys.exit(1)
 
+        if args.ngram and args.no_ngram:
+            logger.error("--ngram and --no-ngram are mutually exclusive")
+            sys.exit(1)
+        if args.ngram and (args.mtp or args.dspark or args.mmproj):
+            logger.error("--ngram cannot be combined with --mtp, --dspark, or --mmproj")
+            sys.exit(1)
+        if args.ngram and args.ngram_type is None:
+            logger.error("--ngram-type is required with --ngram")
+            sys.exit(1)
+        if not args.ngram and args.ngram_type is not None:
+            logger.error("--ngram-type requires --ngram")
+            sys.exit(1)
+
         if args.dspark:
             if is_mistral_format or model_architecture != "DeepseekV4ForCausalLM":
                 logger.error("--dspark is only supported for DeepseekV4ForCausalLM")
@@ -278,9 +307,24 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
+        if args.ngram or args.no_ngram:
+            if not model_class.supports_ngram_export:
+                logger.error("--ngram / --no-ngram are not supported for %s", model_architecture)
+                sys.exit(1)
+            model_class.ngram_only = args.ngram
+            model_class.no_ngram = args.no_ngram
+            if args.ngram:
+                model_class.no_mtp = True
+                ngram_types = {
+                    "bf16": (gguf.LlamaFileType.MOSTLY_BF16, gguf.GGMLQuantizationType.BF16),
+                    "q4_0": (gguf.LlamaFileType.MOSTLY_Q4_0, gguf.GGMLQuantizationType.Q4_0),
+                    "q8_0": (gguf.LlamaFileType.MOSTLY_Q8_0, gguf.GGMLQuantizationType.Q8_0),
+                }
+                output_type, model_class.ngram_qtype = ngram_types[args.ngram_type]
+
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
-                                     eager=args.no_lazy,
+                                     eager=args.no_lazy, use_mmap=not args.no_mmap,
                                      metadata_override=args.metadata, model_name=args.model_name,
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,

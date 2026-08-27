@@ -16,6 +16,9 @@
 static void test(void) {
     common_params params;
 
+    assert(std::string(llama_load_mode_name(LLAMA_LOAD_MODE_MMAP_NO_PREFETCH)) == "mmap-no-prefetch");
+    assert(llama_load_mode_from_str("mmap-no-prefetch") == LLAMA_LOAD_MODE_MMAP_NO_PREFETCH);
+
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {
         const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
@@ -205,6 +208,10 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
 
+    argv = {"binary_name", "-lm", "mmap-no-prefetch"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_NO_PREFETCH);
+
     argv = {"binary_name", "-lm", "mlock"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
@@ -216,6 +223,18 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    argv = {"binary_name", "--model-ngram", "ngram-q4_0.gguf", "--ngram-load-mode", "read"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.path_ngram == "ngram-q4_0.gguf");
+    assert(params.ngram_load_mode == LLAMA_NGRAM_LOAD_MODE_READ);
+
+    argv = {"binary_name", "--ngram-load-mode", "resident"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.ngram_load_mode == LLAMA_NGRAM_LOAD_MODE_RESIDENT);
+
+    argv = {"binary_name", "--ngram-load-mode", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
@@ -252,6 +271,11 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
 
+    setenv("LLAMA_ARG_LOAD_MODE", "mmap-no-prefetch", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_NO_PREFETCH);
+
     setenv("LLAMA_ARG_LOAD_MODE", "mlock", true);
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -266,6 +290,13 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    setenv("LLAMA_ARG_MODEL_NGRAM", "ngram-q8_0.gguf", true);
+    setenv("LLAMA_ARG_NGRAM_LOAD_MODE", "read", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.path_ngram == "ngram-q8_0.gguf");
+    assert(params.ngram_load_mode == LLAMA_NGRAM_LOAD_MODE_READ);
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

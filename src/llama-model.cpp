@@ -1373,6 +1373,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    if (params.path_ngram && arch != LLM_ARCH_QWEN4EXP) {
+        throw std::runtime_error("--model-ngram is only supported for Qwen4 models");
+    }
+
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
@@ -1663,8 +1667,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    const bool prefetch_mmap = params.load_mode != LLAMA_LOAD_MODE_MMAP_NO_PREFETCH;
+    ml.init_mappings(prefetch_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+
+    const auto * per_layer_tok_embd_weight = params.load_mode == LLAMA_LOAD_MODE_MMAP_NO_PREFETCH && per_layer_tok_embd != nullptr
+        ? ml.get_weight(ggml_get_name(per_layer_tok_embd))
+        : nullptr;
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
@@ -1698,9 +1707,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        bool ctx_has_per_layer_tok_embd = false;
+        if (per_layer_tok_embd_weight != nullptr) {
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
+                if (tensor == per_layer_tok_embd) {
+                    ctx_has_per_layer_tok_embd = true;
+                    break;
+                }
+            }
+        }
+
+        const bool use_mmap_for_ctx = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
+        if (per_layer_tok_embd_weight != nullptr && !ml.no_alloc && ctx_has_per_layer_tok_embd &&
+                (!use_mmap_for_ctx || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            throw std::runtime_error(format("mmap-no-prefetch requires a mapped default CPU buffer for tensor '%s' (selected %s)",
+                    ggml_get_name(per_layer_tok_embd), ggml_backend_buft_name(buft)));
+        }
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (use_mmap_for_ctx) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1712,6 +1737,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ml.get_mapping_range(&first, &last, &addr, idx, ctx);
                 if (first >= last) {
                     continue;
+                }
+                if (per_layer_tok_embd_weight != nullptr &&
+                        ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                        per_layer_tok_embd_weight->idx == idx) {
+                    const size_t per_layer_tok_embd_first = per_layer_tok_embd_weight->offs;
+                    const size_t per_layer_tok_embd_last  = per_layer_tok_embd_first + ggml_nbytes(per_layer_tok_embd);
+                    if (first < per_layer_tok_embd_last && per_layer_tok_embd_first < last) {
+                        throw std::runtime_error(format("mmap-no-prefetch cannot keep tensor '%s' demand-paged because the %s mapping spans its data",
+                                ggml_get_name(per_layer_tok_embd), ggml_backend_buft_name(buft)));
+                    }
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
@@ -1864,6 +1899,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
                 ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
             }
         }
+    }
+    if (ngram_data && ngram_data->memory_size() > 0) {
+        ret[ggml_backend_cpu_buffer_type()] += ngram_data->memory_size();
     }
     return ret;
 }
@@ -2650,6 +2688,8 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
+        /*.path_ngram                  =*/ nullptr,
+        /*.ngram_load_mode             =*/ LLAMA_NGRAM_LOAD_MODE_READ,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
