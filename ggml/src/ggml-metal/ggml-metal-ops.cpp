@@ -358,6 +358,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_qwen4exp_hc_combine(ctx, idx);
             } break;
+        case GGML_OP_QSA_BLOCK_SCORE:
+            {
+                n_fuse = ggml_metal_op_qsa_block_score(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1673,6 +1677,54 @@ int ggml_metal_op_qwen4exp_hc_combine(ggml_metal_op_t ctx, int idx) {
     const int nsg = std::min(4, n_tiles);
     ggml_metal_encoder_dispatch_threadgroups(
             enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, 32, nsg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_qsa_block_score(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * q     = op->src[0];
+    const ggml_tensor * k     = op->src[1];
+    const ggml_tensor * cells = op->src[2];
+    const ggml_tensor * mask  = op->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == OP_QSA_BLOCK_SCORE_D);
+    GGML_ASSERT(q->ne[1] == OP_QSA_BLOCK_SCORE_NH);
+
+    ggml_metal_kargs_qsa_block_score args = {
+        /*.n_blocks =*/ (int32_t) cells->ne[0],
+        /*.scale    =*/ ggml_get_op_params_f32(op, 0),
+        /*.nb_q1    =*/ q->nb[1],
+        /*.nb_q2    =*/ q->nb[2],
+        /*.nb_q3    =*/ q->nb[3],
+        /*.nb_k1    =*/ k->nb[1],
+        /*.nb_c1    =*/ cells->nb[1],
+        /*.nb_c3    =*/ cells->nb[3],
+        /*.nb_m1    =*/ mask->nb[1],
+        /*.nb_m3    =*/ mask->nb[3],
+        /*.nb_d1    =*/ op->nb[1],
+        /*.nb_d3    =*/ op->nb[3],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_qsa_block_score(ctx->lib);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),     1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),     2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(cells), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask),  4);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),    5);
+
+    const int nsg = OP_QSA_BLOCK_SCORE_NSG;
+    const int nkptg = OP_QSA_BLOCK_SCORE_NKPSG*nsg;
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, (args.n_blocks + nkptg - 1)/nkptg, q->ne[2], q->ne[3], 32, nsg, 1);
 
     return 1;
 }

@@ -662,3 +662,44 @@ kernel void kernel_qwen4exp_hc_combine_f32(
         dst[idx] = fma(xv, weight[ih], residual[idx]);
     }
 }
+
+kernel void kernel_qsa_block_score_f32(
+        constant ggml_metal_kargs_qsa_block_score & args,
+        device const char * q,
+        device const char * k,
+        device const char * cells,
+        device const char * mask,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int iq = tgpig.y;
+    const int is = tgpig.z;
+    device const char * q_row = q + iq*args.nb_q2 + is*args.nb_q3 + tiisg*sizeof(float4);
+    float4 q_reg[OP_QSA_BLOCK_SCORE_NH];
+    FOR_UNROLL (ushort ih = 0; ih < OP_QSA_BLOCK_SCORE_NH; ++ih) {
+        q_reg[ih] = *(device const float4 *) (q_row + ih*args.nb_q1);
+    }
+
+    const int ib0 = (tgpig.x*ntg.y + sgitg)*OP_QSA_BLOCK_SCORE_NKPSG;
+    FOR_UNROLL (ushort ik = 0; ik < OP_QSA_BLOCK_SCORE_NKPSG; ++ik) {
+        const int ib = ib0 + ik;
+        if (ib >= args.n_blocks) {
+            return;
+        }
+
+        const int cell = *(device const int *) (cells + ib*sizeof(int) + iq*args.nb_c1 + is*args.nb_c3);
+        device const float4 * k_row = (device const float4 *) (k + cell*args.nb_k1);
+        const float4 kv = k_row[tiisg];
+        float score = 0.0f;
+        FOR_UNROLL (ushort ih = 0; ih < OP_QSA_BLOCK_SCORE_NH; ++ih) {
+            score += max(simd_sum(dot(q_reg[ih], kv)), 0.0f);
+        }
+
+        if (tiisg == 0) {
+            const float mv = *(device const float *) (mask + ib*sizeof(float) + iq*args.nb_m1 + is*args.nb_m3);
+            *(device float *) (dst + ib*sizeof(float) + iq*args.nb_d1 + is*args.nb_d3) = score*args.scale + mv;
+        }
+    }
+}
