@@ -753,7 +753,7 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
     index_streams.reserve(n_stream);
     index_mask_streams.reserve(n_stream);
     const bool use_fused_block_score = cparams.fused_qsa_block_score;
-    const bool use_indexed_attn = cparams.fused_qsa_attn && cparams.flash_attn && n_tps == 1;
+    const bool use_indexed_attn = cparams.fused_qsa_attn && cparams.flash_attn;
 
     for (int64_t is = 0; is < n_stream; ++is) {
         ggml_tensor * block_cells = ggml_view_3d(
