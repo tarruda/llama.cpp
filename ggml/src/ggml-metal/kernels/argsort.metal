@@ -75,6 +75,52 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+kernel void kernel_top_k_512_10_f32_i32(
+        constant ggml_metal_kargs_argsort & args,
+        device const char    * src0,
+        device       int32_t * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    constexpr ushort n_per_lane = 16;
+    constexpr ushort n_top = 10;
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+    device const float * row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+
+    float values[n_per_lane];
+    bool active[n_per_lane];
+    for (ushort i = 0; i < n_per_lane; ++i) {
+        values[i] = row[tiisg + i*N_SIMDWIDTH];
+        active[i] = true;
+    }
+
+    dst += args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+
+    for (ushort k = 0; k < n_top; ++k) {
+        float lmax = -INFINITY;
+        int32_t larg = -1;
+        for (ushort i = 0; i < n_per_lane; ++i) {
+            const int32_t index = tiisg + i*N_SIMDWIDTH;
+            if (active[i] && (larg < 0 || values[i] > lmax || (values[i] == lmax && index > larg))) {
+                lmax = values[i];
+                larg = index;
+            }
+        }
+
+        const float max_val = simd_max(lmax);
+        const int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+
+        if (tiisg == 0) {
+            dst[k] = arg_val;
+        }
+        if (tiisg == arg_val % N_SIMDWIDTH) {
+            active[arg_val / N_SIMDWIDTH] = false;
+        }
+    }
+}
+
 kernel void kernel_top_k_radix_f32_i32(
         constant ggml_metal_kargs_argsort & args,
         device const char    * src0,
