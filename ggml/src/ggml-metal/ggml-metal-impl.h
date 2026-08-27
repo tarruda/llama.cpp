@@ -988,6 +988,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    uint64_t state_slot_stride;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

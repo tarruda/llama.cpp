@@ -206,6 +206,22 @@ struct node_info {
     }
 };
 
+static bool ggml_metal_is_gdn_cache_cpy(const ggml_tensor * node) {
+    if (node->op != GGML_OP_CPY || node->src[0] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const ggml_tensor * gdn = src->view_src;
+    if (src->op != GGML_OP_VIEW || gdn == nullptr || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return false;
+    }
+
+    const ggml_tensor * v = gdn->src[2];
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3]);
+    return src->view_offs == tail_off;
+}
+
 static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
@@ -315,6 +331,13 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         //
         // note: we can always add empty nodes to the concurrent set as they don't read nor write anything
         if (!node0.is_empty() && !h_check(mrs0, node0)) {
+            if (ggml_metal_is_gdn_cache_cpy(node0.node)) {
+                ggml_mem_ranges_reset(mrs0);
+                h_add(mrs0, node0);
+                res.push_back(i0);
+                continue;
+            }
+
             // this will hold the set of memory ranges from the nodes that haven't been processed yet
             // if a node is not concurrent with this set, we cannot reorder it
             ggml_mem_ranges_reset(mrs1);

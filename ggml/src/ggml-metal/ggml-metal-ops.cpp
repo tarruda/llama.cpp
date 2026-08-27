@@ -11,6 +11,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <cmath>
 
@@ -2253,6 +2254,69 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+struct ggml_metal_gdn_cache_fusion {
+    ggml_tensor * dst;
+    int64_t slot_stride;
+    int n_fuse;
+};
+
+static bool ggml_metal_try_gdn_cache_fusion(
+        ggml_metal_op_t ctx, int idx, ggml_metal_gdn_cache_fusion & fusion) {
+    const ggml_tensor * gdn = ctx->node(idx);
+    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    int j = idx + 1;
+    while (j < ctx->n_nodes()) {
+        const ggml_tensor * node = ctx->node(j);
+        if (node->op != GGML_OP_NONE && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_VIEW &&
+            node->op != GGML_OP_TRANSPOSE && node->op != GGML_OP_PERMUTE &&
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            break;
+        }
+        ++j;
+    }
+
+    if (j == ctx->n_nodes()) {
+        return false;
+    }
+
+    const ggml_tensor * cpy = ctx->node(j);
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+    const size_t        tail_off  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    const ggml_tensor * src = cpy->src[0];
+    ggml_tensor * dst = cpy->src[1];
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        !ggml_is_contiguous(src)) {
+        return false;
+    }
+
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    fusion.dst         = dst;
+    fusion.slot_stride = K > 1 ? dst->nb[2] / sizeof(float) : 0;
+    fusion.n_fuse      = j - idx + 1;
+    return true;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2272,6 +2336,25 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     int ida = 0;
+
+    const int64_t state_size = ne20 * ne20 * ne21 * ne23;
+    ggml_metal_buffer_id bid_state = ggml_metal_get_buffer_id(op);
+    bid_state.offs += ggml_row_size(GGML_TYPE_F32, ne20 * ne21 * ne22 * ne23);
+    int64_t state_slot_stride = state_size;
+    int n_fuse = 1;
+
+    if (ctx->use_fusion) {
+        ggml_metal_gdn_cache_fusion fusion;
+        if (ggml_metal_try_gdn_cache_fusion(ctx, idx, fusion)) {
+            bid_state = ggml_metal_get_buffer_id(fusion.dst);
+            state_slot_stride = fusion.slot_stride;
+            n_fuse = fusion.n_fuse;
+
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY\n", __func__);
+            }
+        }
+    }
 
     ggml_metal_kargs_gated_delta_net args = {
         /*.ne00 =*/ ne00,
@@ -2309,6 +2392,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.state_slot_stride =*/ (uint64_t) state_slot_stride,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2320,12 +2404,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_buffer  (enc, bid_state,                            ida++); // state output
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
