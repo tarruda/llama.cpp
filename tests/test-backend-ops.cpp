@@ -10506,6 +10506,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t m : {1, 4}) {
+            for (int64_t n : {9, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 10240, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -10515,6 +10523,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t m : {1, 4}) {
+            for (int64_t n : {32, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 10240, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     for (int64_t n_tokens : {1, 8, 32, 512, 2048}) {
         test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens));

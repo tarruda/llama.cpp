@@ -906,11 +906,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr1 = 1;
                     suffix = "_short";
                 } else {
+                    const bool use_nr4 = ne01 == 4 && ne11 > 8 && ne00 % 4 == 0 && tsrc1 == GGML_TYPE_F32 &&
+                        (tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_BF16);
+                    const bool use_nr1 = ne01 == 1 && ne11 > 8 && ne00 % 4 == 0;
                     nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
+                    if (use_nr4) {
+                        nr0 = 4;
+                    } else if (use_nr1) {
+                        nr0 = 1;
+                    } else {
+                        nr0 = 2;
+                    }
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
-                    suffix = ne00 % 4 == 0 ? "_4" : "";
+                    if (use_nr4) {
+                        suffix = "_4_nr4";
+                    } else if (ne00 % 4 == 0) {
+                        suffix = "_4";
+                    }
                 }
             } break;
         case GGML_TYPE_Q1_0:
