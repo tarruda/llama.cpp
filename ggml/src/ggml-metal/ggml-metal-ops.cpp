@@ -797,6 +797,31 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
+    int n_fuse = 1;
+    ggml_tensor * dst = op;
+    bool fuse_scale_silu = false;
+
+    if (ctx->use_fusion && op->op == GGML_OP_SCALE) {
+        const ggml_op fops[] = { GGML_OP_SCALE, GGML_OP_UNARY };
+        if (ctx->can_fuse(idx, fops, 2)) {
+            ggml_tensor * silu = ctx->node(idx + 1);
+            if (silu->src[0] == op &&
+                ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                silu->type == GGML_TYPE_F32 &&
+                ggml_metal_device_supports_op(ctx->dev, silu)) {
+                n_fuse = 2;
+                dst = silu;
+                fuse_scale_silu = true;
+
+                if (ctx->debug_fusion > 1) {
+                    GGML_LOG_DEBUG("%s: fuse: SCALE + SILU\n", __func__);
+                }
+            }
+        }
+    }
+
     if (ctx->use_fusion && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID) {
         const ggml_op fops[] = { GGML_OP_UNARY, GGML_OP_QWEN4EXP_HC_REDUCE };
         if (ctx->can_fuse_subgraph(idx, fops, 2)) {
@@ -815,13 +840,13 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  dst,        ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  dst,        nb);
 
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
-    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(dst);
 
     ggml_metal_kargs_unary args = {
         /*.ne00  =*/ ne00,
@@ -873,7 +898,13 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         args.val   = ggml_get_op_params_f32(op, 4); // eps
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
+    auto pipeline = fuse_scale_silu ?
+        ggml_metal_library_get_pipeline_unary_scale_silu(lib, op) :
+        ggml_metal_library_get_pipeline_unary(lib, op);
+
+    if (n_fuse > 1 && !ggml_metal_op_concurrency_check(ctx, dst)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     if (pipeline.c4) {
         args.ne00 = ne00/4;
@@ -886,7 +917,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
 
     if (pipeline.cnt) {
-        const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
+        const int n = pipeline.c4 ? ggml_nelements(dst)/4 : ggml_nelements(dst);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
     } else {
@@ -897,7 +928,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, nk0*ne01, ne02, ne03, nth, 1, 1);
     }
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
