@@ -1639,7 +1639,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[4]->type == GGML_TYPE_F16 &&
                 op->type         == GGML_TYPE_F32 &&
                 op->src[0]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
-                op->src[0]->ne[1] == 1 &&
                 op->src[2]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
                 op->src[0]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_HEAD &&
                 op->src[1]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_KV &&

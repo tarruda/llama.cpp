@@ -10246,6 +10246,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 19, 13, 1, 2));
     test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 129, 97, 1, 1, 10.0f));
     test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 129, 97, 1, 1, 10.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 129, 97, 3, 2, 10.0f));
     test_cases.emplace_back(new test_flash_attn_ext_indexed());
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
@@ -10767,6 +10768,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 2304, 10000, 20000, 30000, }) {
         test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, kv, 2051));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 24, 2, 10000, 2051, 512));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

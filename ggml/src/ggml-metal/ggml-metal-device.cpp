@@ -1577,7 +1577,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
@@ -1588,10 +1588,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
     // do bounds checks for the mask?
-    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool indexed_prefill = op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED && op->src[0]->ne[1] > 1;
+    const bool bc_mask = !indexed_prefill && op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext",
+            indexed_prefill ? "flash_attn_ext_indexed" : "flash_attn_ext",
             type,
             dk,
             dv);
