@@ -616,6 +616,7 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    post_scale;
 } ggml_metal_kargs_norm;
 
 typedef struct {

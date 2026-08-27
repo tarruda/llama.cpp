@@ -3546,6 +3546,38 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, scale);
+    }
+
+    test_rms_norm_scale(
+            std::array<int64_t, 4> ne = {128, 16, 1, 1},
+            float eps = 1e-6f / 128.0f,
+            float scale = 1.0f / std::sqrt(128.0f))
+        : ne(ne), eps(eps), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps), scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9368,6 +9400,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm_scale());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
