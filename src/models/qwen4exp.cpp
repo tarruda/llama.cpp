@@ -61,14 +61,16 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
         GGML_ASSERT(hparams.ple_conv_kernel > 0 && hparams.n_embd_per_layer > 0);
 
-        hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
-        hparams.ple_head_dim = hparams.n_embd_per_layer;
         if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
             throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
         }
-        if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
-            throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
+
+        const uint64_t ple_n_heads = (uint64_t) (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+        hparams.ple_head_dim = hparams.n_embd_per_layer;
+        if (ple_n_heads == 0 || ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+            throw std::runtime_error(format("PLE head count %" PRIu64 " is out of range", ple_n_heads));
         }
+        hparams.ple_n_heads = (uint32_t) ple_n_heads;
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
 
@@ -138,8 +140,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        int64_t ple_rows = 0;
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            ple_rows = std::max<int64_t>(ple_rows,
+                    (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+        }
+        if (ple_w) {
+            ple_rows = ple_w->tensor->ne[1];
+        }
 
         // sanity check
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
@@ -201,8 +210,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (hparams.is_ple(il)) {
-            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, 0);
-            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, 0);
+            const int64_t ple_dim = (int64_t) hparams.ple_head_dim * hparams.ple_n_heads;
+            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { ple_dim, hc_dim }, 0);
+            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { ple_dim, n_embd }, 0);
             layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, 0);
             layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, 0);
             layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, 0);

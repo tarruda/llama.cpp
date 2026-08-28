@@ -79,7 +79,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool qwen_ple = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -257,6 +257,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             ratios[il] = 4;
         }
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios);
+
+        if (qwen_ple) {
+            ms.add_kv(LLM_KV_PLE_LAYERS,                std::vector<uint32_t>({0}));
+            ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,             uint32_t(2));
+            ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,        uint32_t(1));
+            ms.add_kv(LLM_KV_PLE_CONV_KERNEL,            uint32_t(2));
+            ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,           uint32_t(1));
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, uint32_t(64));
+            ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,      std::vector<uint64_t>({1, 3}));
+            ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,           std::vector<uint64_t>({0}));
+            ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,       std::vector<uint64_t>({16}));
+        }
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
@@ -747,6 +759,24 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         check_qwen4_qsa_mask, &check);
                 get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
                 GGML_ASSERT(check.ok && check.n_seen > 0);
+
+                gguf_context_ptr gguf_ctx_ple = get_gguf_ctx(arch, moe, true);
+                auto model_and_ctx_ple = get_model_and_ctx(gguf_ctx_ple.get(), nullptr, seed, {});
+                const std::vector<float> logits_ple = get_logits(
+                        model_and_ctx_ple.first.get(), model_and_ctx_ple.second.get(), tokens);
+
+                FILE * file_ple = tmpfile();
+                GGML_ASSERT(file_ple);
+                llama_model_saver saver_ple(model_and_ctx_ple.first.get());
+                saver_ple.add_kv_from_model();
+                saver_ple.add_tensors_from_model();
+                saver_ple.save(file_ple);
+                rewind(file_ple);
+
+                auto model_and_ctx_ple_saved = get_model_and_ctx(nullptr, file_ple, seed, {});
+                const std::vector<float> logits_ple_saved = get_logits(
+                        model_and_ctx_ple_saved.first.get(), model_and_ctx_ple_saved.second.get(), tokens);
+                GGML_ASSERT(logits_ple == logits_ple_saved);
             }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
