@@ -49,6 +49,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
@@ -597,7 +598,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                   llama_context * lctx,
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem) {}
+    mem(mem),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        mem->get_mem_idx()->init_update(lctx, optimize)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
