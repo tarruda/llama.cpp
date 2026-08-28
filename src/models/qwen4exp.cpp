@@ -18,21 +18,29 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
-    GGML_ASSERT(hparams.ssm_d_conv  > 0 && hparams.ssm_d_inner > 0 && hparams.ssm_d_state > 0 &&
-                hparams.ssm_dt_rank > 0 && hparams.ssm_n_group > 0);
+    if (hparams.ssm_d_conv == 0 || hparams.ssm_d_inner == 0 || hparams.ssm_d_state == 0 ||
+            hparams.ssm_dt_rank == 0 || hparams.ssm_n_group == 0 ||
+            hparams.ssm_dt_rank % hparams.ssm_n_group != 0 ||
+            (uint64_t) hparams.ssm_d_state * hparams.ssm_dt_rank != hparams.ssm_d_inner) {
+        throw std::runtime_error("invalid Qwen4-Exp gated delta net dimensions");
+    }
 
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
-    GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
+    if (hparams.n_embd == 0 || hparams.dsv4_hc_mult <= 1 || hparams.hc_low_rank == 0 ||
+            hparams.dsv4_hc_mult > UINT32_MAX/hparams.n_embd) {
+        throw std::runtime_error("invalid Qwen4-Exp hyper-connection dimensions");
+    }
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    GGML_ASSERT(hparams.indexer_n_head > 0
-             && hparams.indexer_head_size > 0
-             && hparams.indexer_top_k > 0);
+    if (hparams.indexer_n_head == 0 || hparams.indexer_head_size == 0 || hparams.indexer_top_k == 0 ||
+            hparams.n_rot_full > hparams.indexer_head_size) {
+        throw std::runtime_error("invalid Qwen4-Exp sparse-attention dimensions");
+    }
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
@@ -44,9 +52,11 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (n_ple > 0) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
-        GGML_ASSERT(n_ple == 1 && "qwen4exp supports only one PLE layer");
+        if (n_ple != 1 || ple_layers.size() != n_ple) {
+            throw std::runtime_error("Qwen4-Exp supports exactly one PLE layer");
+        }
         for (uint32_t il : ple_layers) {
-            if (il >= hparams.n_layer_all) {
+            if (il >= hparams.n_layer()) {
                 throw std::runtime_error(format("PLE layer %u is out of range", il));
             }
             hparams.is_ple_impl.set(il);
@@ -59,7 +69,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         // optional: files written before this key fall back to the EOS token
         ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-        GGML_ASSERT(hparams.ple_conv_kernel > 0 && hparams.n_embd_per_layer > 0);
+        if (hparams.ple_conv_kernel == 0 || hparams.n_embd_per_layer == 0) {
+            throw std::runtime_error("invalid Qwen4-Exp PLE dimensions");
+        }
 
         if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
             throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
@@ -71,6 +83,17 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error(format("PLE head count %" PRIu64 " is out of range", ple_n_heads));
         }
         hparams.ple_n_heads = (uint32_t) ple_n_heads;
+
+        uint32_t n_multipliers = 0;
+        uint32_t n_offsets = 0;
+        uint32_t n_vocab_sizes = 0;
+        ml.get_arr_n(LLM_KV_PLE_LAYER_MULTIPLIERS, n_multipliers);
+        ml.get_arr_n(LLM_KV_PLE_HEAD_OFFSETS,      n_offsets);
+        ml.get_arr_n(LLM_KV_PLE_HEAD_VOCAB_SIZES,  n_vocab_sizes);
+        if (n_multipliers != hparams.ple_ngram_size ||
+                n_offsets != hparams.ple_n_heads || n_vocab_sizes != hparams.ple_n_heads) {
+            throw std::runtime_error("invalid Qwen4-Exp PLE metadata lengths");
+        }
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
 
@@ -95,7 +118,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        GGML_ASSERT(full_attn_interval > 0);
+        if (full_attn_interval == 0) {
+            throw std::runtime_error("invalid Qwen4-Exp full-attention interval");
+        }
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
@@ -109,6 +134,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             }
         } else if (ratio == 0 || hparams.indexer_top_k % ratio != 0) {
             throw std::runtime_error(format("invalid Qwen4-Exp QSA compression ratio %u at layer %u", ratio, il));
+        }
+        if (hparams.is_ple(il) && !hparams.is_recr(il)) {
+            throw std::runtime_error(format("Qwen4-Exp PLE layer %u is not recurrent", il));
         }
     }
 
