@@ -5,6 +5,12 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
+
+static ggml_tensor * qwen4_l2_norm(ggml_context * ctx, ggml_tensor * input, float eps) {
+    const float n = input->ne[0];
+    return ggml_scale(ctx, ggml_rms_norm(ctx, input, eps/n), 1.0f/std::sqrt(n));
+}
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -845,8 +851,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = qwen4_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = qwen4_l2_norm(ctx0, k_conv, eps_norm);
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
