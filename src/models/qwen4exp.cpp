@@ -595,13 +595,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
         block_keys = ggml_mean(ctx0, block_keys);
         block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
-        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, 1, n_blocks*n_tps);
+        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, n_blocks*n_tps, 1);
 
         if (block_keys->type != activation_type) {
             block_keys = ggml_cast(ctx0, block_keys, activation_type);
             block_keys = ggml_cast(ctx0, block_keys, GGML_TYPE_F32);
         }
         block_keys = build_norm(block_keys, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, 1, n_blocks*n_tps);
 
         ggml_tensor * block_pos = ggml_view_3d(ctx0, inp->block_pos, n_blocks, 4, n_tps,
                 inp->block_pos->nb[1], inp->block_pos->nb[2], is*n_tps*inp->block_pos->nb[2]);
