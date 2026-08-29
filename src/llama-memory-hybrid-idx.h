@@ -78,13 +78,15 @@ public:
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
     void set_input_qsa(ggml_tensor * block_cells, ggml_tensor * block_pos,
-                       ggml_tensor * block_mask, ggml_tensor * selected,
+                       ggml_tensor * block_mask, ggml_tensor * tail_cells, ggml_tensor * tail_fallback,
                        const ggml_tensor * kq_mask, const llama_ubatch * ubatch,
-                       uint32_t ratio, uint32_t block_topk) const;
+                       uint32_t n_groups, uint32_t ratio) const;
 
     void commit_qsa_tokens(const llama_ubatch & ubatch);
 
 private:
+    friend class llama_memory_hybrid_idx_context;
+
     struct qsa_token {
         std::array<llama_pos, 4> pos;
     };
@@ -146,11 +148,13 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    uint32_t get_qsa_compact_groups(const llama_ubatch & ubatch) const;
+
     // QSA blocks follow each sequence's token order, not physical cells or scalar positions.
     void set_input_qsa(ggml_tensor * block_cells, ggml_tensor * block_pos,
-                       ggml_tensor * block_mask, ggml_tensor * selected,
+                       ggml_tensor * block_mask, ggml_tensor * tail_cells, ggml_tensor * tail_fallback,
                        const ggml_tensor * kq_mask, const llama_ubatch * ubatch,
-                       uint32_t ratio, uint32_t block_topk) const;
+                       uint32_t n_groups, uint32_t ratio) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

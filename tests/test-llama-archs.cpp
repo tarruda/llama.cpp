@@ -433,10 +433,21 @@ static std::vector<float> get_logits(
 struct qwen4_qsa_mask_check {
     int64_t n_seen = 0;
     int64_t n_tokens_seen = 0;
+    int64_t n_indexer_keys_seen = 0;
+    int64_t n_indexer_key_rows_max = 0;
     bool ok = true;
 };
 
 static bool check_qwen4_qsa_mask(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * check = (qwen4_qsa_mask_check *) user_data;
+    if (strncmp(tensor->name, "indexer_k-", 10) == 0) {
+        if (!ask) {
+            check->n_indexer_keys_seen++;
+            check->n_indexer_key_rows_max = std::max(check->n_indexer_key_rows_max, tensor->ne[2]);
+        }
+        return true;
+    }
+
     if (strncmp(tensor->name, "qsa_mask", 8) != 0) {
         return false;
     }
@@ -444,9 +455,13 @@ static bool check_qwen4_qsa_mask(ggml_tensor * tensor, bool ask, void * user_dat
         return true;
     }
 
-    auto * check = (qwen4_qsa_mask_check *) user_data;
     const int64_t n_kv = tensor->ne[0];
     const int64_t n_tokens = tensor->ne[1];
+    if (check->n_indexer_key_rows_max > n_kv/4) {
+        fprintf(stderr, "Qwen4 QSA materialized %lld block-key rows, expected at most %lld\n",
+                (long long) check->n_indexer_key_rows_max, (long long) (n_kv/4));
+        check->ok = false;
+    }
     std::vector<float> mask(ggml_nelements(tensor));
     if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(tensor, mask.data(), 0, ggml_nbytes(tensor));
@@ -758,7 +773,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
                         check_qwen4_qsa_mask, &check);
                 get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
-                GGML_ASSERT(check.ok && check.n_seen > 0);
+                GGML_ASSERT(check.ok && check.n_seen > 0 && check.n_indexer_keys_seen > 0);
 
                 gguf_context_ptr gguf_ctx_ple = get_gguf_ctx(arch, moe, true);
                 auto model_and_ctx_ple = get_model_and_ctx(gguf_ctx_ple.get(), nullptr, seed, {});

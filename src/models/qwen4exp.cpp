@@ -482,14 +482,16 @@ public:
     llm_graph_input_qsa(
             const llama_memory_hybrid_idx_context * mctx,
             ggml_tensor * kq_mask,
+            uint32_t n_groups,
+            bool allow_compact,
             uint32_t ratio,
             uint32_t block_topk) :
-        mctx(mctx), kq_mask(kq_mask), ratio(ratio), block_topk(block_topk) {}
+        mctx(mctx), kq_mask(kq_mask), n_groups(n_groups), allow_compact(allow_compact), ratio(ratio), block_topk(block_topk) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
-        mctx->set_input_qsa(block_cells, block_pos, block_mask, selected,
-                kq_mask, ubatch, ratio, block_topk);
+        mctx->set_input_qsa(block_cells, block_pos, block_mask, tail_cells, tail_fallback,
+                kq_mask, ubatch, n_groups, ratio);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -502,16 +504,25 @@ public:
 
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_blocks = n_kv/ratio;
+        const uint32_t new_groups = allow_compact ? mctx->get_qsa_compact_groups(params.ubatch) : 0;
 
         bool res = true;
 
         res &= n_kv > (int64_t) block_topk*ratio + ratio - 1;
         res &= block_cells->ne[1] == n_blocks;
-        res &= block_cells->ne[2] == params.ubatch.n_tokens;
-        res &= block_pos->ne[2]   == params.ubatch.n_tokens;
+        res &= block_cells->ne[2] == (new_groups > 0 ? new_groups : params.ubatch.n_tokens);
+        if (new_groups > 0) {
+            res &= block_pos->ne[0] == 4*n_blocks;
+            res &= block_pos->ne[1] == new_groups;
+        } else {
+            res &= block_pos->ne[0] == n_blocks;
+            res &= block_pos->ne[2] == params.ubatch.n_tokens;
+        }
         res &= block_mask->ne[1]  == params.ubatch.n_tokens;
-        res &= selected->ne[0]    == n_kv;
-        res &= selected->ne[1]    == params.ubatch.n_tokens;
+        res &= tail_cells->ne[0]  == std::max<int64_t>(ratio - 1, 1);
+        res &= tail_cells->ne[1]  == params.ubatch.n_tokens;
+        res &= tail_fallback->ne[1] == params.ubatch.n_tokens;
+        res &= new_groups == n_groups;
 
         return res;
     }
@@ -519,10 +530,13 @@ public:
     ggml_tensor * block_cells = nullptr;
     ggml_tensor * block_pos   = nullptr;
     ggml_tensor * block_mask  = nullptr;
-    ggml_tensor * selected    = nullptr;
+    ggml_tensor * tail_cells  = nullptr;
+    ggml_tensor * tail_fallback = nullptr;
 
     const llama_memory_hybrid_idx_context * mctx;
     ggml_tensor * kq_mask;
+    const uint32_t n_groups;
+    const bool allow_compact;
     const uint32_t ratio;
     const uint32_t block_topk;
 };
@@ -548,7 +562,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
 
     const int64_t n_stream = mctx_hyb->get_n_stream();
     GGML_ASSERT(n_tokens % n_stream == 0);
-    const int64_t n_tps = n_tokens/n_stream;
+    const bool allow_compact = cparams.causal_attn && !hparams.use_alibi;
+    const uint32_t n_groups = allow_compact ? mctx_hyb->get_qsa_compact_groups(ubatch) : 0;
+    const int64_t n_layout = n_groups > 0 ? n_groups : n_tokens;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -558,17 +574,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         inp = it->second;
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(
-                mctx_hyb, kq_mask, (uint32_t) r, (uint32_t) block_topk);
+                mctx_hyb, kq_mask, n_groups, allow_compact, (uint32_t) r, (uint32_t) block_topk);
 
-        qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_tokens);
-        qsa->block_pos   = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_blocks, 4, n_tokens);
+        qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_layout);
+        qsa->block_pos   = n_groups > 0 ?
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4*n_blocks, n_layout) :
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_blocks, 4, n_layout);
         qsa->block_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blocks, n_tokens);
-        qsa->selected    = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+        qsa->tail_cells  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, std::max<int64_t>(r - 1, 1), n_tokens);
+        qsa->tail_fallback = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, std::max<int64_t>(r - 1, 1), n_tokens);
 
         ggml_set_input(qsa->block_cells);
         ggml_set_input(qsa->block_pos);
         ggml_set_input(qsa->block_mask);
-        ggml_set_input(qsa->selected);
+        ggml_set_input(qsa->tail_cells);
+        ggml_set_input(qsa->tail_fallback);
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -589,84 +609,120 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
     cb(q, "indexer_q", il);
 
     const ggml_type activation_type = mctx_idx->type_k();
-    std::vector<ggml_tensor *> selected_streams;
-    selected_streams.reserve(n_stream);
+    const bool compact = inp->n_groups > 0;
+    const int64_t n_selection_groups = compact ? inp->n_groups : n_stream;
+    GGML_ASSERT(n_tokens % n_selection_groups == 0);
+    GGML_ASSERT(!compact || n_stream == 1 || n_selection_groups == n_stream);
+    const int64_t n_qpg = n_tokens/n_selection_groups;
+    const int64_t n_block_layout = compact ? 1 : n_qpg;
+    std::vector<ggml_tensor *> selected_groups;
+    selected_groups.reserve(n_selection_groups);
 
-    for (int64_t is = 0; is < n_stream; ++is) {
+    for (int64_t ig = 0; ig < n_selection_groups; ++ig) {
+        const int64_t is = compact && n_stream == 1 ? 0 : ig;
         ggml_tensor * cache = ggml_view_2d(ctx0, k_all, idx_dim, n_kv,
                 k_all->nb[1], is*k_all->nb[2]);
-        ggml_tensor * block_cells = ggml_view_3d(ctx0, inp->block_cells, r, n_blocks, n_tps,
-                inp->block_cells->nb[1], inp->block_cells->nb[2], is*n_tps*inp->block_cells->nb[2]);
+        ggml_tensor * block_cells;
+        ggml_tensor * block_pos;
+        if (compact) {
+            if (n_selection_groups == 1) {
+                block_cells = inp->block_cells;
+                block_pos = inp->block_pos;
+            } else {
+                block_cells = ggml_view_2d(ctx0, inp->block_cells, r, n_blocks,
+                        inp->block_cells->nb[1], ig*inp->block_cells->nb[2]);
+                block_pos = ggml_view_1d(ctx0, inp->block_pos, 4*n_blocks, ig*inp->block_pos->nb[1]);
+            }
+        } else {
+            block_cells = ggml_view_3d(ctx0, inp->block_cells, r, n_blocks, n_qpg,
+                    inp->block_cells->nb[1], inp->block_cells->nb[2], ig*n_qpg*inp->block_cells->nb[2]);
+            block_pos = ggml_view_3d(ctx0, inp->block_pos, n_blocks, 4, n_qpg,
+                    inp->block_pos->nb[1], inp->block_pos->nb[2], ig*n_qpg*inp->block_pos->nb[2]);
+        }
         ggml_tensor * block_keys = ggml_get_rows(ctx0, cache,
-                ggml_reshape_1d(ctx0, block_cells, r*n_blocks*n_tps));
-        block_keys = ggml_reshape_4d(ctx0, block_keys, idx_dim, r, n_blocks, n_tps);
+                ggml_reshape_1d(ctx0, block_cells, r*n_blocks*n_block_layout));
+        block_keys = ggml_reshape_4d(ctx0, block_keys, idx_dim, r, n_blocks, n_block_layout);
         block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
         block_keys = ggml_mean(ctx0, block_keys);
         block_keys = ggml_cont(ctx0, ggml_transpose(ctx0, block_keys));
-        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, n_blocks*n_tps, 1);
+        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, n_blocks*n_block_layout, 1);
 
         if (block_keys->type != activation_type) {
             block_keys = ggml_cast(ctx0, block_keys, activation_type);
             block_keys = ggml_cast(ctx0, block_keys, GGML_TYPE_F32);
         }
         block_keys = build_norm(block_keys, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, 1, n_blocks*n_tps);
+        block_keys = ggml_reshape_3d(ctx0, block_keys, idx_dim, 1, n_blocks*n_block_layout);
 
-        ggml_tensor * block_pos = ggml_view_3d(ctx0, inp->block_pos, n_blocks, 4, n_tps,
-                inp->block_pos->nb[1], inp->block_pos->nb[2], is*n_tps*inp->block_pos->nb[2]);
-        block_keys = ggml_rope_multi(ctx0, block_keys,
-                ggml_reshape_1d(ctx0, block_pos, n_blocks*4*n_tps), nullptr,
+        ggml_tensor * block_pos_flat = compact ? block_pos :
+                ggml_reshape_1d(ctx0, block_pos, n_blocks*4*n_block_layout);
+        block_keys = ggml_rope_multi(ctx0, block_keys, block_pos_flat, nullptr,
                 n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
         cb(block_keys, "indexer_k", il);
 
-        block_keys = ggml_reshape_4d(ctx0, block_keys, idx_dim, n_blocks, 1, n_tps);
-        ggml_tensor * query = ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n_tps,
-                q->nb[1], q->nb[2], is*n_tps*q->nb[2]);
-        query = ggml_reshape_4d(ctx0, query, idx_dim, n_idx_h, 1, n_tps);
+        block_keys = ggml_reshape_4d(ctx0, block_keys, idx_dim, n_blocks, 1, n_block_layout);
+        ggml_tensor * query = ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n_qpg,
+                q->nb[1], q->nb[2], ig*n_qpg*q->nb[2]);
+        query = ggml_reshape_4d(ctx0, query, idx_dim, n_idx_h, compact ? n_qpg : 1, compact ? 1 : n_qpg);
 
         ggml_tensor * scores = ggml_mul_mat(ctx0, block_keys, query);
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
         scores = ggml_relu(ctx0, scores);
         scores = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3)));
-        scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, scores, n_blocks, n_tps),
+        scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, scores, n_blocks, n_qpg),
                 1.0f/sqrtf((float) idx_dim));
 
-        ggml_tensor * block_mask = ggml_view_2d(ctx0, inp->block_mask, n_blocks, n_tps,
-                inp->block_mask->nb[1], is*n_tps*inp->block_mask->nb[1]);
+        ggml_tensor * block_mask = n_selection_groups == 1 ? inp->block_mask :
+                ggml_view_2d(ctx0, inp->block_mask, n_blocks, n_qpg,
+                        inp->block_mask->nb[1], ig*n_qpg*inp->block_mask->nb[1]);
         scores = ggml_add(ctx0, scores, block_mask);
         cb(scores, "indexer_score", il);
 
         ggml_tensor * top_blocks = ggml_top_k(ctx0, scores, block_topk);
-        ggml_tensor * top_cells = ggml_get_rows(ctx0, block_cells, top_blocks);
-        top_cells = ggml_reshape_2d(ctx0, top_cells, r*block_topk, n_tps);
+        ggml_tensor * top_cells;
+        if (compact) {
+            ggml_tensor * top_rows = ggml_reshape_1d(
+                    ctx0, ggml_cont(ctx0, top_blocks), block_topk*n_qpg);
+            top_cells = ggml_get_rows(ctx0, block_cells, top_rows);
+        } else {
+            top_cells = ggml_get_rows(ctx0, block_cells, top_blocks);
+        }
+        top_cells = ggml_reshape_2d(ctx0, top_cells, r*block_topk, n_qpg);
 
-        ggml_tensor * base_selected = ggml_view_2d(ctx0, inp->selected, n_kv, n_tps,
-                inp->selected->nb[1], is*n_tps*inp->selected->nb[1]);
-        base_selected = ggml_reshape_3d(ctx0, base_selected, 1, n_kv, n_tps);
-        ggml_tensor * selected_top = ggml_fill(ctx0, base_selected, 0.0f);
-        ggml_tensor * ones = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, r*block_topk, n_tps);
-        ones = ggml_fill(ctx0, ones, 1.0f);
-        selected_top = ggml_set_rows(ctx0, selected_top, ones, top_cells);
-        ggml_tensor * selected_stream = ggml_clamp(
-                ctx0, ggml_add(ctx0, base_selected, selected_top), 0.0f, 1.0f);
-        selected_streams.push_back(ggml_reshape_2d(ctx0, selected_stream, n_kv, n_tps));
+        ggml_tensor * selected_cells = top_cells;
+        if (r > 1) {
+            ggml_tensor * tail_cells = n_selection_groups == 1 ? inp->tail_cells :
+                    ggml_view_2d(ctx0, inp->tail_cells, r - 1, n_qpg,
+                            inp->tail_cells->nb[1], ig*n_qpg*inp->tail_cells->nb[1]);
+            ggml_tensor * tail_fallback = n_selection_groups == 1 ? inp->tail_fallback :
+                    ggml_view_2d(ctx0, inp->tail_fallback, r - 1, n_qpg,
+                            inp->tail_fallback->nb[1], ig*n_qpg*inp->tail_fallback->nb[1]);
+            ggml_tensor * top_cell = ggml_view_2d(ctx0, top_cells, 1, n_qpg, top_cells->nb[1], 0);
+            top_cell = ggml_cast(ctx0, top_cell, GGML_TYPE_F32);
+            tail_fallback = ggml_mul(ctx0, ggml_repeat(ctx0, top_cell, tail_fallback), tail_fallback);
+            tail_cells = ggml_cast(ctx0, tail_cells, GGML_TYPE_F32);
+            tail_cells = ggml_cast(ctx0, ggml_add(ctx0, tail_cells, tail_fallback), GGML_TYPE_I32);
+            selected_cells = ggml_concat(ctx0, selected_cells, tail_cells, 0);
+        }
+
+        ggml_tensor * selected_all = n_selection_groups == 1 ? kq_mask :
+                ggml_view_2d(ctx0, kq_mask, n_kv, n_qpg,
+                        kq_mask->nb[1], ig*n_qpg*kq_mask->nb[1]);
+        selected_all = ggml_reshape_3d(ctx0, ggml_fill(ctx0, selected_all, -1e30f), 1, n_kv, n_qpg);
+        ggml_tensor * zeros = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, selected_cells->ne[0], n_qpg);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+        selected_all = ggml_set_rows(ctx0, selected_all, zeros, selected_cells);
+        selected_groups.push_back(ggml_reshape_2d(ctx0, selected_all, n_kv, n_qpg));
     }
 
-    ggml_tensor * selected = selected_streams[0];
-    for (int64_t is = 1; is < n_stream; ++is) {
-        selected = ggml_concat(ctx0, selected, selected_streams[is], 1);
+    ggml_tensor * selected = selected_groups[0];
+    for (int64_t ig = 1; ig < n_selection_groups; ++ig) {
+        selected = ggml_concat(ctx0, selected, selected_groups[ig], 1);
     }
-    selected = ggml_scale_bias(ctx0, selected, 1e30f, -1e30f);
-
-    ggml_tensor * base_mask = ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens);
-    if (base_mask->type != GGML_TYPE_F32) {
-        base_mask = ggml_cast(ctx0, base_mask, GGML_TYPE_F32);
-    }
+    ggml_tensor * base_mask = n_selection_groups == 1 ? kq_mask :
+            ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens);
     ggml_tensor * mask = ggml_add(ctx0, base_mask, selected);
-    if (cparams.flash_attn) {
-        mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
-    }
     cb(mask, "qsa_mask", il);
     return mask;
 }

@@ -447,41 +447,54 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor *       block_cells,
         ggml_tensor *       block_pos,
         ggml_tensor *       block_mask,
-        ggml_tensor *       selected,
+        ggml_tensor *       tail_cells,
+        ggml_tensor *       tail_fallback,
         const ggml_tensor * kq_mask,
         const llama_ubatch * ubatch,
-        uint32_t            ratio,
-        uint32_t            block_topk) const {
+        uint32_t            n_groups,
+        uint32_t            ratio) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(block_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_pos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_mask->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(selected->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(tail_fallback->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
 
     const int64_t n_blocks = block_cells->ne[1];
     const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_pos    = block_pos->ne[1];
-    const int64_t n_kv     = selected->ne[0];
+    const int64_t n_pos    = n_groups > 0 ? 4 : block_pos->ne[1];
+    const int64_t n_kv     = kq_mask->ne[0];
+    const int64_t n_tail   = tail_cells->ne[0];
+    const int64_t n_layout = n_groups > 0 ? n_groups : n_tokens;
 
     GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(block_pos->type   == GGML_TYPE_I32);
     GGML_ASSERT(block_mask->type  == GGML_TYPE_F32);
-    GGML_ASSERT(selected->type    == GGML_TYPE_F32);
-    GGML_ASSERT(block_cells->ne[0] == ratio && block_cells->ne[2] == n_tokens);
-    GGML_ASSERT(block_pos->ne[0] == n_blocks && block_pos->ne[2] == n_tokens);
+    GGML_ASSERT(tail_cells->type  == GGML_TYPE_I32);
+    GGML_ASSERT(tail_fallback->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_cells->ne[0] == ratio && block_cells->ne[2] == n_layout);
+    if (n_groups > 0) {
+        GGML_ASSERT(block_pos->ne[0] == n_blocks*n_pos && block_pos->ne[1] == n_layout);
+    } else {
+        GGML_ASSERT(block_pos->ne[0] == n_blocks && block_pos->ne[2] == n_layout);
+    }
     GGML_ASSERT(block_mask->ne[0] == n_blocks && block_mask->ne[1] == n_tokens);
-    GGML_ASSERT(selected->ne[1] == n_tokens);
+    GGML_ASSERT(n_tail == std::max<int64_t>(ratio - 1, 1) && tail_cells->ne[1] == n_tokens);
+    GGML_ASSERT(tail_fallback->ne[0] == n_tail && tail_fallback->ne[1] == n_tokens);
     GGML_ASSERT(kq_mask->ne[0] == n_kv);
+    GGML_ASSERT(n_groups == 0 || n_tokens % n_groups == 0);
 
-    int32_t * cell_data     = (int32_t *) block_cells->data;
-    int32_t * pos_data      = (int32_t *) block_pos->data;
-    float *   mask_data     = (float *) block_mask->data;
-    float *   selected_data = (float *) selected->data;
+    int32_t * cell_data = (int32_t *) block_cells->data;
+    int32_t * pos_data  = (int32_t *) block_pos->data;
+    float *   mask_data = (float *) block_mask->data;
+    int32_t * tail_data = (int32_t *) tail_cells->data;
+    float *   tail_fallback_data = (float *) tail_fallback->data;
 
     std::fill(cell_data, cell_data + ggml_nelements(block_cells), 0);
     std::fill(pos_data, pos_data + ggml_nelements(block_pos), 0);
     std::fill(mask_data, mask_data + ggml_nelements(block_mask), -INFINITY);
-    std::fill(selected_data, selected_data + ggml_nelements(selected), 0.0f);
+    std::fill(tail_data, tail_data + ggml_nelements(tail_cells), 0);
+    std::fill(tail_fallback_data, tail_fallback_data + ggml_nelements(tail_fallback), 1.0f);
 
     auto mask_visible = [&](int64_t query, uint32_t cell) {
         const int64_t index = query*n_kv + cell;
@@ -491,11 +504,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
         return std::isfinite(((const float *) kq_mask->data)[index]);
     };
 
-    for (int64_t iq = 0; iq < n_tokens; ++iq) {
-        const llama_seq_id seq_id = ubatch->seq_id[iq][0];
+    using mapped_token = std::pair<const qsa_token *, uint32_t>;
+    auto map_sequence = [&](llama_seq_id seq_id, std::vector<mapped_token> & mapped) {
         const auto found = qsa_histories.find(seq_id);
         if (found == qsa_histories.end()) {
-            continue;
+            return false;
         }
 
         const auto & cells = get_mem_attn()->get_cells(seq_id);
@@ -511,7 +524,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         std::map<pos_key, size_t> next_cell;
-        std::vector<std::pair<const qsa_token *, uint32_t>> visible;
+        mapped.reserve(found->second.size());
         for (const auto & token : found->second) {
             const pos_key key = { token.pos[0], token.pos[1], token.pos[2] };
             auto cells = cells_by_pos.find(key);
@@ -524,9 +537,80 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 continue;
             }
 
-            const uint32_t cell = cells->second[index++];
-            if (mask_visible(iq, cell)) {
-                visible.emplace_back(&token, cell);
+            mapped.emplace_back(&token, cells->second[index++]);
+        }
+
+        return true;
+    };
+
+    if (n_groups > 0) {
+        // Share one logical block table across the queries of each sequence.
+        const int64_t n_qpg = n_tokens/n_groups;
+        for (uint32_t ig = 0; ig < n_groups; ++ig) {
+            const int64_t iq0 = ig*n_qpg;
+            const llama_seq_id seq_id = ubatch->seq_id[iq0][0];
+            std::vector<mapped_token> mapped;
+            GGML_ASSERT(map_sequence(seq_id, mapped) && !mapped.empty());
+
+            const size_t n_complete = mapped.size()/ratio;
+            const size_t n_write = std::min<size_t>(n_complete, n_blocks);
+            std::vector<uint8_t> used_cells(n_kv, 0);
+            for (size_t ib = 0; ib < n_write; ++ib) {
+                for (uint32_t ir = 0; ir < ratio; ++ir) {
+                    const uint32_t cell = mapped[ib*ratio + ir].second;
+                    cell_data[(ig*n_blocks + ib)*ratio + ir] = cell;
+                    used_cells[cell] = 1;
+                }
+                for (int64_t ip = 0; ip < n_pos; ++ip) {
+                    pos_data[(ig*n_pos + ip)*n_blocks + ib] = mapped[ib*ratio].first->pos[ip];
+                }
+            }
+
+            uint32_t fallback_cell = 0;
+            for (size_t ib = n_write; ib < (size_t) n_blocks; ++ib) {
+                for (uint32_t ir = 0; ir < ratio; ++ir) {
+                    while (fallback_cell < used_cells.size() && used_cells[fallback_cell]) {
+                        ++fallback_cell;
+                    }
+                    GGML_ASSERT(fallback_cell < used_cells.size());
+                    cell_data[(ig*n_blocks + ib)*ratio + ir] = fallback_cell;
+                    used_cells[fallback_cell++] = 1;
+                }
+            }
+
+            for (int64_t iq = iq0; iq < iq0 + n_qpg; ++iq) {
+                const size_t n_visible = std::partition_point(mapped.begin(), mapped.end(), [&](const mapped_token & token) {
+                    return mask_visible(iq, token.second);
+                }) - mapped.begin();
+                const size_t n_query_complete = n_visible/ratio;
+                for (size_t ib = 0; ib < std::min<size_t>(n_query_complete, n_blocks); ++ib) {
+                    mask_data[iq*n_blocks + ib] = 0.0f;
+                }
+
+                const size_t tail_start = n_query_complete*ratio;
+                for (size_t iv = tail_start; iv < n_visible; ++iv) {
+                    const size_t it = iq*n_tail + iv - tail_start;
+                    tail_data[it] = mapped[iv].second;
+                    tail_fallback_data[it] = 0.0f;
+                }
+            }
+        }
+
+        return;
+    }
+
+    for (int64_t iq = 0; iq < n_tokens; ++iq) {
+        const llama_seq_id seq_id = ubatch->seq_id[iq][0];
+        std::vector<mapped_token> mapped;
+        if (!map_sequence(seq_id, mapped)) {
+            continue;
+        }
+
+        std::vector<mapped_token> visible;
+        visible.reserve(mapped.size());
+        for (const auto & token : mapped) {
+            if (mask_visible(iq, token.second)) {
+                visible.push_back(token);
             }
         }
 
@@ -557,9 +641,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        const size_t selected_start = n_complete <= block_topk ? 0 : n_complete*ratio;
-        for (size_t iv = selected_start; iv < visible.size(); ++iv) {
-            selected_data[iq*n_kv + visible[iv].second] = 1.0f;
+        const size_t tail_start = n_complete*ratio;
+        for (size_t iv = tail_start; iv < visible.size(); ++iv) {
+            const size_t it = iq*n_tail + iv - tail_start;
+            tail_data[it] = visible[iv].second;
+            tail_fallback_data[it] = 0.0f;
         }
     }
 }
@@ -649,18 +735,79 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_qsa_compact_groups(const llama_ubatch & ubatch) const {
+    // A shared table is exact when every query sees a prefix of one monotonic sequence history.
+    if (!ubatch.equal_seqs() || ubatch.n_seqs == 0 || ubatch.n_seqs != ubatch.n_seqs_unq ||
+            ubatch.n_tokens != ubatch.n_seq_tokens*ubatch.n_seqs) {
+        return 0;
+    }
+
+    const uint32_t n_stream = get_n_stream();
+    if (n_stream > 1 && ubatch.n_seqs != n_stream) {
+        return 0;
+    }
+
+    std::vector<llama_seq_id> group_seqs;
+    group_seqs.reserve(ubatch.n_seqs);
+    std::map<llama_seq_id, bool> seen;
+    for (uint32_t ig = 0; ig < ubatch.n_seqs; ++ig) {
+        const uint32_t first = ig*ubatch.n_seq_tokens;
+        if (ubatch.n_seq_id[first] != 1) {
+            return 0;
+        }
+
+        const llama_seq_id seq_id = ubatch.seq_id[first][0];
+        if (!seen.emplace(seq_id, true).second || (n_stream > 1 && seq_id != ubatch.seq_id_unq[ig])) {
+            return 0;
+        }
+
+        for (uint32_t i = first + 1; i < first + ubatch.n_seq_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
+                return 0;
+            }
+        }
+        group_seqs.push_back(seq_id);
+    }
+
+    if (!has_ubatches) {
+        return ubatch.n_seqs;
+    }
+
+    auto pos_less = [](const llama_memory_hybrid_idx::qsa_token & a,
+                       const llama_memory_hybrid_idx::qsa_token & b) {
+        return std::tie(a.pos[0], a.pos[1], a.pos[2]) < std::tie(b.pos[0], b.pos[1], b.pos[2]);
+    };
+
+    for (llama_seq_id seq_id : group_seqs) {
+        const auto found = mem->qsa_histories.find(seq_id);
+        if (found == mem->qsa_histories.end() || found->second.empty()) {
+            return 0;
+        }
+
+        const auto & history = found->second;
+        for (size_t i = 1; i < history.size(); ++i) {
+            if (pos_less(history[i], history[i - 1])) {
+                return 0;
+            }
+        }
+    }
+
+    return ubatch.n_seqs;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor *       block_cells,
         ggml_tensor *       block_pos,
         ggml_tensor *       block_mask,
-        ggml_tensor *       selected,
+        ggml_tensor *       tail_cells,
+        ggml_tensor *       tail_fallback,
         const ggml_tensor * kq_mask,
         const llama_ubatch * ubatch,
-        uint32_t            ratio,
-        uint32_t            block_topk) const {
+        uint32_t            n_groups,
+        uint32_t            ratio) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
-    mem->set_input_qsa(block_cells, block_pos, block_mask, selected,
-            kq_mask, ubatch, ratio, block_topk);
+    mem->set_input_qsa(block_cells, block_pos, block_mask, tail_cells, tail_fallback,
+            kq_mask, ubatch, n_groups, ratio);
 }
