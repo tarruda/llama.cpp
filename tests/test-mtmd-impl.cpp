@@ -4,6 +4,7 @@
 #include "mtmd-internal.h"
 
 #include <iostream>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -67,6 +68,73 @@ MAKE_TEST(test_image_preprocessor_lfm2) {
             "tiling for " + std::to_string(size.width) + "x" + std::to_string(size.height),
             std::string(expected ? "tiled" : "single"),
             std::string(actual   ? "tiled" : "single"));
+    }
+}
+
+MAKE_TEST(test_image_preprocessor_deepseek4_vision) {
+    clip_hparams hparams;
+    hparams.patch_size = 14;
+    hparams.n_merge = 3;
+    hparams.image_min_pixels = 147456;
+    hparams.image_max_tokens = 384;
+    hparams.image_max_wh_ratio = 8;
+    hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+    hparams.image_pad_color = {127, 127, 127};
+    for (int i = 0; i < 3; i++) {
+        hparams.image_mean[i] = 0.5f;
+        hparams.image_std[i] = 0.5f;
+    }
+
+    struct test_case {
+        const char * name;
+        int width;
+        int height;
+        int expected_width;
+        int expected_height;
+        uint64_t expected_hash;
+    };
+    const std::vector<test_case> cases = {
+        {"square", 384, 384, 392, 392, 15370074496759765159ULL},
+        {"tiny",    16,  16, 392, 392,  4444667534160286557ULL},
+        {"lt8",    700, 100, 1022, 154, 7029455861156325712ULL},
+        {"eq8",    800, 100, 1092, 140, 7176349139487537531ULL},
+        {"gt8",    900, 100, 1092, 140, 16373669385831837058ULL},
+        {"tall",   100, 700, 154, 1022, 3769855483192370884ULL},
+        {"odd",    350, 490, 350, 490, 16201472341062198551ULL},
+        {"even",   490, 350, 490, 350, 15802083030392099821ULL},
+    };
+
+    mtmd_image_preprocessor_deepseek4_vision preprocessor(hparams);
+    for (const auto & tc : cases) {
+        clip_image_u8 image;
+        image.set_size({tc.width, tc.height}, false);
+        std::vector<uint8_t> pixels((size_t) tc.width * tc.height * 3);
+        for (int y = 0; y < tc.height; y++) {
+            for (int x = 0; x < tc.width; x++) {
+                const size_t off = ((size_t) y * tc.width + x) * 3;
+                pixels[off + 0] = (x * 17 + y * 3) % 256;
+                pixels[off + 1] = (x * 5 + y * 11) % 256;
+                pixels[off + 2] = (x * 13 + y * 7) % 256;
+            }
+        }
+        image.cpy_buf(pixels);
+
+        auto output = preprocessor.preprocess(image);
+        t.assert_equal(tc.name + std::string(" entry count"), 1, (int) output.entries.size());
+        const auto & entry = output.entries[0];
+        t.assert_equal(tc.name + std::string(" width"), tc.expected_width, entry.nx());
+        t.assert_equal(tc.name + std::string(" height"), tc.expected_height, entry.ny());
+
+        uint64_t hash = 1469598103934665603ULL;
+        for (float value : entry.get_ro_buf()) {
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            for (int i = 0; i < 4; i++) {
+                hash ^= (bits >> (8 * i)) & 0xff;
+                hash *= 1099511628211ULL;
+            }
+        }
+        t.assert_equal(tc.name + std::string(" pixels"), std::to_string(tc.expected_hash), std::to_string(hash));
     }
 }
 

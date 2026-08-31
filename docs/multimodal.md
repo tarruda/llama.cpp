@@ -32,6 +32,14 @@ llama-server -m gemma-3-4b-it-Q4_K_M.gguf --mmproj mmproj-gemma-3-4b-it-Q4_K_M.g
 llama-server -hf ggml-org/gemma-3-4b-it-GGUF --no-mmproj-offload
 ```
 
+DeepSeek-V4 Flash Vision image blocks must remain in one decoder ubatch. Set both batch limits to at least the largest encoded image block; use 384 to cover every supported image:
+
+```sh
+llama-server -m DeepSeek-V4-Flash-Vision-Exp.gguf \
+    --mmproj mmproj-DeepSeek-V4-Flash-Vision-Exp-BF16.gguf \
+    --batch-size 384 --ubatch-size 384
+```
+
 > [!IMPORTANT]
 >
 > OCR models are trained with specific prompt and input structure, please refer to these discussions for more info:

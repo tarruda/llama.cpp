@@ -1537,6 +1537,7 @@ class TensorNameMap:
             "vision_model.conv1", # Step3-VL
             "model.vision_embedder.patch_dense", # gemma4 unified
             "model.vision_tower.patch_embedder.patch_embedding", # muse-glimmer
+            "vision.patch_embed.proj", # DeepSeek-V4 vision
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_NORM: (
@@ -1586,6 +1587,7 @@ class TensorNameMap:
             "model.vision.transformer.layers.{bid}.attention.query_key_value", # cogvlm
             "model.vision_model.transformer.layers.{bid}.self_attn.qkv_proj", # Deepseek-OCR CLIP
             "vision_tower.encoder.blocks.{bid}.wqkv", # Kimi-K2.5
+            "vision.blocks.{bid}.attn.wqkv", # DeepSeek-V4 vision
             "vision_model.radio_model.model.blocks.{bid}.attn.qkv", # Nemotron Nano v2 VL
             "vision_model.transformer.resblocks.{bid}.attn.in_proj", # Step3-VL
         ),
@@ -1689,6 +1691,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.input_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm1", # muse-glimmer
+            "vision.blocks.{bid}.norm1", # DeepSeek-V4 vision
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -1716,6 +1719,7 @@ class TensorNameMap:
             "vision_encoder.blocks.{bid}.attn.proj", # dots3note
             "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.attn.proj", # muse-glimmer
+            "vision.blocks.{bid}.attn.wo", # DeepSeek-V4 vision
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_SINKS: (
@@ -1746,6 +1750,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.post_attention_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm2", # muse-glimmer
+            "vision.blocks.{bid}.norm2", # DeepSeek-V4 vision
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -1807,6 +1812,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
             "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.mlp.fc2", # muse-glimmer
+            "vision.blocks.{bid}.mlp.w2", # DeepSeek-V4 vision
         ),
 
 
@@ -1880,6 +1886,7 @@ class TensorNameMap:
             "siglip2.vision_model.post_layernorm",
             "model.qwen2_model.model.model.norm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.ln_post", # muse-glimmer
+            "vision.norm", # DeepSeek-V4 vision
         ),
 
         MODEL_TENSOR.V_MM_POST_NORM: (

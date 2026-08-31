@@ -183,7 +183,7 @@ common_chat_msg_spans common_chat_msg_delimiters::split(const llama_tokens & tok
     return spans;
 }
 
-json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
+json common_chat_msg::to_json_oaicompat(bool concat_typed_text, bool preserve_media_parts) const {
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
     }
@@ -193,7 +193,7 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty()) {
         jmsg["content"] = content;
     } else if (!content_parts.empty()) {
-        if (concat_typed_text || contains_media()) {
+        if (concat_typed_text || (contains_media() && !preserve_media_parts)) {
             std::string text;
             bool last_was_media_marker = false;
             // join parts with newline, do not add newline before or after media markers
@@ -541,7 +541,9 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
 
     json messages = json::array();
     for (const auto & msg : msgs) {
-        messages.push_back(msg.to_json_oaicompat(/* concat_typed_text= */ false));
+        messages.push_back(msg.to_json_oaicompat(
+            /* concat_typed_text= */ false,
+            /* preserve_media_parts= */ c.supports_media_marker));
     }
     return messages_inp_normalizer(c).normalize(messages);
 }

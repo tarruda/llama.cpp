@@ -88,6 +88,7 @@ std::map<std::string, bool> caps::to_map() const {
     return {
         {"supports_string_content", supports_string_content},
         {"supports_typed_content", supports_typed_content},
+        {"supports_media_marker", supports_media_marker},
         {"supports_tools", supports_tools},
         {"supports_tool_calls", supports_tool_calls},
         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
@@ -148,6 +149,33 @@ caps caps_get(jinja::program & prog) {
                 // edge case: string may be accessed for checking, but does not appear in the output
                 result.supports_string_content = false;
             }
+        }
+    );
+
+    JJ_DEBUG("%s\n", ">>> Running capability check: media marker");
+
+    static const std::string media_marker = "MEDIA_MARKER";
+    caps_try_execute(
+        prog,
+        [&]() {
+            return json::array({
+                {
+                    {"role", "user"},
+                    {"content", json::array({
+                        {{"type", "text"}, {"text", "TEXT_MARKER"}},
+                        {{"type", "media_marker"}, {"text", media_marker}},
+                    })},
+                },
+            });
+        },
+        nullptr,
+        nullptr,
+        [&](context &, bool success, value &, value &, const std::string & rendered) {
+            const bool preserves_marker = success && rendered.find(media_marker) != std::string::npos;
+            if (preserves_marker) {
+                result.supports_typed_content = true;
+            }
+            result.supports_media_marker = preserves_marker;
         }
     );
 

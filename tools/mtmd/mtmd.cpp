@@ -283,6 +283,10 @@ struct mtmd_image_tokens {
 };
 using mtmd_image_tokens_ptr = std::unique_ptr<mtmd_image_tokens>;
 
+static size_t mtmd_image_tokens_raw_n_tokens(const mtmd_context * ctx, const mtmd_image_tokens * image_tokens);
+MTMD_API int32_t mtmd_helper_chunk_required_ubatch_internal(
+        const mtmd_context * ctx, const mtmd_input_chunk * chunk, llama_pos n_past);
+
 struct mtmd_audio_tokens {
     uint32_t n_tokens = 0; // number of tokens
     clip_image_f32_batch batch_f32; // preprocessed image patches
@@ -832,6 +836,10 @@ struct mtmd_context {
                     img_end = "<|endofimg|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+                {
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4_vision>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_NEMOTRON_V2_VL:
                 {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
@@ -1264,6 +1272,25 @@ struct mtmd_tokenizer {
             if (add_special && llama_vocab_get_add_eos(vocab)) {
                 // if last chunk is text, we add EOS token to it
                 add_text({llama_vocab_eos(vocab)});
+            }
+        }
+
+        if (ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4_VISION) {
+            size_t n_tokens = 0;
+            for (auto & chunk : cur.entries) {
+                if (chunk.type != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                    n_tokens += mtmd_input_chunk_get_n_tokens(&chunk);
+                    continue;
+                }
+                auto * image_tokens = chunk.tokens_image.get();
+                const size_t raw_tokens = mtmd_image_tokens_raw_n_tokens(ctx, image_tokens);
+                const size_t trim = n_tokens % 4;
+                if (raw_tokens <= trim || raw_tokens - trim > UINT32_MAX) {
+                    throw std::runtime_error("invalid DeepSeek-V4 image token count");
+                }
+                image_tokens->nx = raw_tokens - trim;
+                image_tokens->ny = 1;
+                n_tokens += image_tokens->n_tokens();
             }
         }
 
@@ -1708,6 +1735,34 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     }
 }
 
+static size_t mtmd_image_tokens_raw_n_tokens(const mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
+    if (ctx->proj_type_v() != PROJECTOR_TYPE_DEEPSEEK4_VISION) {
+        return image_tokens->n_tokens();
+    }
+    if (image_tokens->batch_f32.entries.size() != 1) {
+        throw std::runtime_error("DeepSeek-V4 vision requires one image per chunk");
+    }
+    return clip_n_output_tokens(ctx->ctx_v, &image_tokens->batch_f32.entries[0]);
+}
+
+MTMD_API int32_t mtmd_helper_chunk_required_ubatch_internal(
+        const mtmd_context * ctx, const mtmd_input_chunk * chunk, llama_pos n_past) {
+    if (ctx->proj_type_v() != PROJECTOR_TYPE_DEEPSEEK4_VISION ||
+            chunk->type != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        return 0;
+    }
+    if (n_past < 0 || !chunk->tokens_image) {
+        return -1;
+    }
+    const size_t raw_tokens = mtmd_image_tokens_raw_n_tokens(ctx, chunk->tokens_image.get());
+    const size_t final_tokens = chunk->tokens_image->n_tokens();
+    const size_t expected_tokens = raw_tokens - n_past % 4;
+    if (final_tokens != expected_tokens || raw_tokens < final_tokens || raw_tokens - final_tokens > 3) {
+        return -1;
+    }
+    return final_tokens <= INT32_MAX ? (int32_t) final_tokens : -1;
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
@@ -1716,19 +1771,33 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
     }
 
     int n_embd_out = ctx->n_embd_out();
-    auto n_tokens_out = image_tokens->n_tokens();
-    out_embd.resize((size_t)n_embd_out * n_tokens_out);
+    const size_t n_tokens_out = image_tokens->n_tokens();
 
     if (image_tokens->is_placeholder()) {
         LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
         return 1;
     }
 
-    bool ok = clip_image_batch_encode(
-        ctx_clip,
-        ctx->n_threads,
-        &image_tokens->batch_f32,
-        out_embd);
+    if (ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4_VISION) {
+        const size_t raw_tokens = mtmd_image_tokens_raw_n_tokens(ctx, image_tokens);
+        if (raw_tokens < n_tokens_out || raw_tokens - n_tokens_out > 3) {
+            LOG_ERR("%s: invalid DeepSeek-V4 image prefix trim\n", __func__);
+            return 1;
+        }
+        std::vector<float> raw_embd((size_t) n_embd_out * raw_tokens);
+        const bool ok = clip_image_batch_encode(
+            ctx_clip, ctx->n_threads, &image_tokens->batch_f32, raw_embd);
+        if (!ok) {
+            return 1;
+        }
+        const size_t trim = raw_tokens - n_tokens_out;
+        out_embd.assign(raw_embd.begin() + trim * n_embd_out, raw_embd.end());
+        return 0;
+    }
+
+    out_embd.resize((size_t) n_embd_out * n_tokens_out);
+    const bool ok = clip_image_batch_encode(
+        ctx_clip, ctx->n_threads, &image_tokens->batch_f32, out_embd);
 
     return ok ? 0 : 1;
 }

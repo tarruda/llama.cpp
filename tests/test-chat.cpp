@@ -6810,6 +6810,77 @@ static void test_template_generation_prompt() {
     }
 
     {
+        auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4-Flash-Vision-Exp.jinja");
+        const std::string assistant_marker = "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
+        check(tmpls, basic(), assistant_marker + "<think>");
+
+        common_chat_templates_inputs max_inputs;
+        max_inputs.messages = { system_msg, message_user };
+        max_inputs.chat_template_kwargs["reasoning_effort"] = R"("max")";
+        auto max_params = common_chat_templates_apply(tmpls.get(), max_inputs);
+        assert_contains(max_params.prompt, deepseek_v4_flash_0731_reasoning_effort_max);
+
+        const auto caps = common_chat_templates_get_caps(tmpls.get());
+        assert_equals(true, caps.at("supports_typed_content"));
+        assert_equals(true, caps.at("supports_media_marker"));
+
+        common_chat_msg typed_user;
+        typed_user.role = "user";
+        typed_user.content_parts = {
+            {"text", "Before"},
+            {"media_marker", "<__media__>"},
+            {"text", "After"},
+        };
+        common_chat_templates_inputs typed_inputs;
+        typed_inputs.messages = { typed_user };
+        typed_inputs.add_generation_prompt = false;
+        auto typed_params = common_chat_templates_apply(tmpls.get(), typed_inputs);
+        const std::string user_marker = "<\xef\xbd\x9c" "User" "\xef\xbd\x9c>";
+        assert_contains(typed_params.prompt, user_marker + "Before\n\n<__media__>\n\nAfter");
+
+        typed_user.role = "developer";
+        typed_inputs.messages = { typed_user };
+        auto typed_developer_params = common_chat_templates_apply(tmpls.get(), typed_inputs);
+        assert_contains(typed_developer_params.prompt, "Before\n\n<__media__>\n\nAfter");
+        typed_user.role = "user";
+
+        common_chat_msg adjacent_images;
+        adjacent_images.role = "user";
+        adjacent_images.content_parts = {
+            {"media_marker", "<__media_0__>"},
+            {"media_marker", "<__media_1__>"},
+        };
+        typed_inputs.messages = { adjacent_images };
+        auto adjacent_params = common_chat_templates_apply(tmpls.get(), typed_inputs);
+        assert_contains(adjacent_params.prompt, user_marker + "<__media_0__>\n\n<__media_1__>");
+
+        common_chat_msg tool_image;
+        tool_image.role = "tool";
+        tool_image.content_parts = {
+            {"text", "Tool text"},
+            {"media_marker", "<__tool_media__>"},
+            {"text", "Tool tail"},
+        };
+        typed_inputs.messages = { typed_user, tool_image };
+        auto tool_image_params = common_chat_templates_apply(tmpls.get(), typed_inputs);
+        assert_contains(tool_image_params.prompt,
+            "<tool_result>Tool text\n\n<__tool_media__>\n\nTool tail</tool_result>");
+
+        const std::string image_placeholder = "<\xef\xbd\x9c" "deepseek_image" "\xef\xbd\x9c>";
+        common_chat_msg injected;
+        injected.role = "user";
+        injected.content = image_placeholder;
+        typed_inputs.messages = { injected };
+        bool rejected = false;
+        try {
+            common_chat_templates_apply(tmpls.get(), typed_inputs);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+
+    {
         auto tmpls = read_templates("models/templates/openbmb-MiniCPM5-1B.jinja");
         check(tmpls, basic(),                  "<|im_start|>assistant\n<think>\n");
         check(tmpls, continuation_content(),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");

@@ -530,6 +530,7 @@ class DeepseekV4Model(TextModel):
     _skipped_mtp_tensors = 0
     _dsv4_main_layers: int | None = None
     _dsv4_nextn_layers: int = 0
+    _dsv4_hash_layers: int = 0
 
     def __init__(self, *args, **kwargs):
         type(self)._skipped_mtp_tensors = 0
@@ -539,6 +540,22 @@ class DeepseekV4Model(TextModel):
             raw_hparams = json.load(f)
         for key, value in raw_hparams.items():
             self.hparams.setdefault(key, value)
+
+        self._is_vision = self.hparams.get("vision_n_layers", 0) > 0
+        if self._is_vision:
+            self._validate_vision_config(self.hparams)
+            expected_vl_biases = {
+                f"layers.{bid}.ffn.gate.bias_vl"
+                for bid in range(self.hparams["num_hidden_layers"])
+            }
+            actual_vl_biases = {
+                name for name in self.model_tensors
+                if re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", name)
+            }
+            if actual_vl_biases != expected_vl_biases:
+                missing = sorted(expected_vl_biases - actual_vl_biases)
+                extra = sorted(actual_vl_biases - expected_vl_biases)
+                raise ValueError(f"DeepSeek-V4 vision routing bias set is incomplete: missing={missing}, extra={extra}")
 
         # workaround for special rope_parameters (main/compress) in transformers 5.x
         if self.rope_parameters.get("full_attention", self.rope_parameters).get("rope_type") is None:
@@ -563,8 +580,12 @@ class DeepseekV4Model(TextModel):
 
         # add a default chat template; if the model has a built-in template, it will be overridden later
         model_id_hint = self.remote_hf_model_id or self.dir_model.name
-        is_0731 = "0731" in model_id_hint
-        template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else "deepseek-ai-DeepSeek-V4.jinja"
+        if self._is_vision:
+            template_name = "deepseek-ai-DeepSeek-V4-Flash-Vision-Exp.jinja"
+        elif "0731" in model_id_hint:
+            template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja"
+        else:
+            template_name = "deepseek-ai-DeepSeek-V4.jinja"
         template_path = Path(__file__).parent.parent / "models" / "templates" / template_name
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
@@ -573,11 +594,19 @@ class DeepseekV4Model(TextModel):
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         type(self)._dsv4_main_layers = self.hparams["num_hidden_layers"]
         type(self)._dsv4_nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
+        type(self)._dsv4_hash_layers = self.hparams.get("num_hash_layers", 0)
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+        if name.startswith(("vision.", "aligner.")) or name in {
+            "image_start", "image_end", "image_newline", "image_pad",
+        }:
+            return None
+        if (match := re.fullmatch(r"layers\.(\d+)\.ffn\.gate\.bias", name)) is not None:
+            if int(match.group(1)) < cls._dsv4_hash_layers:
+                return None
         if name.startswith("mtp."):
             if not cls.mtp_only:
                 cls._skipped_mtp_tensors += 1
@@ -681,6 +710,8 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
         self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
+        if self._is_vision and not self.mtp_only and self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4:
+            self.gguf_writer.add_model_vision_max_image_tokens(hparams["vision_max_n_token"])
         if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4:
             self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
         if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
@@ -853,6 +884,7 @@ class DeepseekV4Model(TextModel):
             "ffn_norm.weight": (gguf.MODEL_TENSOR.FFN_NORM, ".weight"),
             "ffn.gate.weight": (gguf.MODEL_TENSOR.FFN_GATE_INP, ".weight"),
             "ffn.gate.bias": (gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, ".bias"),
+            "ffn.gate.bias_vl": (gguf.MODEL_TENSOR.FFN_EXP_PROBS_B_VL, ".bias"),
             "ffn.gate.tid2eid": (gguf.MODEL_TENSOR.FFN_GATE_TID2EID, ".weight"),
             "ffn.shared_experts.w1.weight": (gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight"),
             "ffn.shared_experts.w2.weight": (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight"),
@@ -891,12 +923,49 @@ class DeepseekV4Model(TextModel):
             return gguf.GGMLQuantizationType.Q8_0
         if new_name.endswith(".nextn.eh_proj.weight"):
             return gguf.GGMLQuantizationType.Q8_0
+        if new_name.endswith(".exp_probs_b_vl.bias"):
+            return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_f32_tensors:
             return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_bf16_tensors and n_dims >= 2:
             return gguf.GGMLQuantizationType.BF16
 
         return False
+
+    @staticmethod
+    def _validate_vision_config(hparams: dict[str, Any]) -> None:
+        expected = {
+            "vision_n_layers": 32,
+            "vision_dim": 1024,
+            "vision_n_heads": 16,
+            "vision_inter_dim": 2816,
+            "vision_patch_size": 14,
+            "vision_rope_theta": 10000.0,
+            "vision_downsample_ratio": 3,
+            "vision_max_n_token": 384,
+            "vision_min_pixels": 147456,
+            "vision_max_wh_ratio": 8,
+        }
+        for key, value in expected.items():
+            if hparams.get(key) != value:
+                raise ValueError(f"Unsupported DeepSeek-V4 vision config: {key}={hparams.get(key)!r}, expected {value!r}")
+
+    def set_vocab(self):
+        if self._is_vision:
+            with open(self.dir_model / "tokenizer.json", "r", encoding="utf-8") as f:
+                tokenizer_json = json.load(f)
+            added_tokens = {token["id"]: token for token in tokenizer_json.get("added_tokens", [])}
+            anchors = {
+                128799: ("<\uff5cSystem\uff5c>", False),
+                129264: ("<\uff5cdeepseek_image\uff5c>", False),
+            }
+            if self.hparams["vocab_size"] != 129280:
+                raise ValueError("DeepSeek-V4 vision conversion requires vocab_size=129280")
+            for token_id, (content, special) in anchors.items():
+                token = added_tokens.get(token_id)
+                if token is None or token.get("content") != content or token.get("special") is not special:
+                    raise ValueError(f"Unexpected DeepSeek-V4 vision tokenizer overlay at token ID {token_id}: {token!r}")
+        super().set_vocab()
 
     def prepare_metadata(self, vocab_only: bool):
         from_dir = self.fname_out.is_dir()
@@ -915,6 +984,137 @@ class DeepseekV4Model(TextModel):
         super().prepare_tensors()
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+
+
+@ModelBase.register("DeepseekV4ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp")
+class DeepseekV4VisionMmprojModel(MmprojModel):
+    def get_vision_config(self) -> dict[str, Any] | None:
+        hparams = self.global_config
+        if hparams.get("vision_n_layers", 0) <= 0:
+            return None
+        DeepseekV4Model._validate_vision_config(hparams)
+        return {
+            "image_size": 0,
+            "patch_size": hparams["vision_patch_size"],
+            "hidden_size": hparams["vision_dim"],
+            "intermediate_size": hparams["vision_inter_dim"],
+            "num_hidden_layers": hparams["vision_n_layers"],
+            "num_attention_heads": hparams["vision_n_heads"],
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.preprocessor_config = {
+            **self.preprocessor_config,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+        }
+
+        expected = {
+            "vision.patch_embed.proj.weight",
+            "vision.patch_embed.proj.bias",
+            "vision.norm.weight",
+            "aligner.w1.weight",
+            "aligner.w1.bias",
+            "aligner.w2.weight",
+            "aligner.w2.bias",
+            "image_start",
+            "image_end",
+            "image_newline",
+            "image_pad",
+        }
+        for bid in range(self.global_config["vision_n_layers"]):
+            prefix = f"vision.blocks.{bid}"
+            expected.update({
+                f"{prefix}.attn.wqkv.weight",
+                f"{prefix}.attn.wqkv.bias",
+                f"{prefix}.attn.wo.weight",
+                f"{prefix}.attn.wo.bias",
+                f"{prefix}.mlp.w1.weight",
+                f"{prefix}.mlp.w2.weight",
+                f"{prefix}.norm1.weight",
+                f"{prefix}.norm2.weight",
+            })
+        actual = set(self.model_tensors)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            raise ValueError(f"DeepSeek-V4 mmproj tensor inventory mismatch: missing={missing}, extra={extra}")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if not name.startswith(("vision.", "aligner.")) and name not in {
+            "image_start", "image_end", "image_newline", "image_pad",
+        }:
+            return None
+        return super().filter_tensors(item)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.global_config
+        self.gguf_writer.add_clip_vision_projector_type(gguf.VisionProjectorType.DEEPSEEK4_VISION)
+        self.gguf_writer.add_vision_use_silu(True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
+        self.gguf_writer.add_vision_spatial_merge_size(hparams["vision_downsample_ratio"])
+        self.gguf_writer.add_vision_min_pixels(hparams["vision_min_pixels"])
+        self.gguf_writer.add_vision_rope_freq_base(hparams["vision_rope_theta"])
+        self.gguf_writer.add_vision_max_image_tokens(hparams["vision_max_n_token"])
+        self.gguf_writer.add_vision_max_wh_ratio(hparams["vision_max_wh_ratio"])
+
+    @staticmethod
+    def _permute_qk(data_torch: Tensor, n_head: int) -> Tensor:
+        head_dim = data_torch.shape[0] // n_head
+        tail = data_torch.shape[1:]
+        return data_torch.reshape(n_head, 2, head_dim // 2, *tail).transpose(1, 2).reshape(data_torch.shape)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        hparams = self.global_config
+        if name == "vision.patch_embed.proj.weight":
+            patch_size = hparams["vision_patch_size"]
+            data_torch = data_torch.reshape(hparams["vision_dim"], 3, patch_size, patch_size)
+
+        if ".attn.wqkv." in name:
+            q, k, v = data_torch.chunk(3, dim=0)
+            q = self._permute_qk(q, hparams["vision_n_heads"])
+            k = self._permute_qk(k, hparams["vision_n_heads"])
+            data_torch = torch.cat((q, k, v), dim=0)
+
+        if name.endswith(".mlp.w1.weight"):
+            assert bid is not None
+            gate, up = data_torch.chunk(2, dim=0)
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_ENC_FFN_GATE, bid, ".weight"), gate
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_ENC_FFN_UP, bid, ".weight"), up
+            return
+
+        aligner = {
+            "aligner.w1.weight": (0, ".weight"),
+            "aligner.w1.bias": (0, ".bias"),
+            "aligner.w2.weight": (1, ".weight"),
+            "aligner.w2.bias": (1, ".bias"),
+        }
+        if name in aligner:
+            proj, suffix = aligner[name]
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, proj, suffix), data_torch
+            return
+
+        structural = {
+            "image_start": gguf.MODEL_TENSOR.V_TOK_BOI,
+            "image_end": gguf.MODEL_TENSOR.V_TOK_EOI,
+            "image_newline": gguf.MODEL_TENSOR.V_ENC_EMBD_IMGNL,
+            "image_pad": gguf.MODEL_TENSOR.V_TOK_IMAGE_PAD,
+        }
+        if name in structural:
+            yield self.format_tensor_name(structural[name], None, ""), data_torch
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if name in {"image_start", "image_end", "image_newline", "image_pad"} or new_name.endswith(".bias"):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register("DeepseekV4DSparkModel")

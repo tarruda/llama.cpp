@@ -361,6 +361,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_CONV_GROUP_SIZE,  "%s.conv_group_size"  },
     { LLM_KV_DFLASH_SELECTOR_RANK,    "%s.selector_rank"    },
     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
+    { LLM_KV_VISION_MAX_IMAGE_TOKENS, "%s.vision.max_image_tokens" },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims
@@ -457,6 +458,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_UP_SHEXP,                           "blk.%d.ffn_up_shexp" },
     { LLM_TENSOR_FFN_DOWN_SHEXP,                         "blk.%d.ffn_down_shexp" },
     { LLM_TENSOR_FFN_EXP_PROBS_B,                        "blk.%d.exp_probs_b" },
+    { LLM_TENSOR_FFN_EXP_PROBS_B_VL,                     "blk.%d.exp_probs_b_vl" },
     { LLM_TENSOR_FFN_LATENT_DOWN,                        "blk.%d.ffn_latent_down" },
     { LLM_TENSOR_FFN_LATENT_UP,                          "blk.%d.ffn_latent_up" },
     { LLM_TENSOR_ATTN_NORM_2,                            "blk.%d.attn_norm_2" },
@@ -896,6 +898,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_EXP_PROBS_B,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_FFN_EXP_PROBS_B_VL,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     // altup / laurel (gemma 3n)
     {LLM_TENSOR_PER_LAYER_TOKEN_EMBD,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_PER_LAYER_MODEL_PROJ,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},

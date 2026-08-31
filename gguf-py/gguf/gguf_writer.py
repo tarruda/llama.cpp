@@ -1016,6 +1016,9 @@ class GGUFWriter:
     def add_has_confidence_head(self, value: bool) -> None:
         self.add_bool(Keys.LLM.HAS_CONFIDENCE_HEAD.format(arch=self.arch), value)
 
+    def add_model_vision_max_image_tokens(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.VISION_MAX_IMAGE_TOKENS.format(arch=self.arch), value)
+
     def add_target_layers(self, value: Sequence[int]) -> None:
         self.add_array(Keys.LLM.TARGET_LAYERS.format(arch=self.arch), value)
 
@@ -1380,6 +1383,15 @@ class GGUFWriter:
 
     def add_vision_spatial_merge_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.SPATIAL_MERGE_SIZE, value)
+
+    def add_vision_rope_freq_base(self, value: float) -> None:
+        self.add_float32(Keys.ClipVision.ROPE_FREQ_BASE, value)
+
+    def add_vision_max_image_tokens(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.MAX_IMAGE_TOKENS, value)
+
+    def add_vision_max_wh_ratio(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.MAX_WH_RATIO, value)
 
     def add_vision_expert_count_per_layer(self, value: Sequence[int]) -> None:
         self.add_array(Keys.ClipVision.EXPERT_COUNT_PER_LAYER, value)

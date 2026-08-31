@@ -63,6 +63,8 @@ struct clip_hparams {
     int32_t image_longest_edge = 0;
     int32_t image_min_pixels = -1;
     int32_t image_max_pixels = -1;
+    int32_t image_max_tokens = 0;
+    int32_t image_max_wh_ratio = 0;
     resize_algo image_resize_algo = RESIZE_ALGO_BICUBIC;
     pad_style image_resize_pad = PAD_CEIL; // padding style when resizing
     std::array<uint8_t, 3> image_pad_color = {0, 0, 0};
@@ -604,6 +606,7 @@ struct clip_model {
     ggml_tensor * mm_merger_fc2_b = nullptr;
 
     ggml_tensor * image_newline = nullptr;
+    ggml_tensor * image_pad = nullptr;
     ggml_tensor * view_seperator = nullptr;
 
 

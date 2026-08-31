@@ -32,6 +32,7 @@ add_library(mtmd
             models/conformer.cpp
             models/dots3note.cpp
             models/dotsocr.cpp
+            models/deepseek4-vision.cpp
             models/exaone4_5.cpp
             models/gemma4a.cpp
             models/gemma4v.cpp

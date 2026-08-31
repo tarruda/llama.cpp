@@ -276,6 +276,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
         ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
+        ms.add_kv(LLM_KV_VISION_MAX_IMAGE_TOKENS,               uint32_t(384));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);

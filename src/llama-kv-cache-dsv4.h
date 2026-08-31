@@ -149,6 +149,7 @@ public:
     llama_dsv4_comp_state * get_lid_state() const;
 
     uint32_t get_n_rs_seq() const;
+    uint32_t get_vision_max_image_tokens() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
@@ -180,12 +181,13 @@ class llama_kv_cache_dsv4_raw_context : public llama_memory_context_i {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv);
+    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv, uint32_t vision_max_image_tokens);
 
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_iswa * kv,
             llama_context * lctx,
-            bool optimize);
+            bool optimize,
+            uint32_t vision_max_image_tokens);
 
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_iswa * kv,
@@ -193,7 +195,8 @@ public:
             slot_info_vec_t sinfos_swa_write,
             slot_info_vec_t sinfos_swa_read,
             std::vector<llama_ubatch> ubatches,
-            std::vector<llama_ubatch> ubatches_write);
+            std::vector<llama_ubatch> ubatches_write,
+            uint32_t vision_max_image_tokens);
 
     bool next() override;
     bool apply() override;
@@ -228,6 +231,7 @@ private:
     const llama_memory_context_ptr ctx_swa_mem;
 
     uint32_t n_kv = 0;
+    const uint32_t vision_max_image_tokens;
 
     const llama_memory_status status;
 };

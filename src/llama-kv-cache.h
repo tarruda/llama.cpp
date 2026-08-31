@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -19,6 +20,7 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    using kq_visibility = std::vector<std::pair<llama_pos, llama_pos>>;
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -226,7 +228,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const kq_visibility * visibility = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

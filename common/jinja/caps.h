@@ -22,6 +22,7 @@ struct caps {
     // one of the 2 content capabilities must be true
     bool supports_string_content = true;
     bool supports_typed_content = false;
+    bool supports_media_marker = false;
 
     bool supports_object_arguments = false;
 

@@ -1704,6 +1704,10 @@ uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
     return n_rs_seq;
 }
 
+uint32_t llama_kv_cache_dsv4::get_vision_max_image_tokens() const {
+    return hparams_raw.dsv4_vision_max_image_tokens;
+}
+
 const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
@@ -1779,11 +1783,13 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
     return sinfo;
 }
 
-llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
+llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
+        llama_kv_cache_iswa * kv, uint32_t vision_max_image_tokens) :
     kv_swa(kv->get_swa()),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
+    vision_max_image_tokens(vision_max_image_tokens),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
     sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa));
     sinfos_write = sinfos_read;
@@ -1792,11 +1798,13 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         llama_kv_cache_iswa * kv,
         llama_context * lctx,
-        bool optimize) :
+        bool optimize,
+        uint32_t vision_max_image_tokens) :
     kv_swa(kv->get_swa()),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
     n_kv(kv_swa->get_size()),
+    vision_max_image_tokens(vision_max_image_tokens),
     status(llama_memory_status_combine(ctx_base_mem->get_status(), ctx_swa_mem->get_status())) {
 }
 
@@ -1806,7 +1814,8 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         slot_info_vec_t sinfos_swa_write,
         slot_info_vec_t sinfos_swa_read,
         std::vector<llama_ubatch> ubatches,
-        std::vector<llama_ubatch> ubatches_write) :
+        std::vector<llama_ubatch> ubatches_write,
+        uint32_t vision_max_image_tokens) :
     kv_swa(kv->get_swa()),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),
@@ -1816,6 +1825,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
                 kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
+    vision_max_image_tokens(vision_max_image_tokens),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
 }
 
@@ -1925,7 +1935,41 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+    if (vision_max_image_tokens == 0 || ubatch->embd == nullptr) {
+        kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+        return;
+    }
+
+    llama_pos seq_min[LLAMA_MAX_SEQ];
+    llama_pos seq_max[LLAMA_MAX_SEQ];
+    uint32_t seq_count[LLAMA_MAX_SEQ] = {};
+    std::fill(seq_min, seq_min + LLAMA_MAX_SEQ, INT32_MAX);
+    std::fill(seq_max, seq_max + LLAMA_MAX_SEQ, -1);
+    for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        GGML_ASSERT(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        seq_min[seq_id] = std::min(seq_min[seq_id], ubatch->pos[i]);
+        seq_max[seq_id] = std::max(seq_max[seq_id], ubatch->pos[i]);
+        seq_count[seq_id]++;
+    }
+
+    llama_kv_cache::kq_visibility visibility(ubatch->n_tokens, {-1, -1});
+    for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const llama_pos image_start = seq_min[seq_id] + 3 - seq_min[seq_id] % 4;
+        const llama_pos image_end = seq_max[seq_id];
+        const llama_pos block_length = image_end - seq_min[seq_id] + 1;
+        if (block_length != (llama_pos) seq_count[seq_id]) {
+            throw std::runtime_error("DeepSeek-V4 image block positions must be contiguous");
+        }
+        if (block_length > (llama_pos) vision_max_image_tokens) {
+            throw std::runtime_error("DeepSeek-V4 image block exceeds vision.max_image_tokens");
+        }
+        if (ubatch->pos[i] >= image_start) {
+            visibility[i] = {image_start, image_end};
+        }
+    }
+    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn, &visibility);
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
@@ -1999,7 +2043,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status sta
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         llama_kv_cache_dsv4 * kv) :
-    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
+                kv->get_raw(), kv->get_vision_max_image_tokens())),
     ctx_csa_mem(kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
     ctx_lid_mem(kv->get_lid()->init_full()),
@@ -2022,7 +2067,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
-    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
+                kv->get_raw(), lctx, optimize, kv->get_vision_max_image_tokens())),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
     ctx_lid_mem(kv->get_lid()->init_update(lctx, optimize)),
@@ -2063,7 +2109,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
                 this->ubatches,
-                std::move(ubatches_raw))),
+                std::move(ubatches_raw),
+                kv->get_vision_max_image_tokens())),
     ctx_csa_mem(nullptr),
     ctx_hca_mem(nullptr),
     ctx_lid_mem(nullptr),
