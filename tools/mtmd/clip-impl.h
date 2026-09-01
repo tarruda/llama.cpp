@@ -63,6 +63,9 @@
 #define KEY_PROJ_SAMPLE_WINDOW_SIDE "clip.vision.projector.window_side"
 #define KEY_PROJ_SPATIAL_OFFSETS    "clip.vision.projector.spatial_offsets"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_VISION_ROPE_FREQ_BASE   "clip.vision.rope.freq_base"
+#define KEY_VISION_MAX_IMAGE_TOKENS "clip.vision.max_image_tokens"
+#define KEY_VISION_MAX_WH_RATIO     "clip.vision.max_width_height_ratio"
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
@@ -143,6 +146,7 @@
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
 #define TN_IMAGE_NEWLINE   "v.image_newline"
+#define TN_IMAGE_PAD       "v.image_pad"
 #define TN_IMAGE_SEPERATOR "v.view_seperator"
 #define TN_MM_INP_NORM     "mm.input_norm.weight"
 #define TN_MM_INP_NORM_B   "mm.input_norm.bias"
@@ -478,6 +482,7 @@ enum projector_type {
     PROJECTOR_TYPE_DOTS_OCR,
     PROJECTOR_TYPE_DOTS3NOTE_V,
     PROJECTOR_TYPE_DOTS3NOTE_A,
+    PROJECTOR_TYPE_DEEPSEEK4_VISION,
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_LFM2A,
@@ -542,6 +547,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DOTS_OCR,          "dots_ocr"},
     { PROJECTOR_TYPE_DOTS3NOTE_V,       "dots3note_v"},
     { PROJECTOR_TYPE_DOTS3NOTE_A,       "dots3note_a"},
+    { PROJECTOR_TYPE_DEEPSEEK4_VISION,  "deepseek4_vision"},
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},

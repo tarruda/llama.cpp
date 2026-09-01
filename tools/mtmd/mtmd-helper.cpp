@@ -139,8 +139,19 @@ int32_t mtmd_helper_decode_image_chunk(
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    const int32_t required_ubatch = mtmd_helper_chunk_required_ubatch_internal(ctx, chunk, n_past);
+    if (required_ubatch < 0) {
+        LOG_ERR("failed to decode image: chunk position changed; retokenize the complete prompt\n");
+        return -1;
+    }
+    if (required_ubatch > 0 &&
+            (required_ubatch > n_batch || required_ubatch > (int32_t) llama_n_ubatch(lctx))) {
+        LOG_ERR("failed to decode image: complete block requires %d tokens, but n_batch=%d and n_ubatch=%u\n",
+            required_ubatch, n_batch, llama_n_ubatch(lctx));
+        return -1;
+    }
     int32_t i_batch = 0;
-    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
+    int32_t n_img_batches = required_ubatch > 0 ? 1 : (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {

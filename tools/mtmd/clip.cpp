@@ -967,6 +967,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_dots3note_a>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+            {
+                builder = std::make_unique<clip_graph_deepseek4_vision>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
             {
@@ -1558,6 +1562,23 @@ struct clip_model_loader {
                         hparams.audio_n_fft       = 400;
                         hparams.audio_window_len  = 400;
                         hparams.audio_hop_len     = 160;
+                    } break;
+                case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+                    {
+                        get_f32(KEY_VISION_ROPE_FREQ_BASE, hparams.rope_theta);
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge);
+                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
+                        get_u32(KEY_VISION_MAX_IMAGE_TOKENS, hparams.image_max_tokens);
+                        get_u32(KEY_VISION_MAX_WH_RATIO, hparams.image_max_wh_ratio);
+                        if (hparams.rope_theta != 10000.0f || hparams.n_merge != 3 ||
+                                hparams.image_max_tokens != 384 || hparams.image_max_wh_ratio != 8) {
+                            throw std::runtime_error("unsupported DeepSeek-V4 vision metadata");
+                        }
+                        hparams.ffn_op = FFN_SILU;
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_pad_color = {127, 127, 127};
+                        hparams.image_max_pixels = hparams.image_max_tokens * hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                        hparams.set_warmup_n_tokens(28 * 28);
                     } break;
                 case PROJECTOR_TYPE_KIMIVL:
                     {
@@ -2763,6 +2784,17 @@ struct clip_model_loader {
                     model.mm_1_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "bias"));
                     model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 3, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 3, "bias"));
+                } break;
+            case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+                {
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                    model.mm_boi = get_tensor(TN_TOK_BOI);
+                    model.mm_eoi = get_tensor(TN_TOK_EOI);
+                    model.image_newline = get_tensor(TN_IMAGE_NEWLINE);
+                    model.image_pad = get_tensor(TN_IMAGE_PAD);
                 } break;
             case PROJECTOR_TYPE_ULTRAVOX:
                 {
@@ -4164,6 +4196,16 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 // 3x stride-2 conv2d over mel frames
                 n_patches = (img->nx() + 7) / 8;
             } break;
+        case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+            {
+                const int h = (img->ny() / patch_size + 2) / 3;
+                const int w = (img->nx() / patch_size + 2) / 3;
+                const int rows = h + h % 2;
+                const int row_length = w + 1;
+                const int tail = (rows / 2 * row_length % 2) * 2;
+                n_patches = 3 + 1 + rows * row_length + tail + 1;
+                GGML_ASSERT(n_patches <= params.image_max_tokens);
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
@@ -4766,6 +4808,45 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     pos_data[i] = i % pos_w;
                 }
                 set_input_i32("pos_w", pos_data);
+            } break;
+        case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+            {
+                std::vector<int32_t> pos_data(n_pos);
+                for (int i = 0; i < n_pos; i++) {
+                    pos_data[i] = i / pos_w;
+                }
+                set_input_i32("pos_h", pos_data);
+                for (int i = 0; i < n_pos; i++) {
+                    pos_data[i] = i % pos_w;
+                }
+                set_input_i32("pos_w", pos_data);
+
+                const int h = (pos_h + 2) / 3;
+                const int w = (pos_w + 2) / 3;
+                const int rows = h + h % 2;
+                const int row_length = w + 1;
+                const int tail = (rows / 2 * row_length % 2) * 2;
+                std::vector<int32_t> indices;
+                indices.reserve(3 + 1 + rows * row_length + tail + 1);
+                indices.insert(indices.end(), 3, 0);
+                indices.push_back(1);
+                for (int y = 0; y < rows; y += 2) {
+                    for (int x = 0; x < row_length; x++) {
+                        for (int dy = 0; dy < 2; dy++) {
+                            const int iy = y + dy;
+                            if (iy >= h) {
+                                indices.push_back(0);
+                            } else if (x == w) {
+                                indices.push_back(2);
+                            } else {
+                                indices.push_back(4 + iy * w + x);
+                            }
+                        }
+                    }
+                }
+                indices.insert(indices.end(), tail, 0);
+                indices.push_back(3);
+                set_input_i32("deepseek4_vision_indices", indices);
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
             {
@@ -5810,6 +5891,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_DOTS3NOTE_V:
         case PROJECTOR_TYPE_DOTS3NOTE_A:
             return ctx->model.mm_2_w->ne[1];
+        case PROJECTOR_TYPE_DEEPSEEK4_VISION:
+            return ctx->model.mm_1_w->ne[1];
         case PROJECTOR_TYPE_MLP_NORM:
             return ctx->model.mm_3_b->ne[0];
         case PROJECTOR_TYPE_MINICPMV:

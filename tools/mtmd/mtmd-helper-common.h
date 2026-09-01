@@ -59,6 +59,9 @@ struct mtmd_helper_logger {
 // inline, so all TUs including this header share one instance
 inline mtmd_helper_logger g_logger;
 
+MTMD_API int32_t mtmd_helper_chunk_required_ubatch_internal(
+        const mtmd_context * ctx, const mtmd_input_chunk * chunk, llama_pos n_past);
+
 #define LOG_DBG(...) g_logger.log(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LOG_INF(...) g_logger.log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
 #define LOG_WRN(...) g_logger.log(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)

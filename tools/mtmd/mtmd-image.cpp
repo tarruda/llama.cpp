@@ -786,6 +786,122 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     return output;
 }
 
+namespace {
+
+struct deepseek4_vision_grid {
+    int h;
+    int w;
+    int tokens;
+};
+
+static deepseek4_vision_grid deepseek4_vision_grid_tokens(
+        int height, int width, int patch_size, int downsample_ratio) {
+    const int vit_h = height / patch_size;
+    const int vit_w = width / patch_size;
+    const int h = (vit_h + downsample_ratio - 1) / downsample_ratio;
+    const int w = (vit_w + downsample_ratio - 1) / downsample_ratio;
+    const int rows = h + h % 2;
+    const int row_length = w + 1;
+    const int tail = (rows / 2 * row_length % 2) * 2;
+    return {h, w, rows * row_length + tail + 2};
+}
+
+static clip_image_size deepseek4_vision_solve_resize_ratio(
+        int height, int width, int patch_size, int downsample_ratio, int max_tokens) {
+    const double ratio = (double) height / width;
+    const double max_w_float = std::sqrt((max_tokens - 2) / ratio + 0.25) - 0.5;
+    const double max_h_float = max_w_float * ratio;
+    int best_width;
+    int best_height;
+    if (max_w_float < 1.0) {
+        const int max_w = 1;
+        int max_h = (max_tokens - 2) / (max_w + 1);
+        if (max_h % 2 == 1) {
+            max_h--;
+        }
+        best_width = max_w * patch_size * downsample_ratio;
+        best_height = max_h * patch_size * downsample_ratio;
+    } else if (max_h_float < 2.0) {
+        const int max_h = 2;
+        const int max_w = (max_tokens - 2) / max_h - 1;
+        GGML_ASSERT(max_w > 1);
+        best_width = max_w * patch_size * downsample_ratio;
+        best_height = max_h * patch_size * downsample_ratio;
+    } else {
+        const int max_w = (int) std::floor(max_w_float);
+        int max_h = (int) std::floor(max_h_float);
+        if (max_h % 2 == 1) {
+            max_h--;
+        }
+        const double beta = std::min(
+            (double) max_w * patch_size * downsample_ratio / width,
+            (double) max_h * patch_size * downsample_ratio / height);
+        best_width = (int) std::floor(width * beta / patch_size) * patch_size;
+        best_height = (int) std::floor(height * beta / patch_size) * patch_size;
+    }
+    return {best_width, best_height};
+}
+
+static clip_image_size deepseek4_vision_safe_resize(
+        int height, int width, int best_height, int best_width,
+        int patch_size, int downsample_ratio, int max_tokens) {
+    max_tokens -= 3;
+    int budget = max_tokens;
+    auto grid = deepseek4_vision_grid_tokens(best_height, best_width, patch_size, downsample_ratio);
+    while (grid.tokens > max_tokens) {
+        const auto size = deepseek4_vision_solve_resize_ratio(
+            height, width, patch_size, downsample_ratio, budget--);
+        best_width = size.width;
+        best_height = size.height;
+        grid = deepseek4_vision_grid_tokens(best_height, best_width, patch_size, downsample_ratio);
+    }
+    return {best_width, best_height};
+}
+
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4_vision::preprocess(const clip_image_u8 & img) {
+    const int patch_size = hparams.patch_size;
+    const int downsample_ratio = hparams.n_merge;
+    const auto original = img.get_size();
+    int width = original.width;
+    int height = original.height;
+    if (width > height * hparams.image_max_wh_ratio) {
+        width = height * hparams.image_max_wh_ratio;
+    }
+    if ((int64_t) width * height < hparams.image_min_pixels) {
+        const double ratio = std::sqrt((double) hparams.image_min_pixels / ((int64_t) width * height));
+        width = (int) (width * ratio);
+        height = (int) (height * ratio);
+    }
+
+    int best_width = (width + patch_size - 1) / patch_size * patch_size;
+    int best_height = (height + patch_size - 1) / patch_size * patch_size;
+    const auto target = deepseek4_vision_safe_resize(
+        height, width, best_height, best_width,
+        patch_size, downsample_ratio, hparams.image_max_tokens);
+
+    clip_image_u8 resized;
+    const bool direct = original.width >= hparams.image_max_wh_ratio * original.height;
+    img_tool::resize(img, resized, target, hparams.image_resize_algo,
+        direct ? PAD_NONE : PAD_NEAREST, hparams.image_pad_color);
+
+    clip_image_f32 converted;
+    converted.from_u8(resized);
+    converted.normalize(hparams.image_mean, hparams.image_std);
+    if (!converted.is_placeholder()) {
+        std::vector<float> rounded = converted.get_ro_buf();
+        for (float & value : rounded) {
+            value = ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+        }
+        converted.cpy_buf(rounded);
+    }
+
+    mtmd_image_preproc_out output;
+    output.append(hparams, converted, false);
+    return output;
+}
+
 //
 // mtmd_image_preprocessor_longest_edge
 //
