@@ -170,6 +170,7 @@ class Keys:
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
+        VISION_MAX_IMAGE_TOKENS           = "{arch}.vision.max_image_tokens"
 
     class Adapters:
         COUNT                = "{arch}.adapters.count"
@@ -382,6 +383,9 @@ class Keys:
         IMAGE_MEAN            = "clip.vision.image_mean"
         IMAGE_STD             = "clip.vision.image_std"
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
+        ROPE_FREQ_BASE        = "clip.vision.rope.freq_base"
+        MAX_IMAGE_TOKENS      = "clip.vision.max_image_tokens"
+        MAX_WH_RATIO          = "clip.vision.max_width_height_ratio"
         EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer" # dots3note pyramid MoE, 0 = dense layer
         EXPERT_USED_COUNT     = "clip.vision.expert_used_count"
         USE_GELU              = "clip.use_gelu"
@@ -697,6 +701,7 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_CHEXP       = auto()
     FFN_UP_CHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
+    FFN_EXP_PROBS_B_VL   = auto()
     FFN_GATE_TID2EID     = auto()
     MOE_LATENT_DOWN      = auto() # nemotron 3 super
     MOE_LATENT_UP        = auto() # nemotron 3 super
@@ -970,6 +975,7 @@ class MODEL_TENSOR(IntEnum):
     V_MM_MERGER_FC2      = auto() # minimax-m3 (patch-merge MLP)
     V_TOK_BOI            = auto() # cogvlm
     V_TOK_EOI            = auto() # cogvlm
+    V_TOK_IMAGE_PAD      = auto()
     V_TOK_IMG_BEGIN      = auto() # hunyuanvl
     V_TOK_IMG_END        = auto() # hunyuanvl
     V_STD_BIAS           = auto() # gemma4
@@ -1446,6 +1452,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
+    MODEL_TENSOR.FFN_EXP_PROBS_B_VL:        "blk.{bid}.exp_probs_b_vl",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
@@ -1716,6 +1723,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MM_MERGER_FC2:           "mm.merger.fc2",
     MODEL_TENSOR.V_TOK_BOI:                 "v.boi",
     MODEL_TENSOR.V_TOK_EOI:                 "v.eoi",
+    MODEL_TENSOR.V_TOK_IMAGE_PAD:           "v.image_pad",
     MODEL_TENSOR.V_MM_PRE_NORM:             "mm.pre_norm",
     MODEL_TENSOR.V_TOK_IMG_BEGIN:           "mm.image_begin",
     MODEL_TENSOR.V_TOK_IMG_END:             "mm.image_end",
@@ -2050,6 +2058,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_MM_GATE,
         MODEL_TENSOR.V_TOK_BOI,
         MODEL_TENSOR.V_TOK_EOI,
+        MODEL_TENSOR.V_TOK_IMAGE_PAD,
         MODEL_TENSOR.V_MM_PRE_NORM,
         MODEL_TENSOR.V_TOK_IMG_BEGIN,
         MODEL_TENSOR.V_TOK_IMG_END,
@@ -3830,6 +3839,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_GATE_TID2EID,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_EXP_PROBS_B_VL,
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
@@ -5645,6 +5655,7 @@ class VisionProjectorType:
     DOTS3NOTE_A = "dots3note_a" # audio
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
+    DEEPSEEK4_VISION = "deepseek4_vision"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"
