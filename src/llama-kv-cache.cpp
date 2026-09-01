@@ -1543,6 +1543,7 @@ struct args_set_input_kq_mask {
 
     const std::vector<llama_kv_cells> & v_cells;
     const std::vector<uint32_t>       & seq_to_stream;
+    const llama_kv_cache::kq_visibility * visibility;
 
     uint32_t       n_swa;
     llama_swa_type swa_type;
@@ -1566,6 +1567,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
+    const bool custom_visibility = args.visibility != nullptr;
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
@@ -1611,7 +1613,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             auto & idxs = seq_idxs[seq_id];
 
-            if (!alibi) {
+            if (!alibi && !custom_visibility) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
@@ -1632,7 +1634,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 uint32_t j = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
+                if (!alibi && !custom_visibility) {
                     if (prev) {
                         if (jj >= idxs.size()) {
                             break;
@@ -1653,12 +1655,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 p0 = cells.pos_get(j);
 
-                if (!alibi) {
+                if (!alibi && !custom_visibility) {
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                         if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
                             idxs.push_back(j);
                         }
+                    }
+                }
+
+                if (custom_visibility) {
+                    const auto & interval = args.visibility->at(i);
+                    if (interval.first >= 0 && p0 >= interval.first && p0 <= interval.second) {
+                        data[idst + j] = mask_keep;
+                        continue;
                     }
                 }
 
@@ -1740,8 +1750,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const kq_visibility * visibility) const {
     const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(visibility == nullptr || visibility->size() == n_tokens);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -1760,6 +1773,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.ubatch           =*/ ubatch,
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
+        /*.visibility       =*/ visibility,
         /*.n_swa            =*/ n_swa,
         /*.swa_type         =*/ swa_type,
         /*.n_kv             =*/ n_kv,

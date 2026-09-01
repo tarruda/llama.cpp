@@ -51,6 +51,10 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
+    ml.get_key(LLM_KV_VISION_MAX_IMAGE_TOKENS,              hparams.dsv4_vision_max_image_tokens, false);
+    if (hparams.dsv4_vision_max_image_tokens != 0 && hparams.dsv4_vision_max_image_tokens != 384) {
+        throw std::runtime_error("DeepSeek-V4 vision requires vision.max_image_tokens=384");
+    }
 
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
@@ -157,6 +161,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, flags);
         } else {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, flags);
+        }
+        if (hparams.dsv4_vision_max_image_tokens > 0 && i < n_layer) {
+            layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, flags);
         }
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
@@ -1218,6 +1225,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    GGML_ASSERT((ubatch.token != nullptr) != (ubatch.embd != nullptr));
+    const bool image_batch = hparams.dsv4_vision_max_image_tokens > 0 && ubatch.embd != nullptr;
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
@@ -1275,8 +1284,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
-        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+        ggml_tensor * exp_probs_b = image_batch ? layer.ffn_exp_probs_b_vl : layer.ffn_exp_probs_b;
+        if (!image_batch && (uint32_t) il < hparams.dsv4_hash_layer_count) {
+            GGML_ASSERT(res->t_inp_tokens != nullptr);
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }
