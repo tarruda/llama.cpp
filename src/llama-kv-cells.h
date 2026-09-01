@@ -336,6 +336,19 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // append the cells of a sequence with positions in [p0, p1]
+    void seq_pos_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & res) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        auto it = sp.lower_bound({ p0, 0 });
+        const auto end = sp.upper_bound({ p1, std::numeric_limits<uint32_t>::max() });
+        for (; it != end; ++it) {
+            res.push_back(it->second);
+        }
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

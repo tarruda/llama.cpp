@@ -1739,6 +1739,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            return has_simdgroup_reduction &&
+                (op->src[0]->ne[1] == 1 || has_simdgroup_mm) &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[3]->type == GGML_TYPE_I32 &&
+                op->src[4]->type == GGML_TYPE_F16 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[2]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[0]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_HEAD &&
+                op->src[1]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_KV &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op->src[4]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
                 op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {
@@ -1805,6 +1824,50 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
+        case GGML_OP_QWEN4EXP_HC_REDUCE:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[0]->ne[3] == 1 &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == op->src[0]->ne[2] &&
+                op->ne[2] == 1 &&
+                op->ne[3] == 1 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_QWEN4EXP_HC_COMBINE:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[0] == op->src[0]->ne[0] &&
+                op->src[1]->ne[1] == op->src[0]->ne[2] &&
+                op->src[2]->ne[0] == 4 &&
+                op->src[2]->ne[1] == op->src[0]->ne[2] &&
+                ggml_are_same_shape(op, op->src[0]) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_QSA_BLOCK_SCORE:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == OP_QSA_BLOCK_SCORE_D &&
+                op->src[0]->ne[1] == OP_QSA_BLOCK_SCORE_NH &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:

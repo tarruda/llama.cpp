@@ -51,6 +51,11 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) (args.scale * x + args.bias);
         }
 
+        if (FC_OP == OP_UNARY_NUM_SCALE_SILU) {
+            const TC scaled = args.scale * x + args.bias;
+            dst_ptr[i0] = (T) (scaled / (1 + exp(-scaled)));
+        }
+
         if (FC_OP == OP_UNARY_NUM_FILL) {
             dst_ptr[i0] = (T) args.val;
         }

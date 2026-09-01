@@ -122,6 +122,15 @@
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
 
+#define OP_QSA_BLOCK_SCORE_D   128
+#define OP_QSA_BLOCK_SCORE_NH    4
+#define OP_QSA_BLOCK_SCORE_NSG   2
+#define OP_QSA_BLOCK_SCORE_NKPSG 3
+
+#define OP_FLASH_ATTN_EXT_INDEXED_D       256
+#define OP_FLASH_ATTN_EXT_INDEXED_N_HEAD   24
+#define OP_FLASH_ATTN_EXT_INDEXED_N_KV      2
+
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
 #define OP_UNARY_NUM_CLAMP      12
@@ -131,6 +140,7 @@
 #define OP_UNARY_NUM_COS        16
 #define OP_UNARY_NUM_LOG        17
 #define OP_UNARY_NUM_LEAKY_RELU 18
+#define OP_UNARY_NUM_SCALE_SILU 19
 
 #define OP_UNARY_NUM_TANH        100
 #define OP_UNARY_NUM_RELU        101
@@ -250,6 +260,12 @@ typedef struct {
     uint64_t offs;
     uint64_t o1[8];
 } ggml_metal_kargs_bin;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_expert;
+    int32_t n_tokens;
+} ggml_metal_kargs_moe_combine;
 
 typedef struct {
     int64_t ne0;
@@ -478,6 +494,20 @@ typedef struct {
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
 typedef struct {
+    int32_t  n_kv;
+    int32_t  n_select;
+    int32_t  n_padded;
+    uint64_t nb_k1;
+    uint64_t nb_k2;
+    uint64_t nb_k3;
+    uint64_t nb_v1;
+    uint64_t nb_v2;
+    uint64_t nb_v3;
+    uint64_t nb_i3;
+    uint64_t nb_m3;
+} ggml_metal_kargs_flash_attn_ext_indexed;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne02;
     uint64_t nb01;
@@ -605,6 +635,7 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    post_scale;
 } ggml_metal_kargs_norm;
 
 typedef struct {
@@ -978,6 +1009,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    uint64_t state_slot_stride;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1286,6 +1318,32 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tokens;
+    int32_t gate_sigmoid;
+} ggml_metal_kargs_qwen4exp_hc_reduce;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tokens;
+} ggml_metal_kargs_qwen4exp_hc_combine;
+
+typedef struct {
+    int32_t  n_blocks;
+    float    scale;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    uint64_t nb_q3;
+    uint64_t nb_k1;
+    uint64_t nb_c1;
+    uint64_t nb_c3;
+    uint64_t nb_m1;
+    uint64_t nb_m3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_qsa_block_score;
 
 typedef struct {
     int32_t  ne00;

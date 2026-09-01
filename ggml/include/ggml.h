@@ -558,6 +558,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_INDEXED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -574,6 +575,9 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QWEN4EXP_HC_REDUCE,
+        GGML_OP_QWEN4EXP_HC_COMBINE,
+        GGML_OP_QSA_BLOCK_SCORE,
 
         GGML_OP_UNARY,
 
@@ -2446,6 +2450,23 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // q:       [n_embd_k, n_batch, n_head,    ne3]
+    // k:       [n_embd_k, n_kv,    n_head_kv, ne3]
+    // v:       [n_embd_v, n_kv,    n_head_kv, ne3]
+    // indices: [n_select, n_batch,  1,         ne3]
+    // mask:    [n_select, n_batch,  1,         ne3]
+    // res:     [n_embd_v, n_head,   n_batch,   ne3]
+    // Negative indices and entries masked with -INFINITY are skipped.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 logit_softcap);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2628,6 +2649,20 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // Qwen sparse-attention block score
+    // q:     [n_embd,   n_head,  n_query, n_stream]
+    // k:     [n_embd,   n_cache, 1,       1]
+    // cells: [n_blocks, 1|n_query, 1,     n_stream]
+    // mask:  [n_blocks, n_query, 1,       n_stream]
+    // res:   [n_blocks, n_query, 1,       n_stream]
+    GGML_API struct ggml_tensor * ggml_qsa_block_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * mask,
+            float                 scale);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
@@ -2666,6 +2701,23 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Qwen4-Exp hyper-connection reduction
+    // x, gate: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    // result[i, t] = sum_h x[i, h, t]*gate[i, h, t]/hc
+    GGML_API struct ggml_tensor * ggml_qwen4exp_hc_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate);
+
+    // Qwen4-Exp hyper-connection combine
+    // residual: [n_embd, hc, n_tokens], x: [n_embd, n_tokens], injection: [hc, n_tokens]
+    // result[i, h, t] = residual[i, h, t] + x[i, t]*2*sigmoid(injection[h, t]/hc)
+    GGML_API struct ggml_tensor * ggml_qwen4exp_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * injection);
 
     // custom operators
 

@@ -48,6 +48,43 @@ template [[host_name("kernel_flash_attn_ext_kv_q5_0_f16")]] kernel kernel_flash_
 template [[host_name("kernel_flash_attn_ext_kv_q5_1_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q5_1, 32, dequantize_q5_1>;
 template [[host_name("kernel_flash_attn_ext_kv_q8_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q8_0, 32, dequantize_q8_0>;
 
+kernel void kernel_flash_attn_ext_indexed_pack_f16_d256(
+        constant ggml_metal_kargs_flash_attn_ext_indexed & args,
+        device const char * k,
+        device const char * v,
+        device const char * indices,
+        device const char * mask,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    const int32_t ir = tgpig.x;
+    const int32_t is = tgpig.y;
+    const int64_t kv_stride = sizeof(half)*OP_FLASH_ATTN_EXT_INDEXED_D*args.n_padded*OP_FLASH_ATTN_EXT_INDEXED_N_KV;
+    const int64_t stream_stride = 2*kv_stride + sizeof(half)*args.n_padded;
+
+    device const int32_t * pi = (device const int32_t *) (indices + is*args.nb_i3);
+    device const half * pm = (device const half *) (mask + is*args.nb_m3);
+    const int32_t idx = ir < args.n_select ? pi[ir] : -1;
+    const half mask_value = ir < args.n_select ? pm[ir] : half(-INFINITY);
+    const bool valid = idx >= 0 && idx < args.n_kv && float(mask_value) != -INFINITY;
+    const int32_t safe_idx = valid ? idx : 0;
+
+    device half * pk_dst = (device half *) (dst + is*stream_stride);
+    device half * pv_dst = (device half *) (dst + is*stream_stride + kv_stride);
+    FOR_UNROLL (short ih = 0; ih < OP_FLASH_ATTN_EXT_INDEXED_N_KV; ++ih) {
+        device const half * pk_src = (device const half *) (k + safe_idx*args.nb_k1 + ih*args.nb_k2 + is*args.nb_k3);
+        device const half * pv_src = (device const half *) (v + safe_idx*args.nb_v1 + ih*args.nb_v2 + is*args.nb_v3);
+        const int64_t offs = (ih*args.n_padded + ir)*OP_FLASH_ATTN_EXT_INDEXED_D + tiitg;
+        pk_dst[offs] = valid ? pk_src[tiitg] : half(0.0f);
+        pv_dst[offs] = valid ? pv_src[tiitg] : half(0.0f);
+    }
+
+    if (tiitg == 0) {
+        device half * pm_dst = (device half *) (dst + is*stream_stride + 2*kv_stride);
+        pm_dst[ir] = valid ? mask_value : half(-INFINITY);
+    }
+}
+
 constant bool FC_flash_attn_ext_pad_has_mask [[function_constant(FC_FLASH_ATTN_EXT_PAD + 0)]];
 
 constant int32_t FC_flash_attn_ext_pad_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_PAD + 25)]];
@@ -225,6 +262,7 @@ template<
     short DV,         // V head size
     short Q,          // queries per threadgroup
     short C,          // cache items per threadgroup
+    bool INDEXED,
     short NSG>        // number of simd groups
 void kernel_flash_attn_ext_impl(
         constant ggml_metal_kargs_flash_attn_ext & args,
@@ -242,7 +280,9 @@ void kernel_flash_attn_ext_impl(
         ushort  sgitg) {
     const ushort iq3 = tgpig[2];
     const ushort iq2 = tgpig[1];
-    const ushort iq1 = tgpig[0]*Q;
+    const ushort indexed_kv_head = tgpig[0]/2;
+    const ushort indexed_head_limit = (indexed_kv_head + 1)*(args.ne01/args.ne_12_2);
+    const ushort iq1 = INDEXED ? indexed_kv_head*(args.ne01/args.ne_12_2) + (tgpig[0]%2)*Q : tgpig[0]*Q;
 
 #define NS10 (FC_flash_attn_ext_ns10)
 #define NS20 (FC_flash_attn_ext_ns20)
@@ -297,10 +337,10 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = INDEXED ? nullptr : (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
-    {
+    if (!INDEXED) {
         const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
         const int32_t nblk0 = ((args.ne11 + C - 1)/C);
 
@@ -308,23 +348,36 @@ void kernel_flash_attn_ext_impl(
     }
 
     {
-        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+        if (INDEXED) {
+            q += iq2*args.nb01 + iq1*args.nb02 + iq3*args.nb03;
 
-        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
-        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+            k += indexed_kv_head*args.nb12 + iq3*args.nb13;
+            v += indexed_kv_head*args.nb22 + iq3*args.nb23;
+        } else {
+            q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
 
-        k += ikv2*args.nb12 + ikv3*args.nb13;
-        v += ikv2*args.nb22 + ikv3*args.nb23;
+            const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+            const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+            k += ikv2*args.nb12 + ikv3*args.nb13;
+            v += ikv2*args.nb22 + ikv3*args.nb23;
+        }
     }
+
+    device const int32_t * pi_base = INDEXED ?
+        (device const int32_t *) sinks + (iq3*args.ne02 + iq2)*args.ne11 : nullptr;
+    device const half * pm_indexed = INDEXED ?
+        (device const half *) (mask + iq2*args.nb31 + iq3*args.nb33) : nullptr;
 
     // load heads from Q to shared memory
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*(INDEXED ? args.nb02 : args.nb01));
 
         for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
+            const bool valid = iq1 + j < args.ne01 && (!INDEXED || iq1 + j < indexed_head_limit);
+            if (valid) {
                 sq4[j*DK4 + i] = (q4_t) q4[i];
             } else {
                 sq4[j*DK4 + i] = 0;
@@ -373,7 +426,7 @@ void kernel_flash_attn_ext_impl(
             }
 
             // the last partial chunk uses the pad buffer as source
-            if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
+            if (!INDEXED && FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
@@ -414,31 +467,45 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
-
-                if (blk_cur == 0) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
-                    }
-
-                    continue;
-                }
-
-                if (blk_cur == 1) {
+                if (INDEXED) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
                         const short j = jj*NSG + sgitg;
+                        const bool q_valid = iq1 + j < args.ne01 && iq1 + j < indexed_head_limit;
+                        const int ii0 = ic + 2*tiisg;
+                        const int ii1 = ii0 + 1;
+                        const int idx0 = ii0 < args.ne11 ? pi_base[ii0] : -1;
+                        const int idx1 = ii1 < args.ne11 ? pi_base[ii1] : -1;
+                        const half m0 = q_valid && idx0 >= 0 && idx0 < args.ne31 ? pm_indexed[ii0] : -INFINITY;
+                        const half m1 = q_valid && idx1 >= 0 && idx1 < args.ne31 ? pm_indexed[ii1] : -INFINITY;
+                        sm2[j*SH + tiisg] = half2(m0, m1);
+                    }
+                } else {
+                    blk_cur = blk[ic0];
 
-                        if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
-                        } else {
-                            sm2[j*SH + tiisg] = pm2[jj][tiisg];
+                    if (blk_cur == 0) {
+                        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                            pm2[jj] += NW;
                         }
 
-                        pm2[jj] += NW;
+                        continue;
                     }
-                } else if (blk_cur == 2) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
+
+                    if (blk_cur == 1) {
+                        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                            const short j = jj*NSG + sgitg;
+
+                            if (FC_flash_attn_ext_bc_mask) {
+                                sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            } else {
+                                sm2[j*SH + tiisg] = pm2[jj][tiisg];
+                            }
+
+                            pm2[jj] += NW;
+                        }
+                    } else if (blk_cur == 2) {
+                        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                            pm2[jj] += NW;
+                        }
                     }
                 }
 
@@ -468,7 +535,7 @@ void kernel_flash_attn_ext_impl(
 
             // Q*K^T
             // this is compile-time check, so it does not have runtime overhead
-            if (is_same<kd4x4_t, k4x4_t>::value) {
+            if (!INDEXED && is_same<kd4x4_t, k4x4_t>::value) {
                 // we can read directly from global memory
                 device      const k_t * pk = (device const k_t *) (k + ic*args.nb11);
                 threadgroup const q_t * pq = sq;
@@ -536,7 +603,10 @@ void kernel_flash_attn_ext_impl(
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
                     for (short ii = 0; ii < DK16; ii += 4) {
-                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                        const int ii_sel = ic + 8*cc + ty;
+                        const int idx_src = INDEXED && ii_sel < args.ne11 ? pi_base[ii_sel] : ii_sel;
+                        const int idx = idx_src >= 0 && idx_src < (INDEXED ? args.ne31 : args.ne11) ? idx_src : 0;
+                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + idx*args.nb11);
 
                         if (DK16%4 == 0) {
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
@@ -640,7 +710,7 @@ void kernel_flash_attn_ext_impl(
             // O = O + (Q*K^T)*V
             {
                 // we can read directly from global memory
-                if (is_same<vd4x4_t, v4x4_t>::value) {
+                if (!INDEXED && is_same<vd4x4_t, v4x4_t>::value) {
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
@@ -727,7 +797,10 @@ void kernel_flash_attn_ext_impl(
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
-                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                            const int ii_sel = ic + 8*cc + ty;
+                            const int idx_src = INDEXED && ii_sel < args.ne11 ? pi_base[ii_sel] : ii_sel;
+                            const int idx = idx_src >= 0 && idx_src < (INDEXED ? args.ne31 : args.ne11) ? idx_src : 0;
+                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + idx*args.nb21);
 
                             if (DV16%4 == 0) {
                                 // no need for bound checks
@@ -811,11 +884,15 @@ void kernel_flash_attn_ext_impl(
     // store to global memory
     for (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
-        if (iq1 + j >= args.ne01) {
+        const bool valid = iq1 + j < args.ne01 && (!INDEXED || iq1 + j < indexed_head_limit);
+        if (!valid) {
             break;
         }
 
-        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+        const uint64_t rid = INDEXED ?
+            (uint64_t) iq3*args.ne2*args.ne1 + (uint64_t) iq2*args.ne1 + iq1 + j :
+            (uint64_t) iq3*args.ne2*args.ne1 + iq2 + (uint64_t) (iq1 + j)*args.ne1;
+        device float4 * dst4 = (device float4 *) dst + rid*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
 
@@ -863,7 +940,8 @@ template<
     short DK,         // K head size
     short DV,         // V head size
     short Q  = OP_FLASH_ATTN_EXT_NQPSG, // queries per threadgroup
-    short C  = OP_FLASH_ATTN_EXT_NCPSG> // cache items per threadgroup
+    short C  = OP_FLASH_ATTN_EXT_NCPSG, // cache items per threadgroup
+    bool INDEXED = false>
 kernel void kernel_flash_attn_ext(
         constant ggml_metal_kargs_flash_attn_ext & args,
         device const char * q,
@@ -878,7 +956,7 @@ kernel void kernel_flash_attn_ext(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-#define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
+#define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C, INDEXED
 #define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
@@ -951,6 +1029,7 @@ template [[host_name("kernel_flash_attn_ext_f16_dk128_dv128")]]  kernel flash_at
 template [[host_name("kernel_flash_attn_ext_f16_dk192_dv192")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  192, 192>;
 template [[host_name("kernel_flash_attn_ext_f16_dk192_dv128")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  192, 128>;
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  256, 256>;
+template [[host_name("kernel_flash_attn_ext_indexed_f16_dk256_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256, OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, true>;
 template [[host_name("kernel_flash_attn_ext_f16_dk320_dv256")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  320, 256>;
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  512, 512>;
 template [[host_name("kernel_flash_attn_ext_f16_dk576_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  576, 512>;

@@ -109,6 +109,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 4;
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        n_head = 24;
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
     } else if (arch == LLM_ARCH_DEEPSEEK2
@@ -134,10 +136,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        n_head_kv = 2;
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head_kv = 2; // GQA coverage
     }
-    const uint32_t n_embd_head = n_embd / n_head;
+    const uint32_t n_embd_head = arch == LLM_ARCH_QWEN4EXP ? 256 : n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
@@ -218,6 +222,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
@@ -282,8 +290,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
-    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    // minimax-m3 keeps one indexer head per GQA head
+    const uint32_t n_indexer_heads = arch == LLM_ARCH_QWEN4EXP ? 4 :
+            arch == LLM_ARCH_MINIMAX_M3 ? n_head : 64;
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, n_indexer_heads);
     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
@@ -291,7 +301,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    const uint32_t rope_section = arch == LLM_ARCH_QWEN4EXP ? 16 : n_embd_head/4;
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({rope_section, rope_section, rope_section, rope_section}));
 
     if (arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
@@ -350,7 +361,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? 256 : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
-    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
+    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        arch == LLM_ARCH_QWEN4EXP ? uint32_t(2) : n_head);
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);

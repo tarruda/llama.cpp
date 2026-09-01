@@ -88,6 +88,7 @@ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, 
 void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_attn_ext_indexed(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_back(
         const struct ggml_compute_params * params,
         const bool masked,
@@ -109,6 +110,9 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qwen4exp_hc_reduce(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qwen4exp_hc_combine(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qsa_block_score(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

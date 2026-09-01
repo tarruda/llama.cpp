@@ -2054,8 +2054,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -2546,7 +2550,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_indices,
+         ggml_tensor * kv_mask) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2561,6 +2567,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    GGML_ASSERT((kv_indices == nullptr) == (kv_mask == nullptr));
+    GGML_ASSERT(kv_indices == nullptr || use_flash_attn);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2577,14 +2585,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (kv_indices) {
+            GGML_ASSERT(sinks == nullptr);
+            GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
+            cur = ggml_flash_attn_ext_indexed(ctx0, q, k, v, kv_indices, kv_mask, kq_scale,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_QSA_ATTN, cur, il});
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+            ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        }
 
         if (v_mla) {
 #if 0
@@ -2796,7 +2812,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kv_indices,
+        ggml_tensor * kv_mask) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2832,7 +2850,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+            q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, kv_indices, kv_mask);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
