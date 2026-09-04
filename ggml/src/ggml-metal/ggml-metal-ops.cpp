@@ -5024,7 +5024,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne10 % ne02 == 0);
     GGML_ASSERT(ne10 >= ne02);
 
-    const int nth = std::min(1024, ne00);
+    const int nth = std::min(1024, (ne00 + 1)/2);
 
     const int n_past     = ((const int32_t *) op->op_params)[0];
     const int n_dims     = ((const int32_t *) op->op_params)[1];
