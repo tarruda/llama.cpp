@@ -7,6 +7,7 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+constant bool FC_mul_mm_id_compact [[function_constant(FC_MUL_MM + 6)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -476,6 +477,29 @@ template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_10")]] kernel kernel_m
 template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_16")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<16>;
 template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_22")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<22>;
 
+kernel void kernel_mul_mm_id_map1(
+        constant int32_t  & ne02,
+        device const char * htpe,
+        device       char * htasks,
+        uint tiitg[[thread_index_in_threadgroup]]) {
+    if (tiitg != 0) {
+        return;
+    }
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
+    device uint32_t * tasks = (device uint32_t *) htasks;
+
+    uint n_tasks = 0;
+    for (int im = 0; im < ne02; ++im) {
+        for (uint r1 = 0; r1 < tpe_u32[im]; r1 += 32) {
+            tasks[2*n_tasks + 1] = im;
+            tasks[2*n_tasks + 2] = r1;
+            ++n_tasks;
+        }
+    }
+    tasks[0] = n_tasks;
+}
+
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
@@ -483,6 +507,7 @@ kernel void kernel_mul_mm_id(
         device const char * src1,
         device const char * htpe,
         device const char * hids,
+        device const char * htasks,
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
@@ -503,12 +528,26 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    int im;
+    int r0;
+    int r1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    if (FC_mul_mm_id_compact) {
+        device const uint32_t * tasks = (device const uint32_t *) htasks;
+        if (tgpig.y >= tasks[0]) {
+            return;
+        }
+        im = tasks[2*tgpig.y + 1];
+        r1 = tasks[2*tgpig.y + 2];
+        r0 = tgpig.x*NR0;
+    } else {
+        im = tgpig.z;
+        r1 = tgpig.x*NR1;
+        r0 = tgpig.y*NR0;
+    }
 
     const int32_t neh1 = tpe_u32[im];
 

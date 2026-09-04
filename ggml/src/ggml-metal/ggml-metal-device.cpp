@@ -1155,7 +1155,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map1(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mm_id_map1";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op, bool compact) {
     char base[256];
     char name[256];
 
@@ -1165,13 +1176,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
     snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d", base, bc_inp);
+    snprintf(name, 256, "%s_bci=%d_compact=%d", base, bc_inp, compact);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool(cv, compact, FC_MUL_MM + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

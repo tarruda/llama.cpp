@@ -3047,6 +3047,29 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
+static bool ggml_metal_op_mul_mat_id_use_compact(const ggml_tensor * op) {
+    const int64_t n_expert      = op->src[0]->ne[2];
+    const int64_t n_expert_used = op->src[2]->ne[0];
+    const int64_t n_tokens       = op->src[2]->ne[1];
+
+    return n_expert >= 128 && n_expert_used < n_expert && n_tokens >= 128;
+}
+
+size_t ggml_metal_op_mul_mat_id_extra_tasks(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    if (!ggml_metal_op_mul_mat_id_use_compact(op)) {
+        return 0;
+    }
+
+    const int64_t n_expert      = op->src[0]->ne[2];
+    const int64_t n_expert_used = op->src[2]->ne[0];
+    const int64_t n_tokens       = op->src[2]->ne[1];
+    const int64_t n_tasks_max    = n_expert + (n_tokens*n_expert_used + 31)/32;
+
+    return sizeof(uint32_t)*(2*n_tasks_max + 1);
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3098,6 +3121,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
 
+        ggml_metal_buffer_id bid_tasks = bid_ids;
+        bid_tasks.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
                 ne02,
@@ -3132,8 +3158,22 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
         ggml_metal_op_concurrency_reset(ctx);
 
+        const bool compact = ggml_metal_op_mul_mat_id_use_compact(op);
+        if (compact) {
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map1(lib);
+            int32_t n_expert = ne02;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &n_expert, sizeof(n_expert), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,   1);
+            ggml_metal_encoder_set_buffer  (enc, bid_tasks, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact);
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
@@ -3160,13 +3200,19 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, compact ? bid_tasks : bid_tpe, 5);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
 
             const size_t smem = pipeline.smem;
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            if (compact) {
+                const int64_t n_tasks = ne02 + (ne21*ne20 + 31)/32;
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, n_tasks, 1, 128, 1, 1);
+            } else {
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            }
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
