@@ -2054,8 +2054,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 

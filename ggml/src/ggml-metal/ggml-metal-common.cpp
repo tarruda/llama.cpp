@@ -408,6 +408,41 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.fused =*/ {},
         };
 
+        if (node.op() == GGML_OP_UNARY && ggml_get_unary_op(node.node) == GGML_UNARY_OP_SOFTPLUS) {
+            const ggml_op fops[] = { GGML_OP_UNARY, GGML_OP_SQRT };
+            const int output = i + 1;
+
+            if (output < n && node.node->type == GGML_TYPE_F32 && gf->nodes[output]->type == GGML_TYPE_F32 &&
+                    ggml_are_same_layout(node.node, gf->nodes[output]) &&
+                    ggml_can_fuse_subgraph(gf, i, 2, fops, &output, 1)) {
+                node.add_fused(gf->nodes[++i]);
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
+
+        if (node.op() == GGML_OP_GET_ROWS) {
+            const ggml_op fops[] = {
+                GGML_OP_GET_ROWS,
+                GGML_OP_RESHAPE,
+                GGML_OP_SUM_ROWS,
+                GGML_OP_CLAMP,
+                GGML_OP_DIV,
+                GGML_OP_RESHAPE,
+                GGML_OP_SCALE,
+            };
+            const int n_fuse = sizeof(fops)/sizeof(fops[0]);
+            const int output = i + n_fuse - 1;
+
+            if (output < n && ggml_can_fuse_subgraph(gf, i, n_fuse, fops, &output, 1)) {
+                for (int k = 1; k < n_fuse; ++k) {
+                    node.add_fused(gf->nodes[++i]);
+                }
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
+
         // fuse only ops that start with these operations
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||

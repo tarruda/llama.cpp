@@ -152,6 +152,11 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
         }
 
+        if (FC_OP == OP_UNARY_NUM_SOFTPLUS_SQRT) {
+            const TC softplus = select(log(1 + exp(x)), x, x > 20);
+            dst_ptr[i0] = (T) sqrt(softplus);
+        }
+
         if (FC_OP == OP_UNARY_NUM_EXPM1) {
             // TODO: precise implementation
             dst_ptr[i0] = (T) (exp(x) - 1);

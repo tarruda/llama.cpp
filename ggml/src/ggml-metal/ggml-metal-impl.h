@@ -132,6 +132,7 @@
 #define OP_UNARY_NUM_LOG        17
 #define OP_UNARY_NUM_LEAKY_RELU 18
 #define OP_UNARY_NUM_SIGMOID_SCALE 19
+#define OP_UNARY_NUM_SOFTPLUS_SQRT 20
 
 #define OP_UNARY_NUM_TANH        100
 #define OP_UNARY_NUM_RELU        101
@@ -257,6 +258,21 @@ typedef struct {
     int32_t n_expert;
     int32_t n_tokens;
 } ggml_metal_kargs_moe_combine;
+
+typedef struct {
+    int32_t  n_expert_used;
+    int32_t  n_tokens;
+    uint64_t nb_p1;
+    uint64_t nb_p2;
+    uint64_t nb_i0;
+    uint64_t nb_i1;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+    float    clamp_min;
+    float    clamp_max;
+    float    scale;
+    float    bias;
+} ggml_metal_kargs_moe_weights;
 
 typedef struct {
     int64_t ne0;
@@ -1362,6 +1378,14 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_tokens;
+    uint64_t nb_x1;
+    uint64_t nb_d1;
+    float    post_scale;
+    float    post_bias;
+} ggml_metal_kargs_dsv4_hc_affine;
 
 typedef struct {
     int32_t  ne00;

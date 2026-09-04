@@ -52,6 +52,17 @@ template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
 
+kernel void kernel_cpy_f32_f32_contiguous(
+        constant ggml_metal_kargs_cpy & args,
+        device const packed_float4 * src0,
+        device       packed_float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const uint64_t n4 = (uint64_t) args.ne00*args.ne01*args.ne02*args.ne03/4;
+    if (tpig < n4) {
+        dst[tpig] = src0[tpig];
+    }
+}
+
 template<short QK,
          typename block_q,
          void (*quantize_func)(device const float *, device block_q &)>
@@ -196,9 +207,13 @@ kernel void kernel_concat(
 }
 
 typedef decltype(kernel_concat<float>) kernel_concat_t;
+typedef decltype(kernel_concat<packed_float4>) kernel_concat_f32_4_t;
+typedef decltype(kernel_concat<packed_half4>)  kernel_concat_f16_4_t;
 
 template [[host_name("kernel_concat_f32")]]  kernel kernel_concat_t kernel_concat<float>;
 template [[host_name("kernel_concat_f16")]]  kernel kernel_concat_t kernel_concat<half>;
+template [[host_name("kernel_concat_f32_4")]] kernel kernel_concat_f32_4_t kernel_concat<packed_float4>;
+template [[host_name("kernel_concat_f16_4")]] kernel kernel_concat_f16_4_t kernel_concat<packed_half4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_concat_bf16")]] kernel kernel_concat_t kernel_concat<bfloat>;
 #endif
@@ -477,4 +492,3 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
-

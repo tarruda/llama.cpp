@@ -462,6 +462,29 @@ kernel void kernel_moe_combine_f32(
     }
 }
 
+kernel void kernel_moe_weights_f32(
+        constant ggml_metal_kargs_moe_weights & args,
+        device const char * probs,
+        device const char * ids,
+        device       char * dst,
+        uint    it[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    if (it >= args.n_tokens) {
+        return;
+    }
+
+    float weight = 0.0f;
+    if (tiisg < args.n_expert_used) {
+        const int32_t id = *(device const int32_t *) (ids + tiisg*args.nb_i0 + it*args.nb_i1);
+        weight = *(device const float *) (probs + id*args.nb_p1 + it*args.nb_p2);
+    }
+
+    const float sum = clamp(simd_sum(weight), args.clamp_min, args.clamp_max);
+    if (tiisg < args.n_expert_used) {
+        *(device float *) (dst + tiisg*args.nb_d1 + it*args.nb_d2) = weight/sum*args.scale + args.bias;
+    }
+}
+
 kernel void kernel_dsv4_hc_comb_f32(
         constant ggml_metal_kargs_dsv4_hc_comb & args,
         device const char * mixes,
@@ -573,10 +596,6 @@ kernel void kernel_dsv4_hc_pre_norm_f32(
         ushort  tiisg[[thread_index_in_simdgroup]]) {
     constexpr ushort hc = 4;
 
-    if (sgitg == 0) {
-        shmem_f32[tiisg] = 0.0f;
-    }
-
     float weight_lane = 0.0f;
     if (tiisg < hc) {
         weight_lane = *(device const float *) (weights + tiisg*args.nb_w0 + tgpig*args.nb_w1);
@@ -591,8 +610,6 @@ kernel void kernel_dsv4_hc_pre_norm_f32(
 
     float sumf = simd_sum(dot(result, result));
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     if (tiisg == 0) {
         shmem_f32[sgitg] = sumf;
     }
@@ -606,9 +623,11 @@ kernel void kernel_dsv4_hc_pre_norm_f32(
     *(device float4 *) (dst + 4*tpitg*args.nb_d0 + tgpig*args.nb_d1) = result*scale*norm_v;
 }
 
-kernel void kernel_dsv4_hc_post_f32(
+template <bool add_x>
+kernel void kernel_dsv4_hc_post_f32_impl(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,
+        device const char * y,
         device const char * residual,
         device const char * post,
         device const char * comb,
@@ -647,7 +666,10 @@ kernel void kernel_dsv4_hc_post_f32(
         return;
     }
 
-    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    if (add_x) {
+        xv += *(device const float *) (y + i0*args.nb_x0 + it*args.nb_x1);
+    }
     float result[hc];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         result[idst] = xv*post_reg[idst];
@@ -664,6 +686,27 @@ kernel void kernel_dsv4_hc_post_f32(
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
+}
+
+typedef decltype(kernel_dsv4_hc_post_f32_impl<false>) kernel_dsv4_hc_post_f32_t;
+
+template [[host_name("kernel_dsv4_hc_post_f32")]]     kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<false>;
+template [[host_name("kernel_dsv4_hc_post_add_f32")]] kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<true>;
+
+kernel void kernel_dsv4_hc_affine_f32(
+        constant ggml_metal_kargs_dsv4_hc_affine & args,
+        device const char * x,
+        device const float * scale,
+        device const float4 * base,
+        device       char * dst,
+        uint it[[thread_position_in_grid]]) {
+    if (it >= args.n_tokens) {
+        return;
+    }
+
+    const float4 z = *(device const float4 *) (x + it*args.nb_x1) * scale[0] + base[0];
+    const float4 result = 1.0f / (1.0f + exp(-z));
+    *(device float4 *) (dst + it*args.nb_d1) = result*args.post_scale + args.post_bias;
 }
 
 kernel void kernel_dsv4_compress(
@@ -687,12 +730,69 @@ kernel void kernel_dsv4_compress(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if (!args.overlap && args.ratio == 128) {
+        const int lane = tiitg & 31;
+        const int nsg = ntg.x/32;
+        const int i0 = tgpig.x*(2*nsg) + (tiitg >> 5)*2 + (lane & 1);
+        const int worker = lane >> 1;
+
+        float score_max = -INFINITY;
+        float sum_v = 0.0f;
+        float sum_w = 0.0f;
+        for (int j = worker; i0 < args.n_embd && j < 128; j += 16) {
+            const int idx = idxs[j];
+            if (idx < 0 || idx >= args.n_rows) {
+                continue;
+            }
+
+            const float score = *(device const float *) (score_state + i0*args.nb_s0 + idx*args.nb_s1);
+            const float value = *(device const float *) (kv_state + i0*args.nb_k0 + idx*args.nb_k1);
+            if (score > score_max) {
+                const float scale = fast::exp(score_max - score);
+                sum_v = sum_v*scale + value;
+                sum_w = sum_w*scale + 1.0f;
+                score_max = score;
+            } else {
+                const float weight = fast::exp(score - score_max);
+                sum_v += value*weight;
+                sum_w += weight;
+            }
+        }
+
+        float group_max = max(score_max, simd_shuffle_xor(score_max, 2));
+        group_max = max(group_max, simd_shuffle_xor(group_max, 4));
+        group_max = max(group_max, simd_shuffle_xor(group_max, 8));
+        group_max = max(group_max, simd_shuffle_xor(group_max, 16));
+
+        float scale = 0.0f;
+        if (sum_w > 0.0f) {
+            scale = fast::exp(score_max - group_max);
+        }
+        sum_v *= scale;
+        sum_w *= scale;
+        sum_v += simd_shuffle_xor(sum_v, 2);
+        sum_w += simd_shuffle_xor(sum_w, 2);
+        sum_v += simd_shuffle_xor(sum_v, 4);
+        sum_w += simd_shuffle_xor(sum_w, 4);
+        sum_v += simd_shuffle_xor(sum_v, 8);
+        sum_w += simd_shuffle_xor(sum_w, 8);
+        sum_v += simd_shuffle_xor(sum_v, 16);
+        sum_w += simd_shuffle_xor(sum_w, 16);
+
+        if (worker == 0 && i0 < args.n_embd) {
+            *(device float *) (dst + i0*args.nb_d0 + ib*args.nb_d1) = sum_w > 0.0f ? sum_v/sum_w : 0.0f;
+        }
+        return;
+    }
+
     const int i0 = tgpig.x*ntg.x + tiitg;
     if (i0 >= args.n_embd) {
         return;
     }
 
     float score_max = -INFINITY;
+    float sum_v = 0.0f;
+    float sum_w = 0.0f;
     for (int j = 0; j < n_read; ++j) {
         const int idx = idxs[j];
         if (idx < 0 || idx >= args.n_rows) {
@@ -702,23 +802,14 @@ kernel void kernel_dsv4_compress(
         const bool cur_half = args.overlap && j >= args.ratio;
         const int i_src = (cur_half ? args.n_embd : 0) + i0;
         const float score = *(device const float *) (score_state + i_src*args.nb_s0 + idx*args.nb_s1);
-        score_max = max(score_max, score);
-    }
-
-    float sum_v = 0.0f;
-    float sum_w = 0.0f;
-    if (score_max != -INFINITY) {
-        for (int j = 0; j < n_read; ++j) {
-            const int idx = idxs[j];
-            if (idx < 0 || idx >= args.n_rows) {
-                continue;
-            }
-
-            const bool cur_half = args.overlap && j >= args.ratio;
-            const int i_src = (cur_half ? args.n_embd : 0) + i0;
-            const float score = *(device const float *) (score_state + i_src*args.nb_s0 + idx*args.nb_s1);
-            const float weight = exp(score - score_max);
-            const float value = *(device const float *) (kv_state + i_src*args.nb_k0 + idx*args.nb_k1);
+        const float value = *(device const float *) (kv_state + i_src*args.nb_k0 + idx*args.nb_k1);
+        if (score > score_max) {
+            const float scale = fast::exp(score_max - score);
+            sum_v = sum_v*scale + value;
+            sum_w = sum_w*scale + 1.0f;
+            score_max = score;
+        } else {
+            const float weight = fast::exp(score - score_max);
             sum_v += value*weight;
             sum_w += weight;
         }
