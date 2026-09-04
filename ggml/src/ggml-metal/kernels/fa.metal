@@ -183,6 +183,7 @@ constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_q_f16     [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 constant bool FC_flash_attn_ext_scan_mask [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -320,13 +321,23 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
-
-        for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
-                sq4[j*DK4 + i] = (q4_t) q4[i];
-            } else {
-                sq4[j*DK4 + i] = 0;
+        if (FC_flash_attn_ext_q_f16) {
+            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
+            }
+        } else {
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
             }
         }
     }
@@ -1068,6 +1079,7 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+constant bool FC_flash_attn_ext_vec_q_f16     [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 
 //constant float FC_flash_attn_ext_vec_scale         [[function_constant(FC_FLASH_ATTN_EXT_VEC + 10)]];
 //constant float FC_flash_attn_ext_vec_max_bias      [[function_constant(FC_FLASH_ATTN_EXT_VEC + 11)]];
@@ -1275,13 +1287,24 @@ kernel void kernel_flash_attn_ext_vec(
     {
         for (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
-            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
             if (iq1_q < args.ne01) {
-                for (short i = tiisg; i < PK4; i += NW) {
-                    if (i < DK4) {
-                        sq4[qq*PK4 + i] = (q4_t) q4[i];
-                    } else {
-                        sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                if (FC_flash_attn_ext_vec_q_f16) {
+                    device const half4 * q4 = (device const half4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
+                    }
+                } else {
+                    device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
                     }
                 }
             } else {

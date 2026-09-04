@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -14,6 +15,17 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     }
 
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
+}
+
+static bool dsv4_use_f16_fa_q(const llama_model & model, const llama_cparams & cparams, int il) {
+    if (!cparams.flash_attn || !cparams.offload_kqv) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    return reg && std::strcmp(ggml_backend_reg_name(reg), "MTL") == 0;
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
@@ -1035,6 +1047,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
     q = ggml_rope_set_offset(q, n_embd_head_nope);
+    if (inp_attn && !inp_attn->self_k_rot && nt >= 32 && dsv4_use_f16_fa_q(model, cparams, il)) {
+        q = ggml_cast(ctx0, q, GGML_TYPE_F16);
+    }
     cb(q, "q", il);
 
     ggml_tensor * kv = build_lora_mm(layer.wkv, cur);

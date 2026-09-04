@@ -3623,7 +3623,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     GGML_ASSERT(ne00 % 4 == 0);
 
-    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
     GGML_ASSERT(op->src[1]->type == op->src[2]->type);
 
     //GGML_ASSERT(ggml_are_same_shape (src1, src2));
@@ -4869,13 +4869,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-static ggml_metal_kargs_rope ggml_metal_op_rope_args(const ggml_tensor * op) {
+static ggml_metal_kargs_rope ggml_metal_op_rope_args(const ggml_tensor * op, const ggml_tensor * dst) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  dst,        ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  dst,        nb);
 
     GGML_ASSERT(ne10 % ne02 == 0);
     GGML_ASSERT(ne10 >= ne02);
@@ -4972,14 +4972,30 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
                 ggml_are_same_layout(op, rope);
 
             if (can_fuse) {
+                ggml_tensor * dst = rope;
+                int n_fuse = 2;
+
+                if (idx + 2 < ctx->n_nodes()) {
+                    const ggml_op fops_cast[] = { GGML_OP_RMS_NORM, GGML_OP_ROPE, GGML_OP_CPY };
+                    ggml_tensor * cast = ctx->node(idx + 2);
+                    if (ctx->can_fuse(idx, fops_cast, 3) && cast->src[0] == rope && cast->src[1] == cast &&
+                            cast->type == GGML_TYPE_F16 && ggml_are_same_shape(rope, cast) && ggml_is_contiguous(cast)) {
+                        dst = cast;
+                        n_fuse = 3;
+                    }
+                }
+
                 float eps;
                 memcpy(&eps, op->op_params, sizeof(float));
 
-                ggml_metal_kargs_rope args = ggml_metal_op_rope_args(rope);
-                auto pipeline = ggml_metal_library_get_pipeline_rms_norm_rope(lib);
+                ggml_metal_kargs_rope args = ggml_metal_op_rope_args(rope, dst);
+                auto pipeline = ggml_metal_library_get_pipeline_rms_norm_rope(lib, dst->type);
 
-                if (!ggml_metal_op_concurrency_check(ctx, rope)) {
-                    ggml_metal_op_concurrency_reset(ctx);
+                for (int i = 1; i < n_fuse; ++i) {
+                    if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                        ggml_metal_op_concurrency_reset(ctx);
+                        break;
+                    }
                 }
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -4987,16 +5003,16 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
                 ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rope->src[1]), 2);
                 ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rope->src[2] ? rope->src[2] : op->src[0]), 3);
-                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rope), 4);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst), 4);
                 ggml_metal_encoder_set_bytes   (enc, &eps, sizeof(eps), 5);
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
                 ggml_metal_encoder_dispatch_threadgroups(enc, args.ne01, args.ne02, args.ne03, 128, 1, 1);
 
                 if (debug_fusion > 1) {
-                    GGML_LOG_DEBUG("%s: fuse: RMS_NORM + ROPE\n", __func__);
+                    GGML_LOG_DEBUG("%s: fuse: RMS_NORM + ROPE%s\n", __func__, n_fuse == 3 ? " + CPY" : "");
                 }
 
-                return 2;
+                return n_fuse;
             }
         }
     }
@@ -5135,7 +5151,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    ggml_metal_kargs_rope args = ggml_metal_op_rope_args(op);
+    ggml_metal_kargs_rope args = ggml_metal_op_rope_args(op, op);
     const int nth = std::min(1024, (args.ne00 + 1)/2);
 
     auto pipeline = ggml_metal_library_get_pipeline_rope(lib, op);

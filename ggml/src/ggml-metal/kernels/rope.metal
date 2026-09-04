@@ -44,7 +44,8 @@ static void rope_yarn_corr_dims(
     dims[1] = min(n_dims - 1.0f, ceil(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
 }
 
-kernel void kernel_rms_norm_rope_f32_512(
+template<typename T4>
+kernel void kernel_rms_norm_rope_512(
         constant ggml_metal_kargs_rope & args,
         device const char * src0,
         device const char * src1,
@@ -105,9 +106,14 @@ kernel void kernel_rms_norm_rope_f32_512(
         }
     }
 
-    device float4 * dst_data = (device float4 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
-    dst_data[tiitg] = value;
+    device T4 * dst_data = (device T4 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
+    dst_data[tiitg] = (T4) value;
 }
+
+typedef decltype(kernel_rms_norm_rope_512<float4>) kernel_rms_norm_rope_512_t;
+
+template [[host_name("kernel_rms_norm_rope_f32_512")]] kernel kernel_rms_norm_rope_512_t kernel_rms_norm_rope_512<float4>;
+template [[host_name("kernel_rms_norm_rope_f16_512")]] kernel kernel_rms_norm_rope_512_t kernel_rms_norm_rope_512<half4>;
 
 template<typename T>
 kernel void kernel_rope_norm(

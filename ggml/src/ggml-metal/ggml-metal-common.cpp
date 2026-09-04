@@ -455,10 +455,25 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                 if (rope->src[0] == rms && rms->src[0]->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 &&
                         rope->type == GGML_TYPE_F32 && rms->ne[0] == 512 && mode == GGML_ROPE_TYPE_NORMAL &&
                         n_dims % 4 == 0 && n_offs % 4 == 0 && ggml_are_same_layout(rms->src[0], rms) &&
-                        ggml_are_same_layout(rms, rope) && ggml_can_fuse(gf, i, fops, 2)) {
-                    node.add_fused(gf->nodes[++i]);
-                    nodes.push_back(std::move(node));
-                    continue;
+                        ggml_are_same_layout(rms, rope)) {
+                    if (i + 2 < n) {
+                        const ggml_tensor * cast = gf->nodes[i + 2];
+                        const ggml_op fops_cast[] = { GGML_OP_RMS_NORM, GGML_OP_ROPE, GGML_OP_CPY };
+                        if (cast->op == GGML_OP_CPY && cast->src[0] == rope && cast->src[1] == cast &&
+                                cast->type == GGML_TYPE_F16 && ggml_are_same_shape(rope, cast) &&
+                                ggml_is_contiguous(cast) && ggml_can_fuse(gf, i, fops_cast, 3)) {
+                            node.add_fused(gf->nodes[++i]);
+                            node.add_fused(gf->nodes[++i]);
+                            nodes.push_back(std::move(node));
+                            continue;
+                        }
+                    }
+
+                    if (ggml_can_fuse(gf, i, fops, 2)) {
+                        node.add_fused(gf->nodes[++i]);
+                        nodes.push_back(std::move(node));
+                        continue;
+                    }
                 }
             }
         }
