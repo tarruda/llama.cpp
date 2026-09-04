@@ -571,6 +571,9 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_COMPRESS,
+        GGML_OP_DSV4_TOP_K_MASK,
+        GGML_OP_DSV4_SPARSE_PACK,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2463,6 +2466,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    GGML_API void ggml_flash_attn_ext_add_sinks_rows(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2627,6 +2634,35 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // DeepSeek V4 compressor weighted reduction.
+    // kv_state and score_state: [overlap ? 2*n_embd : n_embd, n_rows]
+    // read_idxs: [(overlap ? 2 : 1)*ratio*n_blocks]
+    // result: [n_embd, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * read_idxs,
+            int32_t               ratio,
+            bool                  overlap);
+
+    // Build the raw and selected compressed F16 attention mask.
+    GGML_API struct ggml_tensor * ggml_dsv4_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx);
+
+    // Pack selected DeepSeek V4 keys and their masks by query row.
+    GGML_API struct ggml_tensor * ggml_dsv4_sparse_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * comp_k,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx,
+            int64_t               n_raw);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

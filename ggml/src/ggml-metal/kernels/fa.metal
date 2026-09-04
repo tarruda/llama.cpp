@@ -144,20 +144,18 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     // detailed check of the elements of the block
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
+        const short nq_mask = args.ne31 == 1 ? 1 : Q;
+        FOR_UNROLL (short j = 0; j < nq_mask; ++j) {
+            device const half * mask_src = (device const half *) (mask + ((i1*Q + j)%args.ne31)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                 mmin = min(mmin, mask_src[ii*NW]);
                 mmax = max(mmax, mask_src[ii*NW]);
             }
-
-            mask_src += args.nb31/2;
         }
 
         mmin = simd_min(mmin);
@@ -187,6 +185,7 @@ constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
+constant bool FC_flash_attn_ext_scan_mask [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -297,7 +296,7 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = (device const half2 *) ((device const char *) mask + ((iq1 + j)%args.ne31)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
     {
@@ -401,7 +400,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         pm2[jj] = (device const half2 *) ((device const half *) mask +
-                                (iq1 + j)*C +
+                                ((iq1 + j)%args.ne31)*C +
                                 (iq2%args.ne32)*(C*args.ne31) +
                                 (iq3%args.ne33)*(C*args.ne31*args.ne32));
                     }
@@ -414,7 +413,7 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                blk_cur = FC_flash_attn_ext_scan_mask ? blk[ic0] : 1;
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -429,7 +428,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            sm2[j*SH + tiisg] = args.ne31 == 1 || (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
                         }
@@ -792,7 +791,8 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1 + j : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -1313,7 +1313,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        device const half * pm_base = (device const half *) (mask + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         // sparse indices: the list of finite mask entries per query row
         // the sparse path requires Q == 1 (enforced by the host)
@@ -1347,7 +1347,7 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 // padded query rows clamp to row 0 of the mask to avoid OOB; their scores
                 // are forced to -inf below, so the values never affect the result.
-                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? ((iq1*Q + qq)%args.ne31)*(args.nb31/sizeof(half)) : 0);
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -1371,7 +1371,7 @@ kernel void kernel_flash_attn_ext_vec(
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
-                            (iq1*Q + qq)*C +
+                            ((iq1*Q + qq)%args.ne31)*C +
                             (iq2%args.ne32)*(C*args.ne31) +
                             (iq3%args.ne33)*(C*args.ne31*args.ne32);
                     }
@@ -1697,7 +1697,8 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1*Q + qq : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 
@@ -2298,7 +2299,8 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 template<
     typename kd4x4_t,
     short nl_k,
-    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &)>
+    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &),
+    bool direct_k>
 kernel void kernel_lightning_indexer(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,
@@ -2325,38 +2327,48 @@ kernel void kernel_lightning_indexer(
     constexpr short NTG = 32*NSG;    // threads per threadgroup
 
     const int i_stream = tgpig.z;
-    const int i_kv_0   = tgpig.x*NK;            // first key of this threadgroup
+    const int i_kv_0   = args.kv_offset + tgpig.x*NK; // first key of this threadgroup
     const int i_kv     = i_kv_0 + sgitg*NKPSG;  // first key of this simdgroup
 
-    threadgroup half sk[NK * DK16 * 16];
-    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) sk;
-
-    for (short i = tiitg; i < NK*DK16; i += NTG) {
-        const short ik  = i/DK16;
-        const short i16 = i%DK16;
-
-        half4x4 tmp;
-
-        if (i_kv_0 + ik < args.n_kv) {
-            device const kd4x4_t * kr = (device const kd4x4_t *) (k + (i_kv_0 + ik)*args.nbk2 + i_stream*args.nbk3);
-
-            deq_k(kr + i16/nl_k, i16%nl_k, tmp);
-        } else {
-            FOR_UNROLL (short j = 0; j < 4; ++j) {
-                tmp[j] = half4(0.0h);
-            }
-        }
-
-        sk4x4[i] = tmp;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // K tile of this simdgroup, transposed to [DK, NKPSG]
     simdgroup_half8x8 mk[DK8];
 
-    FOR_UNROLL (short i = 0; i < DK8; ++i) {
-        simdgroup_load(mk[i], sk + sgitg*NKPSG*DK + 8*i, DK, 0, true);
+    threadgroup half sk[direct_k ? 1 : NK * DK16 * 16];
+    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) sk;
+
+    if (direct_k) {
+        device const half * pk = (device const half *) (k + i_kv*args.nbk2 + i_stream*args.nbk3);
+
+        FOR_UNROLL (short i = 0; i < DK8; ++i) {
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mk[i], pk + 8*i, args.nbk2/sizeof(half), 0, true);
+            simdgroup_barrier(mem_flags::mem_none);
+        }
+    } else {
+        for (short i = tiitg; i < NK*DK16; i += NTG) {
+            const short ik  = i/DK16;
+            const short i16 = i%DK16;
+
+            half4x4 tmp;
+
+            if (i_kv_0 + ik < args.n_kv) {
+                device const kd4x4_t * kr = (device const kd4x4_t *) (k + (i_kv_0 + ik)*args.nbk2 + i_stream*args.nbk3);
+
+                deq_k(kr + i16/nl_k, i16%nl_k, tmp);
+            } else {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    tmp[j] = half4(0.0h);
+                }
+            }
+
+            sk4x4[i] = tmp;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // K tile of this simdgroup, transposed to [DK, NKPSG]
+        FOR_UNROLL (short i = 0; i < DK8; ++i) {
+            simdgroup_load(mk[i], sk + sgitg*NKPSG*DK + 8*i, DK, 0, true);
+        }
     }
 
     threadgroup half4   sq4[NHPTG*DK4];
@@ -2429,17 +2441,18 @@ kernel void kernel_lightning_indexer(
     }
 }
 
-typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_t;
+typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16, false>) kernel_lightning_indexer_t;
 
-template [[host_name("kernel_lightning_indexer_f32")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<float4x4, 1, dequantize_f32>;
-template [[host_name("kernel_lightning_indexer_f16")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16>;
+template [[host_name("kernel_lightning_indexer_f32")]]        kernel kernel_lightning_indexer_t kernel_lightning_indexer<float4x4, 1, dequantize_f32, false>;
+template [[host_name("kernel_lightning_indexer_f16")]]        kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16, false>;
+template [[host_name("kernel_lightning_indexer_f16_direct")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16, true>;
 
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<bfloat4x4, 1, dequantize_bf16>;
+template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<bfloat4x4, 1, dequantize_bf16, false>;
 #endif
 
-template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_0, 2, dequantize_q4_0>;
-template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_1, 2, dequantize_q4_1>;
-template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
-template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
-template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_0, 2, dequantize_q4_0, false>;
+template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_1, 2, dequantize_q4_1, false>;
+template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0, false>;
+template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1, false>;
+template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0, false>;

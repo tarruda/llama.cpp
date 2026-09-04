@@ -95,6 +95,11 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
         }
 
+        if (FC_OP == OP_UNARY_NUM_SIGMOID_SCALE) {
+            const TC sigmoid = 1 / (1 + exp(-x));
+            dst_ptr[i0] = (T) (args.scale * sigmoid + args.bias);
+        }
+
         if (FC_OP == OP_UNARY_NUM_GELU) {
             dst_ptr[i0] = (T) (0.5*x*(1 + precise::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
         }

@@ -1769,6 +1769,40 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
+        case GGML_OP_DSV4_COMPRESS:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->type         == GGML_TYPE_F32 &&
+                (ggml_get_op_params_i32(op, 1) ? 2 : 1)*ggml_get_op_params_i32(op, 0) <= 128 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]);
+        case GGML_OP_DSV4_TOP_K_MASK:
+            return op->src[0]->type == GGML_TYPE_F16 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->type         == GGML_TYPE_F16 &&
+                op->src[2]->ne[0] <= op->src[1]->ne[0] &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_DSV4_SPARSE_PACK:
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                op->src[1]->type == op->src[0]->type &&
+                op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[3]->type == GGML_TYPE_F16 &&
+                op->src[4]->type == GGML_TYPE_I32 &&
+                op->type         == GGML_TYPE_F16 &&
+                op->src[0]->ne[0] == 512 &&
+                ggml_get_op_params_i32(op, 0) <= 128 &&
+                ggml_get_op_params_i32(op, 0) + op->src[4]->ne[0] <= 128 + 512 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) &&
+                ggml_is_contiguous_rows(op->src[3]) &&
+                ggml_is_contiguous_rows(op->src[4]);
         case GGML_OP_DSV4_HC_COMB:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_F32 &&
