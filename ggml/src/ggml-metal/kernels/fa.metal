@@ -502,7 +502,7 @@ void kernel_flash_attn_ext_impl(
                         q8x8_t mq[2];
 
                         // note: too much unroll can tank the performance for large heads
-                        #pragma unroll (MIN(DK8/2, 4*NSG))
+                        #pragma unroll (MIN(DK8/2, DK >= 512 ? 4 : 4*NSG))
                         for (short i = 0; i < DK8/2; ++i) {
                             simdgroup_barrier(mem_flags::mem_none);
 
@@ -643,76 +643,82 @@ void kernel_flash_attn_ext_impl(
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
+                    constexpr short NO_TILE = DV >= 512 ? 8 : NO;
+                    static_assert(NO % NO_TILE == 0, "");
 
-                    o8x8_t lo[NO];
+                    #pragma unroll (1)
+                    for (short ib = 0; ib < NO/NO_TILE; ++ib) {
+                        const short io = ib*NO_TILE;
+                        o8x8_t lo[NO_TILE];
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            auto sot = so + 8*sgitg + 8*NSG*io;
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_load(lo[ii], sot, PV, 0, false);
+                            FOR_UNROLL (short ii = 0; ii < NO_TILE; ++ii) {
+                                simdgroup_load(lo[ii], sot, PV, 0, false);
 
-                            sot += 8*NSG;
-                        }
-                    }
-
-                    {
-                        device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
-
-                        pv += 8*sgitg;
-
-                        if (DV <= 64) {
-                            FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
-                                s8x8_t vs;
-                                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[2];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
-                                }
-
-                                pv  += 8*NS20;
-                            }
-                        } else {
-                            constexpr short NC = (C/8)/2;
-
-                            FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                                s8x8_t vs[2];
-
-                                simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
-                                simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[4];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
-                                }
-
-                                pv  += 2*8*NS20;
+                                sot += 8*NSG;
                             }
                         }
-                    }
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_store(lo[ii], sot, PV, 0, false);
+                            pv += 8*sgitg + 8*NSG*io;
 
-                            sot += 8*NSG;
+                            if (DV <= 64) {
+                                FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                                    s8x8_t vs;
+                                    simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO_TILE/2; ++ii) {
+                                        v8x8_t mv[2];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 8*NS20;
+                                }
+                            } else {
+                                constexpr short NC = (C/8)/2;
+
+                                FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                                    s8x8_t vs[2];
+
+                                    simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+                                    simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO_TILE/2; ++ii) {
+                                        v8x8_t mv[4];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 2*8*NS20;
+                                }
+                            }
+                        }
+
+                        {
+                            auto sot = so + 8*sgitg + 8*NSG*io;
+
+                            FOR_UNROLL (short ii = 0; ii < NO_TILE; ++ii) {
+                                simdgroup_store(lo[ii], sot, PV, 0, false);
+
+                                sot += 8*NSG;
+                            }
                         }
                     }
                 } else {
