@@ -2008,6 +2008,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_rope(ggml_metal_library_t lib) {
+    const char * base = "kernel_rms_norm_rope_f32_512";
+    const char * name = "kernel_rms_norm_rope_f32_512_imrope=0_is_back=0";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 0);
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 1);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK);
 

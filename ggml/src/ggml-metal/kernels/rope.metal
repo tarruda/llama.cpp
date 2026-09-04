@@ -44,6 +44,71 @@ static void rope_yarn_corr_dims(
     dims[1] = min(n_dims - 1.0f, ceil(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
 }
 
+kernel void kernel_rms_norm_rope_f32_512(
+        constant ggml_metal_kargs_rope & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        constant float & eps,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        uint3   tgpig[[threadgroup_position_in_grid]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+    const int i0 = 4*tiitg;
+
+    device const float4 * src = (device const float4 *) (src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01);
+    float4 value = src[tiitg];
+    float sumf = simd_sum(dot(value, value));
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(shmem_f32[tiisg]);
+    value *= 1.0f/sqrt(sumf/512.0f + eps);
+
+    if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+        float corr_dims[2];
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+        device const int32_t * pos = (device const int32_t *) src1;
+        const float theta_base = (float) pos[i2];
+        const float inv_ndims = -1.0f/args.n_dims;
+
+        for (int j = 0; j < 4; j += 2) {
+            const int iw = i0 + j - args.n_offs;
+            const int ic = iw/2;
+            const float theta = theta_base*pow(args.freq_base, inv_ndims*iw);
+            const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
+
+            float cos_theta;
+            float sin_theta;
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+
+            const float x0 = value[j + 0];
+            const float x1 = value[j + 1];
+            value[j + 0] = x0*cos_theta - x1*sin_theta;
+            value[j + 1] = x0*sin_theta + x1*cos_theta;
+        }
+    }
+
+    device float4 * dst_data = (device float4 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
+    dst_data[tiitg] = value;
+}
+
 template<typename T>
 kernel void kernel_rope_norm(
         constant ggml_metal_kargs_rope & args,

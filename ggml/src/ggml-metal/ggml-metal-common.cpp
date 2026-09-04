@@ -443,6 +443,26 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             }
         }
 
+        if (node.op() == GGML_OP_RMS_NORM && i + 1 < n) {
+            const ggml_tensor * rms  = node.node;
+            const ggml_tensor * rope = gf->nodes[i + 1];
+            if (rope->op == GGML_OP_ROPE) {
+                const int mode   = ((const int32_t *) rope->op_params)[2];
+                const int n_dims = ((const int32_t *) rope->op_params)[1];
+                const int n_offs = ((const int32_t *) rope->op_params)[15];
+                const ggml_op fops[] = { GGML_OP_RMS_NORM, GGML_OP_ROPE };
+
+                if (rope->src[0] == rms && rms->src[0]->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 &&
+                        rope->type == GGML_TYPE_F32 && rms->ne[0] == 512 && mode == GGML_ROPE_TYPE_NORMAL &&
+                        n_dims % 4 == 0 && n_offs % 4 == 0 && ggml_are_same_layout(rms->src[0], rms) &&
+                        ggml_are_same_layout(rms, rope) && ggml_can_fuse(gf, i, fops, 2)) {
+                    node.add_fused(gf->nodes[++i]);
+                    nodes.push_back(std::move(node));
+                    continue;
+                }
+            }
+        }
+
         // fuse only ops that start with these operations
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||
