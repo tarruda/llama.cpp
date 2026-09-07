@@ -1266,6 +1266,7 @@ typedef struct {
     int32_t  n_kv;
     int32_t  n_batch;
     int32_t  mask_ne3;
+    int32_t  kv_offset;
     uint64_t nb1;
     uint64_t nb3;
     uint64_t nbq1;
@@ -1294,6 +1295,58 @@ typedef struct {
 
 typedef struct {
     int32_t  n_embd;
+    int32_t  n_blocks;
+    int32_t  n_rows;
+    int32_t  ratio;
+    int32_t  overlap;
+    uint64_t nb_k0;
+    uint64_t nb_k1;
+    uint64_t nb_s0;
+    uint64_t nb_s1;
+    uint64_t nb_i0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_compress;
+
+typedef struct {
+    int32_t  n_raw;
+    int32_t  n_comp;
+    int32_t  n_select;
+    int32_t  n_query;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_dsv4_top_k_mask;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_batch;
+    int32_t  n_raw;
+    int32_t  n_raw_k;
+    int32_t  n_comp;
+    uint64_t nb_rk2;
+    uint64_t nb_rk3;
+    uint64_t nb_ck2;
+    uint64_t nb_ck3;
+    uint64_t nb_rm0;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm0;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci0;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_sparse_pack;
+
+typedef struct {
+    int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;
     uint64_t nb_x1;
@@ -1303,6 +1356,20 @@ typedef struct {
     uint64_t nb_d0;
     uint64_t nb_d1;
 } ggml_metal_kargs_dsv4_hc_pre;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_n0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_pre_norm;
 
 typedef struct {
     int32_t  n_embd;
@@ -1321,6 +1388,14 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_tokens;
+    uint64_t nb_x1;
+    uint64_t nb_d1;
+    float    post_scale;
+    float    post_bias;
+} ggml_metal_kargs_dsv4_hc_affine;
 
 typedef struct {
     int32_t  ne00;

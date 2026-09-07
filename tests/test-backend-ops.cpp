@@ -4485,7 +4485,7 @@ struct test_dsv4_hc : public test_case {
         if (name == "post") {
             lo = 0.0f; hi = 2.0f; return true;
         }
-        if (name == "x" || name == "residual") {
+        if (name == "x" || name == "y" || name == "residual") {
             lo = -1.0f; hi = 1.0f; return true;
         }
         return false;
@@ -4510,6 +4510,41 @@ struct test_dsv4_hc : public test_case {
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
         }
+    }
+};
+
+struct test_dsv4_hc_affine : public test_case {
+    const int64_t n_tokens;
+    const float post_scale;
+    const float post_bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_AFFINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, post_scale, post_bias);
+    }
+
+    test_dsv4_hc_affine(int64_t n_tokens, float post_scale, float post_bias)
+        : n_tokens(n_tokens), post_scale(post_scale), post_bias(post_bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, n_tokens);
+        ggml_tensor * x = ggml_view_2d(ctx, mixes, 4, n_tokens, mixes->nb[1], 8*sizeof(float));
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+
+        ggml_tensor * out = ggml_mul(ctx, x, scale);
+        out = ggml_add(ctx, out, base);
+        out = ggml_sigmoid(ctx, out);
+        out = ggml_scale_bias(ctx, out, post_scale, post_bias);
+        ggml_set_name(out, "out");
+
+        return out;
     }
 };
 
@@ -4575,9 +4610,49 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+struct test_dsv4_hc_pre_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_NORM";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, eps);
+    }
+
+    test_dsv4_hc_pre_norm(int64_t n_embd = 4096, int64_t n_tokens = 17, float eps = 1e-6f)
+        : n_embd(n_embd), n_tokens(n_tokens), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm, "norm");
+
+        out = ggml_dsv4_hc_pre(ctx, x, weights);
+        out = ggml_rms_norm(ctx, out, eps);
+        out = ggml_mul(ctx, out, norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
+    const bool fuse_add;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4585,15 +4660,23 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
+        return VARS_TO_STR3(n_embd, n_tokens, fuse_add);
     }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17)
-        : n_embd(n_embd), n_tokens(n_tokens) {}
+    bool run_whole_graph() override { return fuse_add; }
+
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool fuse_add = false)
+        : n_embd(n_embd), n_tokens(n_tokens), fuse_add(fuse_add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(x, "x");
+
+        if (fuse_add) {
+            ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(y, "y");
+            x = ggml_add(ctx, x, y);
+        }
 
         ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
         ggml_set_name(residual, "residual");
@@ -9348,15 +9431,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    test_cases.emplace_back(new test_dsv4_hc_affine(1, 1.0f, 1e-6f));
+    test_cases.emplace_back(new test_dsv4_hc_affine(17, 2.0f, 0.0f));
+
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
+    test_cases.emplace_back(new test_dsv4_hc_pre_norm(4096, 21));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(7168, 1, true));
+
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
