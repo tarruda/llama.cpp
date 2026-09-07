@@ -436,6 +436,54 @@ template [[host_name("kernel_fwht_f32_128")]] kernel kernel_fwht_t kernel_fwht_f
 template [[host_name("kernel_fwht_f32_256")]] kernel kernel_fwht_t kernel_fwht_f32<256>;
 template [[host_name("kernel_fwht_f32_512")]] kernel kernel_fwht_t kernel_fwht_f32<512>;
 
+kernel void kernel_moe_combine_f32(
+        constant ggml_metal_kargs_moe_combine & args,
+        device const float * experts,
+        device const float * weights,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const int it = tgpig.y;
+    const int i0 = (int) tgpig.x*32 + tiisg;
+
+    const float weight_lane = tiisg < args.n_expert ? weights[it*args.n_expert + tiisg] : 0.0f;
+    float result = 0.0f;
+    for (int ie = 0; ie < args.n_expert; ++ie) {
+        const float weight = simd_shuffle(weight_lane, ie);
+        if (i0 < args.n_embd) {
+            const int idx = (it*args.n_expert + ie)*args.n_embd + i0;
+            result = fma(experts[idx], weight, result);
+        }
+    }
+
+    if (i0 < args.n_embd) {
+        dst[it*args.n_embd + i0] = result;
+    }
+}
+
+kernel void kernel_moe_weights_f32(
+        constant ggml_metal_kargs_moe_weights & args,
+        device const char * probs,
+        device const char * ids,
+        device       char * dst,
+        uint    it[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    if (it >= args.n_tokens) {
+        return;
+    }
+
+    float weight = 0.0f;
+    if (tiisg < args.n_expert_used) {
+        const int32_t id = *(device const int32_t *) (ids + tiisg*args.nb_i0 + it*args.nb_i1);
+        weight = *(device const float *) (probs + id*args.nb_p1 + it*args.nb_p2);
+    }
+
+    const float sum = clamp(simd_sum(weight), args.clamp_min, args.clamp_max);
+    if (tiisg < args.n_expert_used) {
+        *(device float *) (dst + tiisg*args.nb_d1 + it*args.nb_d2) = weight/sum*args.scale + args.bias;
+    }
+}
+
 kernel void kernel_dsv4_hc_comb_f32(
         constant ggml_metal_kargs_dsv4_hc_comb & args,
         device const char * mixes,

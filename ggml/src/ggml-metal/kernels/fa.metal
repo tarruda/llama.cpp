@@ -144,20 +144,18 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     // detailed check of the elements of the block
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
+        const short nq_mask = args.ne31 == 1 ? 1 : Q;
+        FOR_UNROLL (short j = 0; j < nq_mask; ++j) {
+            device const half * mask_src = (device const half *) (mask + ((i1*Q + j)%args.ne31)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                 mmin = min(mmin, mask_src[ii*NW]);
                 mmax = max(mmax, mask_src[ii*NW]);
             }
-
-            mask_src += args.nb31/2;
         }
 
         mmin = simd_min(mmin);
@@ -185,8 +183,10 @@ constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_q_f16     [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
+constant bool FC_flash_attn_ext_scan_mask [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -297,7 +297,7 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = (device const half2 *) ((device const char *) mask + ((iq1 + j)%args.ne31)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
     {
@@ -321,13 +321,23 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
-
-        for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
-                sq4[j*DK4 + i] = (q4_t) q4[i];
-            } else {
-                sq4[j*DK4 + i] = 0;
+        if (FC_flash_attn_ext_q_f16) {
+            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
+            }
+        } else {
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
             }
         }
     }
@@ -401,7 +411,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         pm2[jj] = (device const half2 *) ((device const half *) mask +
-                                (iq1 + j)*C +
+                                ((iq1 + j)%args.ne31)*C +
                                 (iq2%args.ne32)*(C*args.ne31) +
                                 (iq3%args.ne33)*(C*args.ne31*args.ne32));
                     }
@@ -414,7 +424,7 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                blk_cur = FC_flash_attn_ext_scan_mask ? blk[ic0] : 1;
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -429,7 +439,7 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            sm2[j*SH + tiisg] = args.ne31 == 1 || (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
                         }
@@ -503,7 +513,7 @@ void kernel_flash_attn_ext_impl(
                         q8x8_t mq[2];
 
                         // note: too much unroll can tank the performance for large heads
-                        #pragma unroll (MIN(DK8/2, 4*NSG))
+                        #pragma unroll (MIN(DK8/2, DK >= 512 ? 4 : 4*NSG))
                         for (short i = 0; i < DK8/2; ++i) {
                             simdgroup_barrier(mem_flags::mem_none);
 
@@ -644,76 +654,82 @@ void kernel_flash_attn_ext_impl(
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
+                    constexpr short NO_TILE = DV >= 512 ? 8 : NO;
+                    static_assert(NO % NO_TILE == 0, "");
 
-                    o8x8_t lo[NO];
+                    #pragma unroll (1)
+                    for (short ib = 0; ib < NO/NO_TILE; ++ib) {
+                        const short io = ib*NO_TILE;
+                        o8x8_t lo[NO_TILE];
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            auto sot = so + 8*sgitg + 8*NSG*io;
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_load(lo[ii], sot, PV, 0, false);
+                            FOR_UNROLL (short ii = 0; ii < NO_TILE; ++ii) {
+                                simdgroup_load(lo[ii], sot, PV, 0, false);
 
-                            sot += 8*NSG;
-                        }
-                    }
-
-                    {
-                        device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
-
-                        pv += 8*sgitg;
-
-                        if (DV <= 64) {
-                            FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
-                                s8x8_t vs;
-                                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[2];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
-                                }
-
-                                pv  += 8*NS20;
-                            }
-                        } else {
-                            constexpr short NC = (C/8)/2;
-
-                            FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                                s8x8_t vs[2];
-
-                                simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
-                                simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[4];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
-                                }
-
-                                pv  += 2*8*NS20;
+                                sot += 8*NSG;
                             }
                         }
-                    }
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_store(lo[ii], sot, PV, 0, false);
+                            pv += 8*sgitg + 8*NSG*io;
 
-                            sot += 8*NSG;
+                            if (DV <= 64) {
+                                FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                                    s8x8_t vs;
+                                    simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO_TILE/2; ++ii) {
+                                        v8x8_t mv[2];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 8*NS20;
+                                }
+                            } else {
+                                constexpr short NC = (C/8)/2;
+
+                                FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                                    s8x8_t vs[2];
+
+                                    simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+                                    simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO_TILE/2; ++ii) {
+                                        v8x8_t mv[4];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 2*8*NS20;
+                                }
+                            }
+                        }
+
+                        {
+                            auto sot = so + 8*sgitg + 8*NSG*io;
+
+                            FOR_UNROLL (short ii = 0; ii < NO_TILE; ++ii) {
+                                simdgroup_store(lo[ii], sot, PV, 0, false);
+
+                                sot += 8*NSG;
+                            }
                         }
                     }
                 } else {
@@ -792,7 +808,8 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1 + j : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -1062,6 +1079,7 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+constant bool FC_flash_attn_ext_vec_q_f16     [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 
 //constant float FC_flash_attn_ext_vec_scale         [[function_constant(FC_FLASH_ATTN_EXT_VEC + 10)]];
 //constant float FC_flash_attn_ext_vec_max_bias      [[function_constant(FC_FLASH_ATTN_EXT_VEC + 11)]];
@@ -1269,13 +1287,24 @@ kernel void kernel_flash_attn_ext_vec(
     {
         for (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
-            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
             if (iq1_q < args.ne01) {
-                for (short i = tiisg; i < PK4; i += NW) {
-                    if (i < DK4) {
-                        sq4[qq*PK4 + i] = (q4_t) q4[i];
-                    } else {
-                        sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                if (FC_flash_attn_ext_vec_q_f16) {
+                    device const half4 * q4 = (device const half4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
+                    }
+                } else {
+                    device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
                     }
                 }
             } else {
@@ -1313,7 +1342,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        device const half * pm_base = (device const half *) (mask + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         // sparse indices: the list of finite mask entries per query row
         // the sparse path requires Q == 1 (enforced by the host)
@@ -1347,7 +1376,7 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 // padded query rows clamp to row 0 of the mask to avoid OOB; their scores
                 // are forced to -inf below, so the values never affect the result.
-                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? ((iq1*Q + qq)%args.ne31)*(args.nb31/sizeof(half)) : 0);
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -1371,7 +1400,7 @@ kernel void kernel_flash_attn_ext_vec(
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
-                            (iq1*Q + qq)*C +
+                            ((iq1*Q + qq)%args.ne31)*C +
                             (iq2%args.ne32)*(C*args.ne31) +
                             (iq3%args.ne33)*(C*args.ne31*args.ne32);
                     }
@@ -1697,7 +1726,8 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1*Q + qq : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 

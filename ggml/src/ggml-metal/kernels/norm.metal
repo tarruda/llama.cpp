@@ -74,7 +74,7 @@ kernel void kernel_norm_fuse_impl(
 
     const float variance = sumf/args.ne00;
 
-    const float scale = 1.0f/sqrt(variance + args.eps);
+    const float scale = args.post_scale/sqrt(variance + args.eps);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         if (F == 1) {
             y[i00] = (y[i00]*scale);
@@ -147,7 +147,7 @@ kernel void kernel_rms_norm_fuse_impl(
     sumf = simd_sum(sumf);
 
     const float mean  = sumf/args.ne00;
-    const float scale = 1.0f/sqrt(mean + args.eps);
+    const float scale = args.post_scale/sqrt(mean + args.eps);
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {

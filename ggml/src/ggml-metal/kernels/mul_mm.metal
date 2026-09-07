@@ -7,6 +7,8 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+constant bool FC_mul_mm_id_compact [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_tall       [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -157,10 +159,11 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    const int NR0 = FC_mul_mm_tall ? 128 : 64;
 
-    constexpr int NR0 = 64;
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*32*sizeof(S0));
+
     constexpr int NR1 = 32;
 
     constexpr int NK  = 32;
@@ -171,12 +174,12 @@ kernel void kernel_mul_mm(
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*NR1;
 
-    // if this block is of 64x32 shape or smaller
+    // clamp partial output tiles
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
 
     // a thread shouldn't load data outside of the matrix
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
 
     const short il0 = (tiitg % NL0);
@@ -223,7 +226,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
             }
@@ -242,7 +245,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 // NOTE: this is massively slower.. WTF?
                 //sa[64*ib + 8*ly + lx] = temp_a[i/4][i%4];
@@ -251,7 +254,7 @@ kernel void kernel_mul_mm(
             }
         }
 
-        if (FC_mul_mm_bc_inp) {
+        if ((!FC_mul_mm_tall || tiitg < 128) && FC_mul_mm_bc_inp) {
             for (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
@@ -265,7 +268,7 @@ kernel void kernel_mul_mm(
 
                 *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
             }
-        } else {
+        } else if (!FC_mul_mm_tall || tiitg < 128) {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
 
@@ -287,8 +290,8 @@ kernel void kernel_mul_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // load matrices from threadgroup memory and conduct outer products
-        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
-        threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
+        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%(NR0/32)));
+        threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/(NR0/32)));
 
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
@@ -309,7 +312,7 @@ kernel void kernel_mul_mm(
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
 
-            lsma += 8*64;
+            lsma += (NR0/8)*64;
             lsmb += 4*64;
         }
     }
@@ -317,17 +320,17 @@ kernel void kernel_mul_mm(
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
-            (r0 + 32*(sgitg &  1)) + \
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (r0 + 32*(sgitg % (NR0/32))) + \
+            (r1 + 16*(sgitg / (NR0/32))) * args.ne0 + im*args.ne1*args.ne0;
 
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
         }
     } else {
-        // block is smaller than 64x32, we should avoid writing data outside of the matrix
+        // stage partial tiles to avoid out-of-bounds writes
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg%(NR0/32)) + (16*(sgitg / (NR0/32)))*NR0;
 
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -425,6 +428,80 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+template<short ne20>
+kernel void kernel_mul_mm_id_map0_parallel(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device  const char * src2,
+        device        char * htpe,
+        device        char * hids,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint   tiitg[[thread_index_in_threadgroup]],
+        uint3    ntg[[threads_per_threadgroup]]) {
+    const int ide = tgpig.x;
+    const int n_ids = args.ne21*ne20;
+
+    threadgroup atomic_uint n_all;
+    if (tiitg == 0) {
+        atomic_store_explicit(&n_all, 0u, memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+    for (int idx = tiitg; idx < n_ids; idx += ntg.x) {
+        const int i21 = idx/ne20;
+        const int i20 = idx - i21*ne20;
+        device const int32_t * src2_i32 = (device const int32_t *) (src2 + i21*args.nb21);
+
+        if (src2_i32[i20] == ide) {
+            const uint32_t pos = atomic_fetch_add_explicit(&n_all, 1u, memory_order_relaxed);
+            ids_i32[pos] = idx;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        device uint32_t * tpe_u32 = (device uint32_t *) htpe;
+        tpe_u32[ide] = atomic_load_explicit(&n_all, memory_order_relaxed);
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_map0_parallel<1>) kernel_mul_mm_id_map0_parallel_t;
+
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_1" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<1>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_2" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<2>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_4" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<4>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_5" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<5>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_6" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<6>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_8" )]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<8>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_10")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<10>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_16")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<16>;
+template [[host_name("kernel_mul_mm_id_map0_parallel_ne20_22")]] kernel kernel_mul_mm_id_map0_parallel_t kernel_mul_mm_id_map0_parallel<22>;
+
+kernel void kernel_mul_mm_id_map1(
+        constant int32_t  & ne02,
+        device const char * htpe,
+        device       char * htasks,
+        uint tiitg[[thread_index_in_threadgroup]]) {
+    if (tiitg != 0) {
+        return;
+    }
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
+    device uint32_t * tasks = (device uint32_t *) htasks;
+
+    uint n_tasks = 0;
+    for (int im = 0; im < ne02; ++im) {
+        for (uint r1 = 0; r1 < tpe_u32[im]; r1 += 32) {
+            tasks[2*n_tasks + 1] = im;
+            tasks[2*n_tasks + 2] = r1;
+            ++n_tasks;
+        }
+    }
+    tasks[0] = n_tasks;
+}
+
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
@@ -432,10 +509,11 @@ kernel void kernel_mul_mm_id(
         device const char * src1,
         device const char * htpe,
         device const char * hids,
+        device const char * htasks,
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
+        uint   tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
@@ -452,12 +530,26 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    int im;
+    int r0;
+    int r1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    if (FC_mul_mm_id_compact) {
+        device const uint32_t * tasks = (device const uint32_t *) htasks;
+        if (tgpig.y >= tasks[0]) {
+            return;
+        }
+        im = tasks[2*tgpig.y + 1];
+        r1 = tasks[2*tgpig.y + 2];
+        r0 = tgpig.x*NR0;
+    } else {
+        im = tgpig.z;
+        r1 = tgpig.x*NR1;
+        r0 = tgpig.y*NR0;
+    }
 
     const int32_t neh1 = tpe_u32[im];
 
@@ -509,12 +601,13 @@ kernel void kernel_mul_mm_id(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    const bool sg_active = has_hi || sgitg < 2;
+    if (sg_active) {
+        for (short i = 0; i < 8; i++) {
+            mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
     }
 
-    // simdgroups 2,3 own rows NR1H..NR1-1
-    const bool sg_active = has_hi || sgitg < 2;
 #else
     auto tA  = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
 
@@ -574,7 +667,7 @@ kernel void kernel_mul_mm_id(
             }
         }
 
-        if (FC_mul_mm_bc_inp) {
+        if ((!FC_mul_mm_id_compact || tiitg < 64 || nr1 > 16) && FC_mul_mm_bc_inp) {
             for (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
@@ -588,7 +681,7 @@ kernel void kernel_mul_mm_id(
 
                 *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
             }
-        } else {
+        } else if (!FC_mul_mm_id_compact || tiitg < 64 || nr1 > 16) {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
 

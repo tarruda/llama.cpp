@@ -138,6 +138,9 @@
 #define OP_UNARY_NUM_COS        16
 #define OP_UNARY_NUM_LOG        17
 #define OP_UNARY_NUM_LEAKY_RELU 18
+#define OP_UNARY_NUM_SIGMOID_SCALE 19
+#define OP_UNARY_NUM_SOFTPLUS_SQRT 20
+#define OP_UNARY_NUM_SCALE_SILU 21
 
 #define OP_UNARY_NUM_TANH        100
 #define OP_UNARY_NUM_RELU        101
@@ -257,6 +260,27 @@ typedef struct {
     uint64_t offs;
     uint64_t o1[8];
 } ggml_metal_kargs_bin;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_expert;
+    int32_t n_tokens;
+} ggml_metal_kargs_moe_combine;
+
+typedef struct {
+    int32_t  n_expert_used;
+    int32_t  n_tokens;
+    uint64_t nb_p1;
+    uint64_t nb_p2;
+    uint64_t nb_i0;
+    uint64_t nb_i1;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+    float    clamp_min;
+    float    clamp_max;
+    float    scale;
+    float    bias;
+} ggml_metal_kargs_moe_weights;
 
 typedef struct {
     int64_t ne0;
@@ -429,6 +453,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
@@ -464,6 +489,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;
@@ -612,6 +638,7 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    post_scale;
 } ggml_metal_kargs_norm;
 
 typedef struct {

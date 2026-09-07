@@ -17,7 +17,7 @@ extern "C" {
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 32
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks only; used by the graph optimizer, at which point the graph
@@ -30,6 +30,15 @@ typedef enum ggml_metal_fusion_mode {
 // identifier of each fusion pattern so the op encoders know which kernel to use
 typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NONE = 0,
+    GGML_METAL_FUSION_SCALE_SILU,
+    GGML_METAL_FUSION_SIGMOID_SCALE,
+    GGML_METAL_FUSION_SOFTPLUS_SQRT,
+    GGML_METAL_FUSION_NORM_SCALE,
+    GGML_METAL_FUSION_RMS_NORM_ROPE,
+    GGML_METAL_FUSION_RMS_NORM_ROPE_CPY,
+    GGML_METAL_FUSION_MOE_WEIGHTS,
+    GGML_METAL_FUSION_MOE_COMBINE,
+
     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
@@ -37,20 +46,26 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_GDN_CACHE,    // GATED_DELTA_NET + CPY (write snapshots into the recurrent cache)
 } ggml_metal_fusion_id;
 
+typedef enum ggml_metal_fusion_kind {
+    GGML_METAL_FUSION_CHAIN = 0,
+    GGML_METAL_FUSION_SUBGRAPH,
+    GGML_METAL_FUSION_UNSAFE,
+} ggml_metal_fusion_kind;
+
 struct ggml_metal_fusion {
     ggml_metal_fusion_id id;
 
     const enum ggml_op * ops;        // op sequence (fixed length)
     int                  n_ops;      // number of ops
 
-    // if unsafe: the generic chain/shape + ggml_can_fuse_subgraph checks are skipped and the
-    // check callback below is the sole validator (used for patterns that are not elision chains,
-    // e.g. the gdn + cache-cpy write-through fusion)
-    bool unsafe;
+    // SUBGRAPH includes intermediate views; UNSAFE relies on the callback for use checks.
+    ggml_metal_fusion_kind kind;
 
     // extra backend constraints on top of ggml_can_fuse_subgraph
     // nodes[j] is the j-th node of the pattern
     bool (*check)(const struct ggml_metal_fusion   * fusion,
+                  const struct ggml_cgraph         * gf,
+                  const int                        * node_idxs,
                   const struct ggml_tensor * const * nodes,
                         ggml_metal_fusion_mode       mode);
 };
