@@ -143,6 +143,9 @@
 #define OP_UNARY_NUM_COS        16
 #define OP_UNARY_NUM_LOG        17
 #define OP_UNARY_NUM_LEAKY_RELU 18
+#define OP_UNARY_NUM_SIGMOID_SCALE 19
+#define OP_UNARY_NUM_SOFTPLUS_SQRT 20
+#define OP_UNARY_NUM_SCALE_SILU 21
 
 #define OP_UNARY_NUM_TANH        100
 #define OP_UNARY_NUM_RELU        101
@@ -434,6 +437,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
@@ -469,6 +473,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;

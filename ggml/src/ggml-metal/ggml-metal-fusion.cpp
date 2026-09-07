@@ -292,6 +292,62 @@ static bool ggml_metal_fusion_check_snake(
     return types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x;
 }
 
+static bool ggml_metal_fusion_check_unary(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * op  = nodes[0];
+    const ggml_tensor * dst = nodes[1];
+    if (dst->src[0] != op || op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (fusion->id == GGML_METAL_FUSION_SCALE_SILU) {
+        return ggml_get_unary_op(dst) == GGML_UNARY_OP_SILU && ggml_is_contiguous_rows(op);
+    }
+
+    const ggml_unary_op unary = fusion->id == GGML_METAL_FUSION_SIGMOID_SCALE ? GGML_UNARY_OP_SIGMOID : GGML_UNARY_OP_SOFTPLUS;
+    return ggml_get_unary_op(op) == unary && ggml_are_same_layout(op, dst);
+}
+
+static bool ggml_metal_fusion_check_rms_norm_rope(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * rms  = nodes[0];
+    const ggml_tensor * rope = nodes[1];
+    const int rope_mode = ggml_get_op_params_i32(rope, 2);
+    const int n_dims    = ggml_get_op_params_i32(rope, 1);
+    const int n_offs    = ggml_get_op_params_i32(rope, 15);
+    if (rope->src[0] != rms || rms->src[0]->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
+        rope->type != GGML_TYPE_F32 || rms->ne[0] != 512 || rope_mode != GGML_ROPE_TYPE_NORMAL ||
+        n_dims % 4 != 0 || n_offs % 4 != 0 || !ggml_are_same_layout(rms->src[0], rms) || !ggml_are_same_layout(rms, rope)) {
+        return false;
+    }
+    if (fusion->ops.size() == 3) {
+        const ggml_tensor * cast = nodes[2];
+        return cast->src[0] == rope && cast->src[1] == cast && cast->type == GGML_TYPE_F16 &&
+            ggml_are_same_shape(rope, cast) && ggml_is_contiguous(cast);
+    }
+
+    return true;
+}
+
 #define GGML_METAL_TOPK_MOE_MAX_EXPERTS 1024
 
 // SOFT_MAX + ARGSORT + GET_ROWS (plus optional norm/scale) for MoE routing.
@@ -607,6 +663,12 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+static const std::vector<ggml_op> ops_scale_silu        = { GGML_OP_SCALE, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_sigmoid_scale     = { GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_softplus_sqrt     = { GGML_OP_UNARY, GGML_OP_SQRT };
+static const std::vector<ggml_op> ops_rms_norm_rope     = { GGML_OP_RMS_NORM, GGML_OP_ROPE };
+static const std::vector<ggml_op> ops_rms_norm_rope_cpy = { GGML_OP_RMS_NORM, GGML_OP_ROPE, GGML_OP_CPY };
+
 static const std::vector<ggml_op> ops_topk_moe = {
     GGML_OP_SOFT_MAX, GGML_OP_ARGSORT, GGML_OP_GET_ROWS
 };
@@ -661,6 +723,11 @@ static const std::vector<ggml_op> ops_moe_reduce_all_8 = {
 };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+    { GGML_METAL_FUSION_SCALE_SILU,        ops_scale_silu,             ops_scale_silu,                 {},     false, ggml_metal_fusion_check_unary },
+    { GGML_METAL_FUSION_SIGMOID_SCALE,     ops_sigmoid_scale,          ops_sigmoid_scale,              {},     false, ggml_metal_fusion_check_unary },
+    { GGML_METAL_FUSION_SOFTPLUS_SQRT,     ops_softplus_sqrt,          ops_softplus_sqrt,               {},     false, ggml_metal_fusion_check_unary },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,     ops_rms_norm_rope,          ops_rms_norm_rope,               {},     false, ggml_metal_fusion_check_rms_norm_rope },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE_CPY, ops_rms_norm_rope_cpy,      ops_rms_norm_rope_cpy,           {},     false, ggml_metal_fusion_check_rms_norm_rope },
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               ops_norm_mul,                   {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           ops_norm_mul_add,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_SCALE,     ops_norm_scale,             ops_norm_scale,                 {},     false, ggml_metal_fusion_check_norm },
