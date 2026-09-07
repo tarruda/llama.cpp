@@ -30,6 +30,7 @@ typedef enum ggml_metal_fusion_mode {
 // identifier of each fusion pattern so the op encoders know which kernel to use
 typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NONE = 0,
+    GGML_METAL_FUSION_QWEN4EXP_HC_REDUCE,
     GGML_METAL_FUSION_DSV4_HC_AFFINE,
     GGML_METAL_FUSION_DSV4_HC_POST_ADD,
     GGML_METAL_FUSION_DSV4_HC_PRE_NORM,

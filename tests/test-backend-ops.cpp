@@ -5305,6 +5305,72 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+struct test_gated_delta_net_cache : public test_gated_delta_net {
+    const bool extra_tail_user;
+
+    test_gated_delta_net_cache(
+            int64_t head_count,
+            int64_t head_size,
+            int64_t n_seq_tokens,
+            int64_t n_seqs,
+            int64_t K,
+            bool extra_tail_user = false)
+        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_seq_tokens, n_seqs, 1, false, false, K),
+          extra_tail_user(extra_tail_user) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_CACHE";
+    }
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + "," + VAR_TO_STR(extra_tail_user);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * full = test_gated_delta_net::build_graph(ctx);
+
+        const int64_t D = head_size*head_size*head_count;
+        const int64_t n_written = std::min(n_seq_tokens, K);
+        const int64_t slot_stride = D*n_seqs + 17;
+        const int64_t cache_offset = 13;
+        const int64_t cache_size = cache_offset + (n_written - 1)*slot_stride + D*n_seqs;
+        const size_t tail_offset = ggml_row_size(GGML_TYPE_F32, head_size*head_count*n_seq_tokens*n_seqs);
+
+        ggml_tensor * src;
+        ggml_tensor * dst;
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cache_size);
+        if (K == 1) {
+            src = ggml_view_4d(ctx, full, head_size, head_size, head_count, n_seqs,
+                    ggml_row_size(GGML_TYPE_F32, head_size),
+                    ggml_row_size(GGML_TYPE_F32, head_size*head_size),
+                    ggml_row_size(GGML_TYPE_F32, D), tail_offset);
+            dst = ggml_view_2d(ctx, cache, D, n_seqs,
+                    ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, cache_offset));
+        } else {
+            src = ggml_view_3d(ctx, full, D, n_seqs, n_written,
+                    ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D*n_seqs), tail_offset);
+            dst = ggml_view_3d(ctx, cache, D, n_seqs, n_written,
+                    ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, slot_stride),
+                    ggml_row_size(GGML_TYPE_F32, cache_offset));
+        }
+
+        ggml_tensor * copied = ggml_cpy(ctx, src, dst);
+        if (!extra_tail_user) {
+            return ggml_dup(ctx, copied);
+        }
+
+        ggml_tensor * extra = ggml_dup(ctx, src);
+        return ggml_add(ctx,
+                ggml_reshape_1d(ctx, copied, ggml_nelements(copied)),
+                ggml_reshape_1d(ctx, extra, ggml_nelements(extra)));
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11716,6 +11782,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_cache(48, 128, 1, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache(4, 32, 1, 1, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache(4, 64, 4, 2, 4));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));

@@ -227,51 +227,25 @@ struct node_info {
 };
 
 static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
-    // helper to add node src and dst ranges
+    // Include every output: GDN keeps its attention output when the cache copy is fused.
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            if (node.node->src[i]) {
-                if (!ggml_mem_ranges_add_src(mrs, node.node->src[i])) {
-                    return false;
-                }
-            }
-        }
-
-        // keep track of the sources of the fused nodes as well
+        ggml_mem_ranges_add(mrs, node.node);
         for (const auto * fused : node.fused) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (fused->src[i]) {
-                    if (!ggml_mem_ranges_add_src(mrs, fused->src[i])) {
-                        return false;
-                    }
-                }
-            }
+            ggml_mem_ranges_add(mrs, fused);
         }
-
-        return ggml_mem_ranges_add_dst(mrs, node.dst());
+        return true;
     };
 
-    // helper to check if a node can run concurrently with the existing set of nodes
     const auto & h_check = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            if (node.node->src[i]) {
-                if (!ggml_mem_ranges_check_src(mrs, node.node->src[i])) {
-                    return false;
-                }
-            }
+        if (!ggml_mem_ranges_check(mrs, node.node)) {
+            return false;
         }
-
         for (const auto * fused : node.fused) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (fused->src[i]) {
-                    if (!ggml_mem_ranges_check_src(mrs, fused->src[i])) {
-                        return false;
-                    }
-                }
+            if (!ggml_mem_ranges_check(mrs, fused)) {
+                return false;
             }
         }
-
-        return ggml_mem_ranges_check_dst(mrs, node.dst());
+        return true;
     };
 
     // perform reorders only across these types of ops

@@ -59,10 +59,9 @@ kernel void kernel_gated_delta_net_impl(
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
-    // output state base offset: after attention scores
     const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
-    // output state per-slot size: S_v * S_v * H * n_seqs
     const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
+
     // per-(seq,head) offset within a slot
     const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
@@ -70,7 +69,7 @@ kernel void kernel_gated_delta_net_impl(
     // the slot stride; otherwise append them after the attn scores (nb_out == 0)
     const bool fused = args.nb_out > 0;
     const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + attn_size;
-    const uint slot_stride = fused ? (uint)args.nb_out : state_size_per_snap;
+    const uint64_t slot_stride = fused ? args.nb_out : state_size_per_snap;
 
     for (short t = 0; t < args.ne22; t++) {
         float s_k = 0.0f;
@@ -242,9 +241,8 @@ kernel void kernel_gated_delta_net_impl(
     // the slot stride; otherwise append them after the attn scores (nb_out == 0)
     const bool fused = args.nb_out > 0;
     const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + args.ne23*args.ne22*args.ne21*S_v;
-    const uint slot_stride = fused ? (uint)args.nb_out : S_v*S_v;
 
-    device float * dst_state  = (device float *)state_out + (i23*args.ne21 + i21)*slot_stride + i20;
+    device float * dst_state  = (device float *)state_out + (i23*args.ne21 + i21)*S_v*S_v + i20;
     device T     * dstt_state = (device T     *) (dst_state);
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {
