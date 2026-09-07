@@ -8397,8 +8397,8 @@ struct test_generic_op : public test_case {
                 } else if (op == GGML_OP_MUL_MAT_ID || op == GGML_OP_ADD_ID) {
                     const int64_t n_expert = (op == GGML_OP_MUL_MAT_ID) ? sources[0].ne[2] : sources[1].ne[1];
                     for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                        std::vector<int32_t> data(t->ne[0]);
-                        for (int32_t i = 0; i < t->ne[0]; i++) {
+                        std::vector<int32_t> data(std::max(t->ne[0], n_expert));
+                        for (size_t i = 0; i < data.size(); i++) {
                             data[i] = i % n_expert;
                         }
                         std::shuffle(data.begin(), data.end(), rng);
