@@ -617,6 +617,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_affine(g
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_block_score(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_block_score_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_indexed(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_indexed_pack_f16_d256";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
@@ -1649,6 +1671,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_512_10(ggml_metal_library_t lib) {
+    const char * name = "kernel_top_k_512_10_f32_i32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_TOP_K);
 
@@ -1850,7 +1881,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
@@ -1862,11 +1893,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
     // do bounds checks for the mask?
-    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool indexed_batch = op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED && op->src[0]->ne[1] > 1;
+    const bool bc_mask = !indexed_batch && op->src[3] && (op->src[3]->ne[1] % 8 != 0);
     const bool scan_mask = has_mask && op->src[3]->ne[1] != 1;
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext",
+            indexed_batch ? "flash_attn_ext_indexed" : "flash_attn_ext",
             type,
             dk,
             dv);
@@ -1947,7 +1979,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
@@ -2013,7 +2045,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         const ggml_tensor * op,
         int32_t dv,
         int32_t nwg) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
