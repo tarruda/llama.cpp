@@ -41,14 +41,22 @@ struct llama_cparams {
     bool auto_fa;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
+    bool fused_dsv4_compress;
+    bool fused_dsv4_top_k_mask;
+    bool auto_fdsv4_aux;
+    bool fused_dsv4_sparse;
+    bool auto_fdsv4_sparse;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_qwen4exp_hc_post;
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool fused_qsa_attn;
+    bool auto_fqsa_attn;
     bool no_perf;
     bool op_offload;
     bool kv_unified;

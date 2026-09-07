@@ -1,7 +1,97 @@
 #include "common.h"
+#include "dequantize.h"
 
 constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
 constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
+
+kernel void kernel_ssm_conv_silu_norm_f32(
+        constant ggml_metal_kargs_ssm_conv_silu_norm & args,
+        device const float * src,
+        device const float4 * weights,
+        device float4 * dst,
+        device float4 * dst_q,
+        device float4 * dst_k,
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = 4*group.x + sg;
+    if (head*128 >= args.n_channels) {
+        return;
+    }
+    const uint c = head*128 + 4*lane;
+    float4 y;
+    for (uint j = 0; j < 4; ++j) {
+        device const float * x = src + (group.z*args.n_channels + c + j)*(args.n_tokens + 3) + group.y;
+        const float z = dot(float4(x[0], x[1], x[2], x[3]), weights[c + j]);
+        y[j] = z/(1.0f + exp(-z));
+    }
+    dst[((group.z*args.n_tokens + group.y)*args.n_channels + c)/4] = y;
+    if (head < 2*args.n_heads) {
+        const float rs = rsqrt(simd_sum(dot(y, y))/128.0f + args.eps);
+        y = (y*rs)*args.scale + args.bias;
+        device float4 * out = head < args.n_heads ? dst_q : dst_k;
+        out[((group.z*args.n_tokens + group.y)*args.n_heads + head%args.n_heads)*32 + lane] = y;
+    }
+}
+
+kernel void kernel_gdn_alpha_beta_q8_0_f32(
+        constant ggml_metal_kargs_gdn_alpha_beta & args,
+        device const float * x,
+        device const block_q8_0 * wb,
+        device const block_q8_0 * wa,
+        device const float * dt,
+        device const float * a,
+        device float * beta,
+        device float * alpha,
+        uint group [[threadgroup_position_in_grid]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint row = 4*group + sg;
+    if (row >= args.n_heads) {
+        return;
+    }
+    const uint nb = args.n_embd/QK8_0;
+    const uint il = lane%4;
+    float sb = 0.0f;
+    float sa = 0.0f;
+    for (uint ib = lane/4; ib < nb; ib += 8) {
+        const uint offset = row*nb + ib;
+        float vb = 0.0f;
+        float va = 0.0f;
+        FOR_UNROLL (uint j = 0; j < 8; ++j) {
+            const float v = x[ib*QK8_0 + il*8 + j];
+            vb += wb[offset].qs[il*8 + j]*v;
+            va += wa[offset].qs[il*8 + j]*v;
+        }
+        sb += vb*float(wb[offset].d);
+        sa += va*float(wa[offset].d);
+    }
+    sb = simd_sum(sb);
+    sa = simd_sum(sa) + dt[row];
+    if (lane == 0) {
+        beta[row] = 1.0f/(1.0f + exp(-sb));
+        alpha[row] = (sa > 20.0f ? sa : log(1.0f + exp(sa)))*a[row];
+    }
+}
+
+kernel void kernel_ple_conv_f32(
+        constant ggml_metal_kargs_ple_conv & args,
+        device const float * input,
+        device const float4 * weights,
+        device const float * gated,
+        device const float * residual,
+        device float * dst,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n_channels*args.n_tokens) {
+        return;
+    }
+    const uint channel = i%args.n_channels;
+    const uint token = i/args.n_channels;
+    device const float * x = input + channel*(args.n_tokens + 3*args.dilation) + token;
+    const float4 v = float4(half4(x[0], x[args.dilation], x[2*args.dilation], x[3*args.dilation]));
+    const float z = dot(v, weights[channel]);
+    dst[i] = residual[i] + (gated[i] + z/(1.0f + exp(-z)));
+}
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
 kernel void kernel_ssm_conv_f32_f32(

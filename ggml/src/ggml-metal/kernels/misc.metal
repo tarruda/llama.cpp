@@ -782,35 +782,8 @@ kernel void kernel_dsv4_hc_pre_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
-kernel void kernel_dsv4_hc_pre_gated_f32(
-        constant ggml_metal_kargs_dsv4_hc_pre & args,
-        device const char * x,
-        device const char * gate,
-        device       char * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
-    const int it = tgpig.y;
-    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
-
-    if (i0 >= args.n_embd) {
-        return;
-    }
-
-    device const char * xb = x    + i0*args.nb_x0 + it*args.nb_x2;
-    device const char * gb = gate + i0*args.nb_w0 + it*args.nb_w2;
-    float result = 0.0f;
-    FOR_UNROLL (int ih = 0; ih < FC_dsv4_hc_n_hc; ++ih) {
-        const float g  = 1.0f/(1.0f + exp(-*(device const float *) (gb + ih*args.nb_w1)));
-        const float xv = *(device const float *) (xb + ih*args.nb_x1);
-        result = fma(xv, g, result);
-    }
-
-    *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
-}
-
-kernel void kernel_dsv4_hc_post_nocomb_f32(
+template <bool gated>
+kernel void kernel_dsv4_hc_post_nocomb_f32_impl(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,
         device const char * residual,
@@ -828,6 +801,9 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
     float post_lane = 0.0f;
     if (tiisg < hc) {
         post_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
+        if (gated) {
+            post_lane = args.gate_scale_out * (1.0f / (1.0f + exp(-args.scale*post_lane)));
+        }
     }
 
     float post_reg[hc];
@@ -847,9 +823,16 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
     }
 }
 
-kernel void kernel_dsv4_hc_post_f32(
+typedef decltype(kernel_dsv4_hc_post_nocomb_f32_impl<false>) kernel_dsv4_hc_post_nocomb_f32_t;
+
+template [[host_name("kernel_dsv4_hc_post_nocomb_f32")]]      kernel kernel_dsv4_hc_post_nocomb_f32_t kernel_dsv4_hc_post_nocomb_f32_impl<false>;
+template [[host_name("kernel_dsv4_hc_post_nocomb_gate_f32")]] kernel kernel_dsv4_hc_post_nocomb_f32_t kernel_dsv4_hc_post_nocomb_f32_impl<true>;
+
+template <bool add_x, bool gated>
+kernel void kernel_dsv4_hc_post_f32_impl(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,
+        device const char * y,
         device const char * residual,
         device const char * post,
         device const char * comb,
@@ -858,6 +841,8 @@ kernel void kernel_dsv4_hc_post_f32(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
     constexpr ushort hc = 4;
 
     const int it = tgpig.y;
@@ -866,6 +851,9 @@ kernel void kernel_dsv4_hc_post_f32(
     float coeff_lane = 0.0f;
     if (tiisg < hc) {
         coeff_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
+        if (gated) {
+            coeff_lane = args.gate_scale_out * (1.0f / (1.0f + exp(-args.scale*coeff_lane)));
+        }
     } else if (tiisg < hc + hc*hc) {
         const ushort idx  = tiisg - hc;
         const ushort idst = idx & 3;
@@ -888,24 +876,34 @@ kernel void kernel_dsv4_hc_post_f32(
         return;
     }
 
-    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    if (add_x) {
+        xv += *(device const float *) (y + i0*args.nb_x0 + it*args.nb_x1);
+    }
     float result[hc];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
-        result[idst] = xv*post_reg[idst];
+        result[idst] = 0.0f;
     }
 
     device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
     FOR_UNROLL (ushort isrc = 0; isrc < hc; ++isrc) {
         const float rv = *(device const float *) (rb + isrc*args.nb_r1);
         FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
-            result[idst] = fma(rv, comb_reg[isrc][idst], result[idst]);
+            result[idst] += rv*comb_reg[isrc][idst];
         }
     }
 
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+        result[idst] += xv*post_reg[idst];
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+typedef decltype(kernel_dsv4_hc_post_f32_impl<false, false>) kernel_dsv4_hc_post_f32_t;
+
+template [[host_name("kernel_dsv4_hc_post_f32")]]      kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<false, false>;
+template [[host_name("kernel_dsv4_hc_post_add_f32")]]  kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<true,  false>;
+template [[host_name("kernel_dsv4_hc_post_gate_f32")]] kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<false, true>;
 
 constant bool FC_top_k_mask_has_score  [[function_constant(FC_TOP_K_MASK + 0)]];
 constant bool FC_top_k_mask_has_blocks [[function_constant(FC_TOP_K_MASK + 1)]];

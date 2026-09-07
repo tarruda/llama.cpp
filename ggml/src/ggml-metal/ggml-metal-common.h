@@ -44,6 +44,9 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const struct ggml_tensor * tenso
 // - new dst range overlaps with any existing range (src or dst)
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
 
+// check one extra source of a fused operation
+bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
+
 // reorder the nodes in the graph to improve concurrency, while respecting the fusions of a device with props
 //
 // note: this implementation is generic and not specific to metal
@@ -54,6 +57,8 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+bool ggml_metal_op_mul_mat_id_may_have_skipped(const struct ggml_tensor * op);
+bool ggml_metal_op_mul_mat_id_use_parallel(const struct ggml_tensor * op);
 
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only

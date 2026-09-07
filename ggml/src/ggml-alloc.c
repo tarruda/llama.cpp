@@ -652,6 +652,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
+                    struct ggml_tensor * parent_base = ggml_impl_is_view(parent) ? parent->view_src : parent;
+                    ggml_backend_buffer_type_t buft = galloc->bufts[p_hn->buffer_id];
+                    if (ggml_backend_buft_get_alloc_size(buft, parent_base) < ggml_backend_buft_get_alloc_size(buft, node)) {
+                        continue;
+                    }
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
                         struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
@@ -952,6 +957,12 @@ void ggml_gallocr_reserve_n_size(
         sizes[i] = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
+        }
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[i] == galloc->buf_tallocs[j]) {
+                sizes[i] = 0;
+                break;
+            }
         }
     }
 }

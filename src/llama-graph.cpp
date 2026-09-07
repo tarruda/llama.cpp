@@ -2064,11 +2064,18 @@ ggml_tensor * llm_graph_context::build_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate && type_gate == LLM_FFN_PAR) {
+                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                    const float limit = il >= 0 ? hparams.swiglu_clamp_shexp[il] : 0.0f;
+                    cur = ggml_dsv4_swiglu(ctx0, cur, tmp, nullptr, limit);
+                    cb(cur, "ffn_swiglu", il);
+                    type_gate = LLM_FFN_SEQ;
+                    break;
+                }
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2438,6 +2445,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    const bool dsv4_swiglu = type_op == LLM_FFN_SILU && (gate_exps || gate_up_exps) &&
+        (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0));
+    const bool weight_in_swiglu = dsv4_swiglu && !weight_before_ffn && !down_exps_b && !post_exp_norm;
+
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
@@ -2497,12 +2508,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
+                if (dsv4_swiglu) {
+                    const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+                    cur = ggml_dsv4_swiglu(ctx0, cur, up, weight_in_swiglu ? weights : nullptr, limit);
+                    cb(cur, "ffn_moe_swiglu", il);
+                    break;
+                }
                 if (gate_exps) {
                     if (il >= 0) {
                         const float limit = hparams.swiglu_clamp_exp[il];
                         constexpr float eps = 1e-6f;
                         if (limit > eps) {
-                            if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                            if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_HY_V4) {
                                 cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                             } else {
                                 up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2623,7 +2640,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !weight_in_swiglu) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }

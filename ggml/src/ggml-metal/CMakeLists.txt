@@ -40,6 +40,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_aux.metal
     kernels/fa_f16.metal
     kernels/fa_f32.metal
+    kernels/fa_indexed.metal
     kernels/fa_q4_0.metal
     kernels/fa_q4_1.metal
     kernels/fa_q5_0.metal
@@ -65,6 +66,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/tri.metal
     kernels/ssm.metal
     kernels/wkv.metal
+    kernels/dsv4.metal
     kernels/gated_delta_net.metal
     kernels/solve_tri.metal
     kernels/rope.metal

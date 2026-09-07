@@ -3,6 +3,7 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+constant bool FC_flash_attn_ext_vec_q_f16     [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 
 //constant float FC_flash_attn_ext_vec_scale         [[function_constant(FC_FLASH_ATTN_EXT_VEC + 10)]];
 //constant float FC_flash_attn_ext_vec_max_bias      [[function_constant(FC_FLASH_ATTN_EXT_VEC + 11)]];
@@ -113,13 +114,24 @@ kernel void kernel_flash_attn_ext_vec(
     {
         for (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
-            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
             if (iq1_q < args.ne01) {
-                for (short i = tiisg; i < PK4; i += NW) {
-                    if (i < DK4) {
-                        sq4[qq*PK4 + i] = (q4_t) q4[i];
-                    } else {
-                        sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                if (FC_flash_attn_ext_vec_q_f16) {
+                    device const half4 * q4 = (device const half4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
+                    }
+                } else {
+                    device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
+                    for (short i = tiisg; i < PK4; i += NW) {
+                        if (i < DK4) {
+                            sq4[qq*PK4 + i] = (q4_t) q4[i];
+                        } else {
+                            sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                        }
                     }
                 }
             } else {
@@ -159,7 +171,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        device const half * pm_base = (device const half *) (mask + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         // sparse indices: the list of finite mask entries per query row
         // the sparse path requires Q == 1 (enforced by the host)
@@ -199,7 +211,7 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 // padded query rows clamp to row 0 of the mask to avoid OOB; their scores
                 // are forced to -inf below, so the values never affect the result.
-                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? ((iq1*Q + qq)%args.ne31)*(args.nb31/sizeof(half)) : 0);
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -223,7 +235,7 @@ kernel void kernel_flash_attn_ext_vec(
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
-                            (iq1*Q + qq)*C +
+                            ((iq1*Q + qq)%args.ne31)*C +
                             (iq2%args.ne32)*(C*args.ne31) +
                             (iq3%args.ne33)*(C*args.ne31*args.ne32);
                     }
@@ -568,7 +580,8 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int sink_idx = args.sinks_rows ? iq1*Q + qq : iq2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 
