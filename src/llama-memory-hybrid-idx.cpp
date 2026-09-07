@@ -148,6 +148,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
+    kpool_pending = false;
 
     if (mem_idx) {
         mem_idx->clear(data);
@@ -532,6 +533,9 @@ bool llama_memory_hybrid_idx_context::next() {
     if (i_cur == 0 && mem != nullptr) {
         mem->mem_idx_stale_clear();
     }
+    if (kpool_track()) {
+        mem->kpool_pending = kpool_cur().n_new_g == 0;
+    }
 
     if (ctx_idx) {
         ctx_idx->next();
@@ -594,6 +598,10 @@ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_key_gate(ggm
     return ggml_get_rows(ctx, key_gate, idxs);
 }
 
+ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::scatter_key_gate(ggml_tensor * values, ggml_tensor * idxs) const {
+    return ggml_set_rows(ctx, key_gate, values, idxs);
+}
+
 ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const {
     return ggml_set_rows(ctx, pooled, values, idxs);
 }
@@ -640,6 +648,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 
     st.n_pool_real = lay.n_pool_real;
     st.n_new       = 0;
+    if (mem->get_kpool_by_order() && get_idx()->get_n_kv() <= (uint64_t) mem->hparams_idx.indexer_top_k + kpool - 1) {
+        st.n_new_g = 0;
+        return;
+    }
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(),  st.is_new.end(),  0);
         std::fill(st.rep_gen.begin(), st.rep_gen.end(), 0);
@@ -668,8 +680,8 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         pool_start[s] = ip;
         ip += (uint32_t) sq.pools.size();
 
-        // A sequence edit invalidates only pools ending after the edited position.
-        const llama_pos stale_from = i_cur == 0 ?
+        // Rebuild deferred pools when QSA first becomes sparse; edits invalidate pools from their position.
+        const llama_pos stale_from = mem->kpool_pending ? 0 : i_cur == 0 ?
             mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN;
         if (stale_from == llama_memory_hybrid_idx::POS_CLEAN) {
             continue;

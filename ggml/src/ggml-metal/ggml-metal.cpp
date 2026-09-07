@@ -227,6 +227,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_amax(tensor);
+                res += ggml_metal_op_mul_mat_id_extra_tasks(tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -235,6 +236,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
+            } break;
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            {
+                res += ggml_metal_op_flash_attn_ext_indexed_extra(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

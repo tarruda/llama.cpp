@@ -1249,10 +1249,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * comb,
                 int il) const;
 
-        ggml_tensor * build_hc_sinkhorn(
-                ggml_tensor * comb,
-                int il) const;
-
         ggml_tensor * build_hc_head(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -2553,13 +2549,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention over the cells the QSA mask keeps
+        struct qsa_selection {
+            ggml_tensor * mask = nullptr;
+            ggml_tensor * indices = nullptr;
+        };
+
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * sel,
+            const qsa_selection & sel,
                         int64_t   n_sel,
                           float   kq_scale,
                             int   il);
@@ -2567,8 +2567,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
-        ggml_tensor * build_qsa_sel(
+        qsa_selection build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,

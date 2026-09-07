@@ -51,6 +51,11 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) (args.scale * x + args.bias);
         }
 
+        if (FC_OP == OP_UNARY_NUM_SCALE_SILU) {
+            const TC scaled = args.scale * x + args.bias;
+            dst_ptr[i0] = (T) (scaled / (1 + exp(-scaled)));
+        }
+
         if (FC_OP == OP_UNARY_NUM_FILL) {
             dst_ptr[i0] = (T) args.val;
         }
@@ -93,6 +98,11 @@ kernel void kernel_unary_impl(
 
         if (FC_OP == OP_UNARY_NUM_SIGMOID) {
             dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
+        }
+
+        if (FC_OP == OP_UNARY_NUM_SIGMOID_SCALE) {
+            const TC sigmoid = 1 / (1 + exp(-x));
+            dst_ptr[i0] = (T) (args.scale * sigmoid + args.bias);
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
@@ -145,6 +155,11 @@ kernel void kernel_unary_impl(
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
             dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_SOFTPLUS_SQRT) {
+            const TC softplus = select(log(1 + exp(x)), x, x > 20);
+            dst_ptr[i0] = (T) sqrt(softplus);
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {

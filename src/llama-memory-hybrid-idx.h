@@ -108,6 +108,8 @@ public:
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
 private:
+    friend class llama_memory_hybrid_idx_context;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -128,6 +130,7 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+    bool kpool_pending = false;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -135,6 +138,7 @@ public:
     class kpool_access {
     public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
+        ggml_tensor * scatter_key_gate(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
 
@@ -190,7 +194,7 @@ public:
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
-    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+    uint32_t get_n_kpool_new() const; // Pools to re-pool, padded to a stable bound; zero while QSA is dense.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
