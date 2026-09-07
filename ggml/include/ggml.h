@@ -569,6 +569,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_INDEXED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -582,9 +583,15 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_COMPRESS,
+        GGML_OP_DSV4_TOP_K_MASK,
+        GGML_OP_DSV4_SPARSE_PACK,
         GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_SPLIT,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_SWIGLU,
+        GGML_OP_QSA_BLOCK_SCORE,
 
         GGML_OP_UNARY,
 
@@ -1470,7 +1477,8 @@ extern "C" {
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
     //
-    // return false on faliure
+    // MUL_MAT accepts sources 0 and 1. MUL_MAT_ID accepts source 1.
+    // return false on failure
     GGML_API bool ggml_prec_set_src(
             struct ggml_tensor * a,
             enum ggml_prec       prec,
@@ -2494,6 +2502,23 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // q:       [n_embd_k, n_batch, n_head,    ne3]
+    // k:       [n_embd_k, n_kv,    n_head_kv, ne3]
+    // v:       [n_embd_v, n_kv,    n_head_kv, ne3]
+    // indices: [n_select, n_batch,  1,         ne3]
+    // mask:    [n_select, n_batch,  1,         ne3]
+    // res:     [n_embd_v, n_head,   n_batch,   ne3]
+    // Negative indices and entries masked with -INFINITY are skipped.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 logit_softcap);
+
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec),
@@ -2509,6 +2534,10 @@ extern "C" {
             int32_t              n_kv_max);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
+
+    GGML_API void ggml_flash_attn_ext_add_sinks_rows(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
@@ -2677,6 +2706,49 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // DeepSeek V4 compressor weighted reduction.
+    // kv_state and score_state: [overlap ? 2*n_embd : n_embd, n_rows]
+    // read_idxs: [(overlap ? 2 : 1)*ratio*n_blocks]
+    // result: [n_embd, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * read_idxs,
+            int32_t               ratio,
+            bool                  overlap);
+
+    // Build the raw and selected compressed F16 attention mask.
+    GGML_API struct ggml_tensor * ggml_dsv4_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx);
+
+    // Pack selected DeepSeek V4 keys and their masks by query row.
+    GGML_API struct ggml_tensor * ggml_dsv4_sparse_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * comp_k,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx,
+            int64_t               n_raw);
+
+    // Qwen sparse-attention block score
+    // q:     [n_embd,   n_head,  n_query, n_stream]
+    // k:     [n_embd,   n_cache, 1,       1]
+    // cells: [n_blocks, 1|n_query, 1,     n_stream]
+    // mask:  [n_blocks, n_query, 1,       n_stream]
+    // res:   [n_blocks, n_query, 1,       n_stream]
+    GGML_API struct ggml_tensor * ggml_qsa_block_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * mask,
+            float                 scale);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
@@ -2688,6 +2760,15 @@ extern "C" {
     // Softmax over dst, add eps, normalize over src, then repeat normalization
     // over dst followed by src for iterations 1 through n_iter - 1.
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // HC affine, sigmoid and Sinkhorn normalization. Returns packed pre[4], post[4], comb[16] rows.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,
             struct ggml_tensor  * scale,
@@ -2726,6 +2807,23 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // hc_post with a sigmoid gate and identity residual mixing
+    //   result[i, h, t] = residual[i, h, t] + x[i, t]*2*sigmoid(scale*gate[h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
+    // Clamped SwiGLU with optional per-row weights. Inputs and output are rounded to BF16 values in F32.
+    GGML_API struct ggml_tensor * ggml_dsv4_swiglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * weights,
+            float                 limit);
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

@@ -63,6 +63,24 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMPRESS,
+    /*.name             =*/ "fused DeepSeek V4 compressor",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_TOP_K_MASK,
+    /*.name             =*/ "fused DeepSeek V4 top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_sparse_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_SPARSE_PACK,
+    /*.name             =*/ "fused DeepSeek V4 sparse attention packing",
+    /*.n_tokens_per_seq =*/ 512,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -78,6 +96,24 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qwen4exp_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QWEN4EXP_HC_POST,
+    /*.name             =*/ "fused Qwen4-Exp HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qsa_block_score_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_BLOCK_SCORE,
+    /*.name             =*/ "QSA block score",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qsa_attn_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_ATTN,
+    /*.name             =*/ "indexed QSA attention",
     /*.n_tokens_per_seq =*/ 1,
 };
 
@@ -237,10 +273,23 @@ llama_context::llama_context(
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
+    cparams.fused_dsv4_compress   = true;
+    cparams.fused_dsv4_top_k_mask = true;
+    cparams.auto_fdsv4_aux        = true;
+
+    cparams.fused_dsv4_sparse = true;
+    cparams.auto_fdsv4_sparse = true;
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_qwen4exp_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_qsa_block_score = true;
+    cparams.auto_fqsa_block_score  = true;
+    cparams.fused_qsa_attn = true;
+    cparams.auto_fqsa_attn  = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -571,12 +620,38 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.auto_flid = false;
     }
 
+    if (cparams.auto_fdsv4_aux) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 auxiliary ops support:\n", func);
+        resolve(llm_fused_op_dsv4_compress_probe,   cparams.fused_dsv4_compress);
+        resolve(llm_fused_op_dsv4_top_k_mask_probe, cparams.fused_dsv4_top_k_mask);
+        cparams.auto_fdsv4_aux = false;
+    }
+
     if (cparams.auto_fhc) {
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_qwen4exp_hc_post_probe, cparams.fused_qwen4exp_hc_post);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fdsv4_sparse) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 sparse attention support:\n", func);
+        resolve(llm_fused_op_dsv4_sparse_probe, cparams.fused_dsv4_sparse);
+        cparams.auto_fdsv4_sparse = false;
+    }
+
+    if (cparams.auto_fqsa_block_score) {
+        LLAMA_LOG_INFO("%s: resolving QSA block score support:\n", func);
+        resolve(llm_fused_op_qsa_block_score_probe, cparams.fused_qsa_block_score);
+        cparams.auto_fqsa_block_score = false;
+    }
+
+    if (cparams.auto_fqsa_attn) {
+        LLAMA_LOG_INFO("%s: resolving indexed QSA attention support:\n", func);
+        resolve(llm_fused_op_qsa_attn_probe, cparams.fused_qsa_attn);
+        cparams.auto_fqsa_attn = false;
     }
 }
 
@@ -1253,8 +1328,10 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
-    //sched_need_reserve = true;
+    // Cached QSA is causal only, so toggling attention changes the graph shape.
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        sched_need_reserve = true;
+    }
 }
 
 bool llama_context::get_causal_attn() const {

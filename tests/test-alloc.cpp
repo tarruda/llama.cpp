@@ -554,6 +554,68 @@ static void test_multiple_buffer_types() {
     GGML_ASSERT(backend_b.context->allocated_total() <= 32 + 24);
 }
 
+static void test_reserve_size() {
+    for (bool shared : {false, true}) {
+        dummy_backend backend_a = dummy_backend_init(32);
+        dummy_backend backend_b = dummy_backend_init(64);
+        dummy_backend backend_c = dummy_backend_init(32);
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_with_size(ctx, 16);
+        auto * a = ggml_scale(ctx, input, 2.0f);
+        auto * b = ggml_sqr(ctx, a);
+        auto * c = ggml_add(ctx, a, b);
+        for (auto * tensor : {a, b, c}) { ggml_set_output(tensor); }
+        ggml_build_forward_expand(graph, c);
+        GGML_ASSERT(graph->n_nodes == 3 && graph->n_leafs == 1);
+
+        ggml_backend_buffer_type_t bufts[] = {&backend_a.buffer_type, &backend_b.buffer_type, shared ? &backend_a.buffer_type : &backend_c.buffer_type};
+        const int node_buffer_ids[] = {0, 1, 2};
+        const int leaf_buffer_ids[] = {0};
+        size_t sizes[3];
+        ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 3));
+        ggml_gallocr_reserve_n_size(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids, sizes);
+        GGML_ASSERT(backend_a.context->allocated_total() + backend_b.context->allocated_total() + backend_c.context->allocated_total() == 0);
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+        for (int i = 0; i < 3; ++i) { GGML_ASSERT(sizes[i] == ggml_gallocr_get_buffer_size(galloc.get(), i)); }
+        GGML_ASSERT(sizes[0] + sizes[1] + sizes[2] == backend_a.context->allocated_total() + backend_b.context->allocated_total() + backend_c.context->allocated_total());
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+        check_max_size(ctx);
+    }
+}
+
+static void test_sched_reserve_size() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    ggml_backend_t backends[] = { &backend_a.context->backend, &backend_b.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 8, false, false));
+    size_t sizes[2];
+    for (bool measure : {true, false}) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_with_size(ctx, 16);
+        auto * a = ggml_scale(ctx, input, 2.0f);
+        auto * b = ggml_sqr(ctx, a);
+        auto * c = ggml_scale(ctx, b, 2.0f);
+        ggml_set_output(c);
+        ggml_build_forward_expand(graph, c);
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_tensor_backend(sched.get(), a, backends[1]);
+        ggml_backend_sched_set_tensor_backend(sched.get(), b, backends[0]);
+        ggml_backend_sched_set_tensor_backend(sched.get(), c, backends[1]);
+        if (measure) {
+            ggml_backend_sched_reserve_size(sched.get(), graph, sizes);
+            GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), b) == backends[0]);
+            GGML_ASSERT(backend_a.context->allocated_total() + backend_b.context->allocated_total() == 0);
+        } else {
+            GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), graph));
+            for (int i = 0; i < 2; ++i) { GGML_ASSERT(sizes[i] == ggml_backend_sched_get_buffer_size(sched.get(), backends[i])); }
+        }
+        GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 3);
+    }
+}
+
 static void test_buffer_size_zero() {
     dummy_backend backend_a    = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_b    = dummy_backend_init(SIZE_MAX);
@@ -669,6 +731,8 @@ int main() {
     run("test_merge_free_block(SIZE_MAX)", []() { test_merge_free_block(SIZE_MAX); });
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
+    run("test_reserve_size", test_reserve_size);
+    run("test_sched_reserve_size", test_sched_reserve_size);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);

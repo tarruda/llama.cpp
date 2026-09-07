@@ -66,7 +66,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
 
     const char * op_str = "undefined";
     switch (op) {
-        case GGML_OP_ADD_ID: op_str = "add_id"; break;
+        case GGML_OP_ADD_ID:          op_str = "add_id";          break;
+        case GGML_OP_DSV4_COMPRESS:   op_str = "dsv4_compress";   break;
+        case GGML_OP_DSV4_TOP_K_MASK: op_str = "dsv4_top_k_mask"; break;
+        case GGML_OP_DSV4_HC_SPLIT:   op_str = "dsv4_hc_split";   break;
+        case GGML_OP_DSV4_SWIGLU:     op_str = "dsv4_swiglu";     break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -86,6 +90,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_l
     char name[256];
 
     snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_contiguous(ggml_metal_library_t lib, ggml_type type) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_cpy_%s_%s_contiguous", ggml_type_name(type), ggml_type_name(type));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -215,11 +234,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc, bool vec4) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_concat_%s", ggml_type_name(tsrc));
+    snprintf(base, 256, "kernel_concat_%s%s", ggml_type_name(tsrc), vec4 ? "_4" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -230,10 +249,41 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal_library_t lib, const ggml_tensor * op) {
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_impl(
+        ggml_metal_library_t lib,
+        const ggml_tensor *  op,
+        int                  op_num) {
     char base[256];
     char name[256];
 
+    const char * t0_str = ggml_type_name(op->src[0]->type);
+    const char * t_str  = ggml_type_name(op->type);
+
+    const bool is_c4 = op->src[0]->ne[0] % 4 == 0;
+    const bool is_cnt = ggml_is_contiguous(op->src[0]) && ggml_nelements(op) < 32768;
+
+    snprintf(base, 256, "kernel_unary_%s_%s%s", t0_str, t_str, is_c4 ? "_4" : "");
+    snprintf(name, 256, "%s_op=%d_cnt=%d", base, op_num, is_cnt);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, op_num, FC_UNARY + 0);
+        ggml_metal_cv_set_bool (cv, is_cnt, FC_UNARY + 1);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.c4  = is_c4;
+    res.cnt = is_cnt;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal_library_t lib, const ggml_tensor * op) {
     int op_num = -1;
 
     switch (op->op) {
@@ -275,31 +325,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
         default: GGML_ABORT("fatal error");
     };
 
-    const char * t0_str = ggml_type_name(op->src[0]->type);
-    const char * t_str  = ggml_type_name(op->type);
+    return ggml_metal_library_get_pipeline_unary_impl(lib, op, op_num);
+}
 
-    const bool is_c4 = op->src[0]->ne[0] % 4 == 0;
-    const bool is_cnt = ggml_is_contiguous(op->src[0]) && ggml_nelements(op) < 32768;
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_sigmoid_scale(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID);
+    return ggml_metal_library_get_pipeline_unary_impl(lib, op, OP_UNARY_NUM_SIGMOID_SCALE);
+}
 
-    snprintf(base, 256, "kernel_unary_%s_%s%s", t0_str, t_str, is_c4 ? "_4" : "");
-    snprintf(name, 256, "%s_op=%d_cnt=%d", base, op_num, is_cnt);
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_softplus_sqrt(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS);
+    return ggml_metal_library_get_pipeline_unary_impl(lib, op, OP_UNARY_NUM_SOFTPLUS_SQRT);
+}
 
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        ggml_metal_cv_t cv = ggml_metal_cv_init();
-
-        ggml_metal_cv_set_int16(cv, op_num, FC_UNARY + 0);
-        ggml_metal_cv_set_bool (cv, is_cnt, FC_UNARY + 1);
-
-        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
-
-        ggml_metal_cv_free(cv);
-    }
-
-    res.c4  = is_c4;
-    res.cnt = is_cnt;
-
-    return res;
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_scale_silu(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_SCALE);
+    return ggml_metal_library_get_pipeline_unary_impl(lib, op, OP_UNARY_NUM_SCALE_SILU);
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_library_t lib, const ggml_tensor * op) {
@@ -481,17 +522,44 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer(
         ggml_metal_library_t lib,
-        const ggml_tensor * op) {
+        const ggml_tensor * op,
+        bool direct_k) {
     GGML_ASSERT(op->op == GGML_OP_LIGHTNING_INDEXER);
+    GGML_ASSERT(!direct_k || op->src[1]->type == GGML_TYPE_F16);
 
     char name[256];
 
-    snprintf(name, 256, "kernel_lightning_indexer_%s", ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "kernel_lightning_indexer_%s%s", ggml_type_name(op->src[1]->type), direct_k ? "_direct" : "");
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
     }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack(ggml_metal_library_t lib, ggml_type type) {
+    char name[256];
+    snprintf(name, 256, "kernel_dsv4_sparse_pack_%s", ggml_type_name(type));
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv4_hc_pre_norm_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.smem = 32*sizeof(float);
 
     return res;
 }
@@ -510,7 +578,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             snprintf(name, 256, "%s_n_hc=%d", base, (int) op->src[0]->ne[1]);
             break;
         case GGML_OP_DSV4_HC_POST:
-            base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
+            base = ggml_get_op_params_i32(op, 1) != 0 ? "kernel_dsv4_hc_post_gated_f32" :
+                op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
             snprintf(name, 256, "%s", base);
             break;
         default:
@@ -531,6 +600,50 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
         if (cv) {
             ggml_metal_cv_free(cv);
         }
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv4_hc_post_add_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_affine(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv4_hc_affine_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_block_score(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_block_score_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_indexed(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_indexed_pack_f16_d256";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
     }
 
     return res;
@@ -797,6 +910,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
+    const bool f32_inputs = (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32 &&
+        (ggml_get_op_params_i32(op, 2) == GGML_PREC_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32);
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
@@ -804,10 +919,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+    const bool tall = !has_tensor && tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && op->src[0]->ne[0] >= 8192 && op->ne[0] >= 4096 && op->ne[1] >= 2048;
+    const int nr0 = tall ? 128 : 64;
 
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+        : (op->ne[0] % nr0 != 0 || op->ne[1] % 32  != 0);
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -815,9 +932,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), f32_inputs ? "_f32_inputs" : "");
+    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_tall=%d",
+             base, bc_inp, bc_out, ne12, ne13, r2, r3, tall);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -829,6 +946,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+        ggml_metal_cv_set_bool(cv, tall,  FC_MUL_MM + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -839,16 +957,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = NRA;
         res.nr1 = NRB;
 
-        const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+        const size_t smem_a = NRA * N_MM_NK_TOTAL * (f32_inputs ? sizeof(float) : sizeof(ggml_fp16_t));
         res.smem = smem_a;
     } else {
-        res.nr0 = 64;
+        res.nr0 = nr0;
         res.nr1 = 32;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        const size_t smem_inputs = (nr0 + 32)*32*(f32_inputs ? sizeof(float) : sizeof(ggml_fp16_t));
+        res.smem = bc_out ? std::max<size_t>(nr0*32*sizeof(float), smem_inputs) : smem_inputs;
     }
 
-    res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+    res.nsg = tall ? 8 : N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
     return res;
 }
@@ -885,11 +1004,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr1 = 1;
                     suffix = "_short";
                 } else {
+                    const bool use_nr4 = ne01 == 4 && ne11 > 8 && ne00 % 4 == 0 && tsrc1 == GGML_TYPE_F32 &&
+                        (tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_BF16);
+                    const bool use_nr1 = (ne01 == 1 && ne11 > 8 && ne00 % 4 == 0) ||
+                        (tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 && ne11 == 1 && ne01 <= 24 && ne00 >= 4096);
                     nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
+                    if (use_nr4) {
+                        nr0 = 4;
+                    } else if (use_nr1) {
+                        nr0 = 1;
+                    } else {
+                        nr0 = 2;
+                    }
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
-                    suffix = ne00 % 4 == 0 ? "_4" : "";
+                    if (use_nr4) {
+                        suffix = "_4_nr4";
+                    } else if (ne00 % 4 == 0) {
+                        suffix = "_4";
+                    }
                 }
             } break;
         case GGML_TYPE_Q1_0:
@@ -924,7 +1057,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q8_0:
             {
-                nsg = N_SG_Q8_0;
+                if (ne00 <= 1024 && ne01 >= 1024) {
+                    nsg = 1;
+                } else if (ne00 <= 4096 && ne01 >= 1024) {
+                    nsg = 2;
+                } else {
+                    nsg = N_SG_Q8_0;
+                }
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
             } break;
@@ -987,7 +1126,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
+                smem = 256*4;
 
                 // split the rows across threads when there are fewer than 32 chunks per row
                 const int nb32 = ne00/32;
@@ -1129,25 +1268,43 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(g
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20, int ne21) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
-    snprintf(name, 256, "%s_ne02=%d", base, ne02);
+    const bool use_parallel = ne02 >= 256 && ne21 >= 256;
+    if (use_parallel) {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_parallel_ne20_%d", ne20);
+        snprintf(name, 256, "%s", base);
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+        snprintf(name, 256, "%s_ne02=%d", base, ne02);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = (size_t) ne02*ne20*sizeof(uint16_t);
-    res.smem = GGML_PAD(res.smem, 16);
+    res.nr0  = use_parallel ? 256 : ne02;
+    res.nr1  = use_parallel ? ne02 : 1;
+    res.smem = use_parallel ? 0 : GGML_PAD((size_t) ne02*ne20*sizeof(uint16_t), 16);
 
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map1(ggml_metal_library_t lib, bool split_tail) {
+    const char * name = split_tail ? "kernel_mul_mm_id_map1_split_tail" : "kernel_mul_mm_id_map1";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op, bool compact, bool tail16) {
     char base[256];
     char name[256];
 
@@ -1159,8 +1316,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     // src1 prec [TAG_GGML_PREC]
     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_amax=%d", base, bc_inp, amax);
+    GGML_ASSERT(!tail16 || (compact && tsrc0 == GGML_TYPE_IQ3_XXS && tsrc1 == GGML_TYPE_F32));
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), tail16 ? "_tail16" : "");
+    snprintf(name, 256, "%s_bci=%d_amax=%d_compact=%d", base, bc_inp, amax, compact);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1168,13 +1326,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, amax,   FC_MUL_MM + 6);
+        ggml_metal_cv_set_bool(cv, compact, FC_MUL_MM + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 8192;
+    res.smem = tail16 ? 6144 : 8192;
 
     return res;
 }
@@ -1306,7 +1465,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
+                smem = 256*4;
 
                 // split the rows across threads when there are fewer than 32 chunks per row
                 const int nb32 = ne00/32;
@@ -1383,6 +1542,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 GGML_ABORT("not implemented");
             }
     };
+
+    if (tsrc0 == GGML_TYPE_IQ3_XXS && op->src[2]->ne[1] == 1) {
+        suffix = "_decode";
+    }
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
@@ -1523,6 +1686,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_512_10(ggml_metal_library_t lib) {
+    const char * name = "kernel_top_k_512_10_f32_i32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
     return res;
 }
 
@@ -1727,33 +1899,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
 
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
+    const bool q_f16 = op->src[0]->type == GGML_TYPE_F16;
 
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
     // do bounds checks for the mask?
-    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool indexed_batch = op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED && op->src[0]->ne[1] > 1;
+    const bool bc_mask = !indexed_batch && op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool scan_mask = has_mask && op->src[3]->ne[1] != 1;
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext",
+            indexed_batch ? "flash_attn_ext_indexed" : "flash_attn_ext",
             type,
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_qf16=%d_bcm=%d_scanm=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
             has_mask,
             has_sinks,
             has_bias,
             has_scap,
             has_kvpad,
+            q_f16,
             bc_mask,
+            scan_mask,
             ns10,
             ns20,
             nsg);
@@ -1767,8 +1944,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT + 2);
         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT + 3);
         ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT + 4);
+        ggml_metal_cv_set_bool(cv, q_f16,     FC_FLASH_ATTN_EXT + 5);
 
         ggml_metal_cv_set_bool(cv, bc_mask, FC_FLASH_ATTN_EXT + 10);
+        ggml_metal_cv_set_bool(cv, scan_mask, FC_FLASH_ATTN_EXT + 11);
 
         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT + 20);
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
@@ -1818,13 +1997,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
 
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
+    const bool q_f16 = op->src[0]->type == GGML_TYPE_F16;
 
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
@@ -1840,7 +2020,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dv,
             qne_suffix);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_qf16=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
             has_mask,
             has_sinks,
@@ -1848,6 +2028,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             has_scap,
             has_kvpad,
             has_sparse,
+            q_f16,
             ns10,
             ns20,
             nsg, nwg);
@@ -1862,6 +2043,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_VEC + 3);
         ggml_metal_cv_set_bool(cv, has_kvpad,  FC_FLASH_ATTN_EXT_VEC + 4);
         ggml_metal_cv_set_bool(cv, has_sparse, FC_FLASH_ATTN_EXT_VEC + 5);
+        ggml_metal_cv_set_bool(cv, q_f16,      FC_FLASH_ATTN_EXT_VEC + 6);
 
         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT_VEC + 20);
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
@@ -1881,7 +2063,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         const ggml_tensor * op,
         int32_t dv,
         int32_t nwg) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     char base[256];
     char name[256];
@@ -2104,6 +2286,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale(ggml_
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_bool(cv, true, FC_NORM + 0);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_rope(ggml_metal_library_t lib, ggml_type type) {
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, sizeof(base), "kernel_rms_norm_rope_%s_512", ggml_type_name(type));
+    snprintf(name, sizeof(name), "%s_imrope=0_is_back=0", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 0);
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 1);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

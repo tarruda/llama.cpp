@@ -183,16 +183,18 @@ static void dsv4_hc_post_f32_sycl(
             const int64_t idst = (ir / n_embd) % hc;
             const int64_t it   = ir / (n_embd * hc);
 
-            float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+            volatile float sum = 0.0f;
             if constexpr (has_comb) {
                 for (int64_t isrc = 0; isrc < hc; ++isrc) {
-                    sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+                    volatile float product = residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+                    sum = isrc == 0 ? product : sum + product;
                 }
             } else {
-                sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+                sum = residual[i0*sr0 + idst*sr1 + it*sr2];
             }
+            volatile float product = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
 
-            dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+            dst[i0*sd0 + idst*sd1 + it*sd2] = product + sum;
         });
 }
 

@@ -47,9 +47,15 @@ enum llm_fused_op {
     LLM_FUSED_OP_GDN_AR,
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
+    LLM_FUSED_OP_DSV4_COMPRESS,
+    LLM_FUSED_OP_DSV4_TOP_K_MASK,
+    LLM_FUSED_OP_DSV4_SPARSE_PACK,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_QWEN4EXP_HC_POST,
+    LLM_FUSED_OP_QSA_BLOCK_SCORE,
+    LLM_FUSED_OP_QSA_ATTN,
 };
 
 enum llm_ffn_op_type : int {
@@ -1192,7 +1198,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_indices = nullptr,
+            ggml_tensor * kv_mask = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1224,7 +1232,9 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_indices = nullptr,
+            ggml_tensor * kv_mask = nullptr) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

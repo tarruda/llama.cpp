@@ -136,6 +136,15 @@
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
 
+#define OP_QSA_BLOCK_SCORE_D   128
+#define OP_QSA_BLOCK_SCORE_NH    4
+#define OP_QSA_BLOCK_SCORE_NSG   2
+#define OP_QSA_BLOCK_SCORE_NKPSG 3
+
+#define OP_FLASH_ATTN_EXT_INDEXED_D       256
+#define OP_FLASH_ATTN_EXT_INDEXED_N_HEAD   24
+#define OP_FLASH_ATTN_EXT_INDEXED_N_KV      2
+
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
 #define OP_UNARY_NUM_CLAMP      12
@@ -145,6 +154,9 @@
 #define OP_UNARY_NUM_COS        16
 #define OP_UNARY_NUM_LOG        17
 #define OP_UNARY_NUM_LEAKY_RELU 18
+#define OP_UNARY_NUM_SIGMOID_SCALE 19
+#define OP_UNARY_NUM_SOFTPLUS_SQRT 20
+#define OP_UNARY_NUM_SCALE_SILU 21
 
 #define OP_UNARY_NUM_TANH        100
 #define OP_UNARY_NUM_RELU        101
@@ -436,6 +448,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
@@ -471,6 +484,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;
@@ -490,6 +504,20 @@ typedef struct {
 typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
+
+typedef struct {
+    int32_t  n_kv;
+    int32_t  n_select;
+    int32_t  n_padded;
+    uint64_t nb_k1;
+    uint64_t nb_k2;
+    uint64_t nb_k3;
+    uint64_t nb_v1;
+    uint64_t nb_v2;
+    uint64_t nb_v3;
+    uint64_t nb_i3;
+    uint64_t nb_m3;
+} ggml_metal_kargs_flash_attn_ext_indexed;
 
 typedef struct {
     int32_t  ne00;
@@ -1276,6 +1304,7 @@ typedef struct {
     int32_t  n_kv;
     int32_t  n_batch;
     int32_t  mask_ne3;
+    int32_t  kv_offset;
     uint64_t nb1;
     uint64_t nb3;
     uint64_t nbq1;
@@ -1303,6 +1332,65 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hc_comb;
 
 typedef struct {
+    int32_t  n_tokens;
+    int32_t  n_iter;
+    float    eps;
+    uint64_t nb_m1;
+} ggml_metal_kargs_dsv4_hc_split;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_blocks;
+    int32_t  n_rows;
+    int32_t  ratio;
+    int32_t  overlap;
+    uint64_t nb_k0;
+    uint64_t nb_k1;
+    uint64_t nb_s0;
+    uint64_t nb_s1;
+    uint64_t nb_i0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_compress;
+
+typedef struct {
+    int32_t  n_raw;
+    int32_t  n_comp;
+    int32_t  n_select;
+    int32_t  n_query;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_dsv4_top_k_mask;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_batch;
+    int32_t  n_raw;
+    int32_t  n_raw_k;
+    int32_t  n_comp;
+    uint64_t nb_rk2;
+    uint64_t nb_rk3;
+    uint64_t nb_ck2;
+    uint64_t nb_ck3;
+    uint64_t nb_rm0;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm0;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci0;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_sparse_pack;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;
@@ -1321,6 +1409,20 @@ typedef struct {
     int32_t  n_tokens;
     uint64_t nb_x0;
     uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_n0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_pre_norm;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
     uint64_t nb_r0;
     uint64_t nb_r1;
     uint64_t nb_r2;
@@ -1332,7 +1434,48 @@ typedef struct {
     uint64_t nb_d0;
     uint64_t nb_d1;
     uint64_t nb_d2;
+    float    scale;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  weighted;
+    float    limit;
+    uint64_t nb_g1;
+    uint64_t nb_g2;
+    uint64_t nb_g3;
+    uint64_t nb_u1;
+    uint64_t nb_u2;
+    uint64_t nb_u3;
+    uint64_t nb_w1;
+    uint64_t nb_w2;
+    uint64_t nb_w3;
+} ggml_metal_kargs_dsv4_swiglu;
+
+typedef struct {
+    int32_t  n_tokens;
+    uint64_t nb_x1;
+    uint64_t nb_d1;
+    float    post_scale;
+    float    post_bias;
+} ggml_metal_kargs_dsv4_hc_affine;
+
+typedef struct {
+    int32_t  n_blocks;
+    float    scale;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    uint64_t nb_q3;
+    uint64_t nb_k1;
+    uint64_t nb_c1;
+    uint64_t nb_c3;
+    uint64_t nb_m1;
+    uint64_t nb_m3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_qsa_block_score;
 
 typedef struct {
     int32_t  ne00;

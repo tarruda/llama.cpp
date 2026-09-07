@@ -1068,6 +1068,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_INDEXED",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1081,9 +1082,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "DSV4_COMPRESS",
+    "DSV4_TOP_K_MASK",
+    "DSV4_SPARSE_PACK",
     "DSV4_HC_COMB",
+    "DSV4_HC_SPLIT",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_SWIGLU",
+    "QSA_BLOCK_SCORE",
 
     "UNARY",
 
@@ -1101,7 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1183,6 +1190,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_indexed(q, k, v, indices, mask)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1196,9 +1204,15 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "dsv4_compress(kv_state, score_state, read_idxs)",
+    "dsv4_top_k_mask(raw_mask, comp_mask, comp_idx)",
+    "dsv4_sparse_pack(raw_k, comp_k, raw_mask, comp_mask, comp_idx)",
     "dsv4_hc_comb(mixes, scale, base)",
+    "dsv4_hc_split(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_swiglu(gate, up, weights)",
+    "qsa_block_score(q, k, cells, mask)",
 
     "unary(x)",
 
@@ -1216,7 +1230,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3313,7 +3327,7 @@ bool ggml_prec_set_src(
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-                if (idx != 1) {
+                if (idx != 1 && (idx != 0 || a->op != GGML_OP_MUL_MAT)) {
                     return false;
                 }
 
@@ -5511,7 +5525,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(ggml_is_contiguous(mask) || (mask->ne[1] == 1 && ggml_is_contiguous_rows(mask)));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5534,6 +5548,56 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_indexed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * indices,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 logit_softcap) {
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(k->type       == GGML_TYPE_F16);
+    GGML_ASSERT(v->type       == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F16);
+
+    GGML_ASSERT(q->nb[0]       == sizeof(float));
+    GGML_ASSERT(k->nb[0]       == sizeof(ggml_fp16_t));
+    GGML_ASSERT(v->nb[0]       == sizeof(ggml_fp16_t));
+    GGML_ASSERT(indices->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(mask->nb[0]    == sizeof(ggml_fp16_t));
+
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(k->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(indices->ne[1] == q->ne[1]);
+    GGML_ASSERT(indices->ne[2] == 1);
+    GGML_ASSERT(indices->ne[3] == q->ne[3]);
+    GGML_ASSERT(ggml_are_same_shape(indices, mask));
+    GGML_ASSERT(ggml_is_contiguous(indices));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_INDEXED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = indices;
+    result->src[4] = mask;
 
     return result;
 }
@@ -5581,6 +5645,23 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_sinks_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    if (!sinks) {
+        a->src[4] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(a->src[0]->ne[1] == sinks->ne[0]);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+
+    a->src[4] = sinks;
+    ggml_set_op_params_i32(a, 5, 1);
 }
 
 // ggml_flash_attn_back
@@ -6454,6 +6535,123 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+// ggml_dsv4_compress
+
+struct ggml_tensor * ggml_dsv4_compress(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv_state,
+        struct ggml_tensor  * score_state,
+        struct ggml_tensor  * read_idxs,
+        int32_t               ratio,
+        bool                  overlap) {
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(read_idxs->type   == GGML_TYPE_I32);
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
+    GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
+    GGML_ASSERT(kv_state->ne[2] == 1 && kv_state->ne[3] == 1);
+    GGML_ASSERT(score_state->ne[2] == 1 && score_state->ne[3] == 1);
+    GGML_ASSERT(read_idxs->ne[1] == 1 && read_idxs->ne[2] == 1 && read_idxs->ne[3] == 1);
+
+    const int64_t n_read_per_block = (overlap ? 2 : 1)*ratio;
+    GGML_ASSERT(read_idxs->ne[0] % n_read_per_block == 0);
+
+    const int64_t n_blocks = read_idxs->ne[0]/n_read_per_block;
+    const int64_t n_embd   = overlap ? kv_state->ne[0]/2 : kv_state->ne[0];
+
+    GGML_ASSERT(n_blocks > 0 && n_embd > 0);
+    GGML_ASSERT(kv_state->ne[0] == (overlap ? 2 : 1)*n_embd);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, overlap ? 1 : 0);
+
+    result->op     = GGML_OP_DSV4_COMPRESS;
+    result->src[0] = kv_state;
+    result->src[1] = score_state;
+    result->src[2] = read_idxs;
+
+    return result;
+}
+
+// ggml_dsv4_top_k_mask
+
+struct ggml_tensor * ggml_dsv4_top_k_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx) {
+    GGML_ASSERT(raw_mask->type  == GGML_TYPE_F16);
+    GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_idx->type  == GGML_TYPE_I32);
+    GGML_ASSERT(raw_mask->ne[2] == 1 && comp_mask->ne[2] == 1 && comp_idx->ne[2] == 1);
+    GGML_ASSERT(raw_mask->ne[1] == comp_mask->ne[1]);
+    GGML_ASSERT(raw_mask->ne[1] == comp_idx->ne[1]);
+    GGML_ASSERT(raw_mask->ne[3] == comp_mask->ne[3]);
+    GGML_ASSERT(raw_mask->ne[3] == comp_idx->ne[3]);
+    GGML_ASSERT(comp_idx->ne[0] <= comp_mask->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+            raw_mask->ne[0] + comp_mask->ne[0], raw_mask->ne[1], 1, raw_mask->ne[3]);
+
+    result->op     = GGML_OP_DSV4_TOP_K_MASK;
+    result->src[0] = raw_mask;
+    result->src[1] = comp_mask;
+    result->src[2] = comp_idx;
+
+    return result;
+}
+
+// ggml_dsv4_sparse_pack
+
+struct ggml_tensor * ggml_dsv4_sparse_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * comp_k,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx,
+        int64_t               n_raw) {
+    GGML_ASSERT(raw_k->type == comp_k->type);
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(raw_mask->type  == GGML_TYPE_F16);
+    GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_idx->type  == GGML_TYPE_I32);
+
+    const int64_t d        = raw_k->ne[0];
+    const int64_t n_stream = raw_k->ne[3];
+    const int64_t nq       = raw_mask->ne[1];
+    const int64_t nk       = n_raw + comp_idx->ne[0];
+
+    GGML_ASSERT(n_raw >= 0 && n_raw <= raw_k->ne[2]);
+    GGML_ASSERT(nk > 0);
+    GGML_ASSERT(comp_k->ne[0] == d);
+    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
+    GGML_ASSERT(comp_k->ne[3] == n_stream);
+    GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2]);
+    GGML_ASSERT(comp_mask->ne[0] == comp_k->ne[2]);
+    GGML_ASSERT(comp_mask->ne[1] == nq);
+    GGML_ASSERT(raw_mask->ne[2] == 1 && comp_mask->ne[2] == 1);
+    GGML_ASSERT(raw_mask->ne[3] == n_stream && comp_mask->ne[3] == n_stream);
+    GGML_ASSERT(comp_idx->ne[1] == nq && comp_idx->ne[2] == 1);
+    GGML_ASSERT(comp_idx->ne[3] == n_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nk*(d + 1), nq*n_stream);
+
+    result->op     = GGML_OP_DSV4_SPARSE_PACK;
+    result->src[0] = raw_k;
+    result->src[1] = comp_k;
+    result->src[2] = raw_mask;
+    result->src[3] = comp_mask;
+    result->src[4] = comp_idx;
+
+    ggml_set_op_params_i32(result, 0, n_raw);
+
+    return result;
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
@@ -6545,6 +6743,28 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_hc_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes) && ggml_is_contiguous(scale) && ggml_is_contiguous(base));
+    GGML_ASSERT(mixes->ne[0] == 24 && ggml_is_matrix(mixes));
+    GGML_ASSERT(ggml_nelements(scale) == 3 && ggml_nelements(base) == 24 && eps > 0 && n_iter > 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+    result->op = GGML_OP_DSV4_HC_SPLIT;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+    return result;
+}
+
 struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -6604,6 +6824,84 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_post_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * gate,
+        float                 scale) {
+    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, x, residual, gate, NULL);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, 1);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * weights,
+        float                 limit) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(gate) && ggml_is_contiguous_rows(up) && ggml_are_same_shape(gate, up));
+    GGML_ASSERT(isfinite(limit) && limit >= 0);
+    if (weights) {
+        GGML_ASSERT(weights->type == GGML_TYPE_F32 && weights->ne[0] == 1);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            GGML_ASSERT(weights->ne[i] == gate->ne[i]);
+        }
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, gate);
+    result->op = GGML_OP_DSV4_SWIGLU;
+    result->src[0] = gate;
+    result->src[1] = up;
+    result->src[2] = weights;
+    ggml_set_op_params_f32(result, 0, limit);
+    return result;
+}
+// ggml_qsa_block_score
+
+struct ggml_tensor * ggml_qsa_block_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * mask,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(cells->ne[0] == mask->ne[0]);
+    GGML_ASSERT(cells->ne[1] == 1 || cells->ne[1] == q->ne[2]);
+    GGML_ASSERT(mask->ne[1] == q->ne[2]);
+    GGML_ASSERT(cells->ne[2] == 1 && mask->ne[2] == 1);
+    GGML_ASSERT(cells->ne[3] == q->ne[3]);
+    GGML_ASSERT(cells->ne[3] == mask->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F32, cells->ne[0], q->ne[2], 1, q->ne[3]);
+
+    result->op     = GGML_OP_QSA_BLOCK_SCORE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = cells;
+    result->src[3] = mask;
+
+    ggml_set_op_params_f32(result, 0, scale);
 
     return result;
 }

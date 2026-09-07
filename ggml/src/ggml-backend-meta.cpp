@@ -1012,6 +1012,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
             } break;
+            case GGML_OP_FLASH_ATTN_EXT_INDEXED: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1035,10 +1038,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
             } break;
+            case GGML_OP_DSV4_COMPRESS:
+            case GGML_OP_DSV4_TOP_K_MASK:
+            case GGML_OP_DSV4_SPARSE_PACK:
             case GGML_OP_DSV4_HC_COMB:
+            case GGML_OP_DSV4_HC_SPLIT:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_QSA_BLOCK_SCORE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_DSV4_SWIGLU: {
+                split_state = handle_bin_bcast(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

@@ -561,14 +561,16 @@ void dequantize_iq3_xxs(device const block_iq3_xxs * xb, short il, thread type4x
     const float dl = d * (0.5f + (aux32 >> 28)) * 0.5f;
     constant uint8_t * grid1 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+0]);
     constant uint8_t * grid2 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+1]);
-    uint8_t signs = ksigns_iq2xs[(aux32 >> 14*il) & 127];
+    uint signs7 = (aux32 >> 14*il) & 127;
+    uint signs = signs7 | ((popcount(signs7) & 1) << 7);
     for (int i = 0; i < 4; ++i) {
         reg[0][i] = dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f);
         reg[1][i] = dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f);
     }
     grid1 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+2]);
     grid2 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+3]);
-    signs = ksigns_iq2xs[(aux32 >> (14*il+7)) & 127];
+    signs7 = (aux32 >> (14*il+7)) & 127;
+    signs = signs7 | ((popcount(signs7) & 1) << 7);
     for (int i = 0; i < 4; ++i) {
         reg[2][i] = dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f);
         reg[3][i] = dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f);

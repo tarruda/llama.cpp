@@ -4,6 +4,7 @@
 
 #include <array>
 #include <limits>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -119,7 +120,67 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    void set_input_qsa_cached(
+            ggml_tensor * block_cells, ggml_tensor * block_mask,
+            ggml_tensor * selected, ggml_tensor * tail_cells, ggml_tensor * tail_mask,
+            ggml_tensor * block_key_cells, ggml_tensor * update_cells,
+            ggml_tensor * update_pos, ggml_tensor * update_idxs,
+            const llama_ubatch * ubatch, uint32_t n_stream, uint32_t ratio) const;
+
+    uint32_t get_qsa_update_capacity(
+            const llama_ubatch & ubatch, uint32_t n_stream,
+            uint32_t ratio, uint32_t n_kv, uint32_t n_blocks, bool reserve) const;
+
 private:
+    friend class llama_memory_hybrid_idx_context;
+
+    struct qsa_block {
+        std::vector<uint32_t> cells;
+        std::array<llama_pos, 4> pos = {};
+        int32_t start = 0;
+        uint32_t member_cell = 0;
+        uint32_t key_cell = 0;
+        uint32_t cache_stream = 0;
+
+        bool operator==(const qsa_block & other) const {
+            return cells == other.cells && pos == other.pos && key_cell == other.key_cell && cache_stream == other.cache_stream;
+        }
+    };
+
+    struct qsa_stream_layout {
+        std::vector<qsa_block> blocks;
+        std::vector<int32_t> order;
+        std::vector<int32_t> rank;
+        llama_seq_id seq_id = -1;
+        llama_pos seq_pos_min = -1;
+        llama_pos seq_pos_max = -1;
+        uint32_t last_cell = 0;
+        uint32_t fallback_cell = 0;
+        uint32_t cache_stream = 0;
+        std::array<llama_pos, 4> fallback_pos = {};
+        bool ranked = false;
+        bool appendable = false;
+    };
+
+    struct qsa_layout {
+        std::vector<qsa_stream_layout> streams;
+        std::vector<std::pair<uint32_t, uint32_t>> updates;
+        uint32_t n_tokens = 0;
+        uint32_t n_kv = 0;
+        uint32_t n_stream = 0;
+        uint32_t ratio = 0;
+    };
+
+    qsa_layout build_qsa_layout(
+            const llama_ubatch & ubatch, uint32_t n_stream,
+            uint32_t ratio, uint32_t n_kv, uint32_t n_blocks) const;
+
+    bool try_append_qsa_layout(
+            qsa_layout & layout, const llama_ubatch & ubatch,
+            uint32_t n_stream, uint32_t ratio, uint32_t n_kv, uint32_t n_blocks) const;
+
+    void find_qsa_updates(qsa_layout & layout) const;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -143,6 +204,8 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+    mutable std::map<uint32_t, qsa_layout> qsa_pending;
+    mutable std::map<uint32_t, std::vector<std::vector<qsa_block>>> qsa_blocks;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -216,6 +279,17 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
 
+    void set_input_qsa_cached(
+            ggml_tensor * block_cells, ggml_tensor * block_mask,
+            ggml_tensor * selected, ggml_tensor * tail_cells, ggml_tensor * tail_mask,
+            ggml_tensor * block_key_cells, ggml_tensor * update_cells,
+            ggml_tensor * update_pos, ggml_tensor * update_idxs,
+            const llama_ubatch * ubatch, uint32_t ratio) const;
+
+    uint32_t get_qsa_update_capacity(
+            const llama_ubatch & ubatch, uint32_t ratio,
+            uint32_t n_kv, uint32_t n_blocks) const;
+
 private:
     llama_memory_hybrid_idx * mem = nullptr;
 
@@ -225,6 +299,8 @@ private:
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
+
+    const bool has_ubatches = false;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
