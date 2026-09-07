@@ -111,10 +111,16 @@ template <typename T> static T stdev(const std::vector<T> & v) {
     if (v.size() <= 1) {
         return 0;
     }
-    T mean   = avg(v);
-    T sq_sum = std::inner_product(v.begin(), v.end(), v.begin(), T(0));
-    T stdev  = std::sqrt(sq_sum / (T) (v.size() - 1) - mean * mean * (T) v.size() / (T) (v.size() - 1));
-    return stdev;
+    long double mean = 0.0;
+    long double sum_sq = 0.0;
+    size_t count = 0;
+    for (T value : v) {
+        ++count;
+        const long double delta = (long double) value - mean;
+        mean += delta / count;
+        sum_sq += delta * ((long double) value - mean);
+    }
+    return (T) std::sqrt(sum_sq / (v.size() - 1));
 }
 
 static std::string get_cpu_info() {

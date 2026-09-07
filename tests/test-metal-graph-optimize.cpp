@@ -273,13 +273,75 @@ static bool check_chained_pack_reader() {
     return report_reader("reader of a chained MUL_MAT+ADD sum", packed, after);
 }
 
+static bool check_hc_post_gate() {
+    enum {
+        HC_POST_IDENTITY, HC_POST_COMB, HC_POST_INPUT_BIAS, HC_POST_OUTPUT_BIAS, HC_POST_TANH, HC_POST_EXTRA_READER,
+        HC_POST_LIVE_SCALE, HC_POST_LIVE_SIGMOID, HC_POST_LIVE_WEIGHTS, HC_POST_GATED, HC_POST_ALIAS, HC_POST_INPLACE, HC_POST_STRIDED_GATE,
+        HC_POST_X_SCALE, HC_POST_X_SIGMOID, HC_POST_X_WEIGHTS,
+    };
+    const char * cases[] = {
+        "identity", "comb", "input bias", "output bias", "tanh", "extra reader", "live scale", "live sigmoid", "live weights", "gated post", "aliased output", "inplace scale",
+        "strided gate", "scale reused as x", "sigmoid reused as x", "weights reused as x",
+    };
+    bool all_ok = true;
+    for (int c = 0; c < (int) (sizeof(cases)/sizeof(cases[0])); ++c) {
+        ggml_context * ctx = graph_ctx();
+        const bool reuse_gate = c >= HC_POST_X_SCALE && c <= HC_POST_X_WEIGHTS;
+        const int64_t n_embd = reuse_gate ? 4 : 33;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 7);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, 7);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c == HC_POST_STRIDED_GATE ? 8 : 4, 7);
+        if (c == HC_POST_STRIDED_GATE) {
+            gate = ggml_view_2d(ctx, gate, 4, 7, gate->nb[1], sizeof(float));
+        }
+        ggml_tensor * scale_in = c == HC_POST_INPLACE ? ggml_scale_inplace(ctx, gate, 0.25f) : ggml_scale_bias(ctx, gate, 0.25f, c == HC_POST_INPUT_BIAS ? 1.0f : 0.0f);
+        ggml_tensor * sigmoid = c == HC_POST_TANH ? ggml_tanh(ctx, scale_in) : ggml_sigmoid(ctx, scale_in);
+        ggml_tensor * scale_out = ggml_scale_bias(ctx, sigmoid, 2.0f, c == HC_POST_OUTPUT_BIAS ? 1.0f : 0.0f);
+        ggml_tensor * comb = c == HC_POST_COMB ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 7) : nullptr;
+        if (reuse_gate) {
+            x = c == HC_POST_X_SCALE ? scale_in : c == HC_POST_X_SIGMOID ? sigmoid : scale_out;
+        }
+        ggml_tensor * out = c == HC_POST_GATED ? ggml_dsv4_hc_post_gated(ctx, x, residual, scale_out, 0.25f) : ggml_dsv4_hc_post(ctx, x, residual, scale_out, comb);
+        const std::vector<ggml_tensor *> nodes = { scale_in, sigmoid, scale_out, out };
+        if (c >= HC_POST_LIVE_SCALE && c <= HC_POST_LIVE_WEIGHTS) {
+            ggml_set_output(nodes[c - HC_POST_LIVE_SCALE]);
+        }
+
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        if (c == HC_POST_EXTRA_READER) {
+            ggml_build_forward_expand(graph, ggml_sum(ctx, sigmoid));
+        }
+        const std::vector<int> idxs = node_positions(graph, nodes);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (c == HC_POST_ALIAS) {
+            out->data = residual->data;
+        }
+
+        for (ggml_metal_fusion_mode mode : { GGML_METAL_FUSION_STRUCTURAL, GGML_METAL_FUSION_FULL }) {
+            int n_fused = 1;
+            const ggml_metal_fusion * fusion = ggml_metal_fusion_next(graph, idxs.data(), idxs.size(), 0, mode, &n_fused);
+            const bool fused = fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DSV4_HC_POST_GATE && n_fused == 4;
+            const bool expected = c == HC_POST_IDENTITY || c == HC_POST_COMB || c == HC_POST_STRIDED_GATE || (c == HC_POST_ALIAS && mode == GGML_METAL_FUSION_STRUCTURAL);
+            const bool ok = fused == expected;
+            std::printf("HC post gate %s, mode %d: fused %d (expected %d): %s\n", cases[c], mode, fused, expected, ok ? "OK" : "FAIL");
+            all_ok &= ok;
+        }
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    return all_ok;
+}
+
 int main() {
     const std::vector<device_case> devices = {
         { "native simdgroup matrices",       true,  true },
         { "probed or no simdgroup matrices", false, true },
     };
     const int failures = run_pack_cases(devices) + (check_chained_pack_reader() ? 0 : 1) + run_row_independent_pack_cases() +
-        (check_encoder_skips_weight_residual() ? 0 : 1);
+        (check_encoder_skips_weight_residual() ? 0 : 1) + (check_hc_post_gate() ? 0 : 1);
 
     return failures == 0 ? 0 : 1;
 }

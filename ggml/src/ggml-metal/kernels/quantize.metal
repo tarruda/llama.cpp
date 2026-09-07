@@ -52,6 +52,17 @@ template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
 
+kernel void kernel_cpy_f32_f32_contiguous(
+        constant ggml_metal_kargs_cpy & args,
+        device const packed_float4 * src0,
+        device       packed_float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const uint64_t n4 = (uint64_t) args.ne00*args.ne01*args.ne02*args.ne03/4;
+    if (tpig < n4) {
+        dst[tpig] = src0[tpig];
+    }
+}
+
 template<short QK,
          typename block_q,
          void (*quantize_func)(device const float *, device block_q &)>

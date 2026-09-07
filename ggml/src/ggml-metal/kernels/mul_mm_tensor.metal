@@ -196,11 +196,11 @@ kernel void kernel_mul_mm_id_tensor(
         return;
     }
 
-    const int im  = tpe_u32[1 + 3*tile];     // expert
-    const int idb = tpe_u32[1 + 3*tile + 1]; // first entry of this tile in hids
+    const int im  = tpe_u32[2 + 3*tile];     // expert
+    const int idb = tpe_u32[2 + 3*tile + 1]; // first entry of this tile in hids
 
     // number of entries in this tile, always <= NR1
-    const short nr1 = (short) ((tpe_u32[1 + 3*tile + 2] < NR1) ? tpe_u32[1 + 3*tile + 2] : NR1);
+    const short nr1 = (short) ((tpe_u32[2 + 3*tile + 2] < NR1) ? tpe_u32[2 + 3*tile + 2] : NR1);
 
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
