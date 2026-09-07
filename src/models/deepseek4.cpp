@@ -841,7 +841,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * out = ggml_flash_attn_ext(ctx0, q_fa, k_sel, k_sel, mask_sel, kq_scale,
                 hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         ggml_flash_attn_ext_add_sinks_rows(out, sinks);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out, il});
         out = ggml_reshape_2d(ctx0, out, q->ne[0]*n_head, nt);
         ggml_build_forward_expand(gf, out);
