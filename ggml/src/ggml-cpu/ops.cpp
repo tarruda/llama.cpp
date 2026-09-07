@@ -8674,6 +8674,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    const bool sinks_rows = ggml_get_op_params_i32(dst, 5);
 
     if (logit_softcap != 0) {
         scale /= logit_softcap;
@@ -8718,7 +8719,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + (iq1%mask->ne[1])*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8810,7 +8811,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
-            const float s = ((float *)((char *) sinks->data))[h];
+            const float s = ((float *)((char *) sinks->data))[sinks_rows ? iq1 : h];
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -8910,6 +8911,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    const bool sinks_rows = ggml_get_op_params_i32(dst, 5);
 
     if (logit_softcap != 0) {
         scale /= logit_softcap;
@@ -8999,7 +9001,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + ((iq1 + tq)%mask->ne[1])*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
                         mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
@@ -9102,9 +9104,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
         // sinks (apply only to valid rows in the tile)
         if (sinks) {
-            const float s = ((float *)((char *) sinks->data))[h];
-
             for (int tq = 0; tq < tile_rows; tq++) {
+                const float s = ((float *)((char *) sinks->data))[sinks_rows ? iq1 + tq : h];
                 float ms = 1.0f;
                 float vs = 1.0f;
 
@@ -11104,6 +11105,199 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+
+// ggml_compute_forward_dsv4_compress
+
+void ggml_compute_forward_dsv4_compress(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv_state    = dst->src[0];
+    const ggml_tensor * score_state = dst->src[1];
+    const ggml_tensor * read_idxs   = dst->src[2];
+
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(read_idxs->type   == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type         == GGML_TYPE_F32);
+
+    const int32_t ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_blocks = dst->ne[1];
+    const int64_t n_rows   = kv_state->ne[1];
+    const int64_t n_read   = (overlap ? 2 : 1)*ratio;
+
+    GGML_ASSERT(ratio > 0 && n_blocks > 0);
+    GGML_ASSERT(kv_state->ne[0] == (overlap ? 2 : 1)*n_embd);
+    GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
+    GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
+    GGML_ASSERT(read_idxs->ne[0] == n_read*n_blocks);
+
+    GGML_TENSOR_LOCALS(size_t, nbk, kv_state,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, score_state, nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, read_idxs,   nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,         nb);
+
+    const int64_t nr  = n_embd*n_blocks;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t ib = ir / n_embd;
+
+        float score_max = -INFINITY;
+        for (int64_t j = 0; j < n_read; ++j) {
+            const bool cur_half = overlap && j >= ratio;
+            const int64_t jr = cur_half ? j - ratio : j;
+            const int64_t idx_pos = (cur_half ? ratio*n_blocks : 0) + ib*ratio + jr;
+            const int32_t idx = *(const int32_t *) ((const char *) read_idxs->data + idx_pos*nbi0);
+
+            GGML_ASSERT(idx >= 0 && idx <= n_rows);
+            if (idx == n_rows) {
+                continue;
+            }
+
+            const int64_t i_src = (cur_half ? n_embd : 0) + i0;
+            const float score = *(const float *) ((const char *) score_state->data + i_src*nbs0 + idx*nbs1);
+            score_max = MAX(score_max, score);
+        }
+
+        float sum_v = 0.0f;
+        float sum_w = 0.0f;
+        if (score_max != -INFINITY) {
+            for (int64_t j = 0; j < n_read; ++j) {
+                const bool cur_half = overlap && j >= ratio;
+                const int64_t jr = cur_half ? j - ratio : j;
+                const int64_t idx_pos = (cur_half ? ratio*n_blocks : 0) + ib*ratio + jr;
+                const int32_t idx = *(const int32_t *) ((const char *) read_idxs->data + idx_pos*nbi0);
+
+                if (idx == n_rows) {
+                    continue;
+                }
+
+                const int64_t i_src = (cur_half ? n_embd : 0) + i0;
+                const float score = *(const float *) ((const char *) score_state->data + i_src*nbs0 + idx*nbs1);
+                const float weight = expf(score - score_max);
+                const float value = *(const float *) ((const char *) kv_state->data + i_src*nbk0 + idx*nbk1);
+                sum_v += value*weight;
+                sum_w += weight;
+            }
+        }
+
+        *(float *) ((char *) dst->data + i0*nbd0 + ib*nbd1) = sum_w > 0.0f ? sum_v/sum_w : 0.0f;
+    }
+}
+
+// ggml_compute_forward_dsv4_top_k_mask
+
+void ggml_compute_forward_dsv4_top_k_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * raw_mask  = dst->src[0];
+    const ggml_tensor * comp_mask = dst->src[1];
+    const ggml_tensor * comp_idx  = dst->src[2];
+
+    GGML_ASSERT(raw_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(comp_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    const int64_t n_raw  = raw_mask->ne[0];
+    const int64_t n_comp = comp_mask->ne[0];
+    const int64_t n_sel  = comp_idx->ne[0];
+    const int64_t nq     = raw_mask->ne[1];
+    const int64_t nrows  = nq*raw_mask->ne[3];
+    const ggml_fp16_t neg_inf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    for (int64_t row = params->ith; row < nrows; row += params->nth) {
+        const int64_t iq = row % nq;
+        const int64_t is = row / nq;
+        ggml_fp16_t * out = (ggml_fp16_t *) ((char *) dst->data + iq*dst->nb[1] + is*dst->nb[3]);
+
+        for (int64_t i = 0; i < n_raw; ++i) {
+            out[i] = *(const ggml_fp16_t *) ((const char *) raw_mask->data +
+                    i*raw_mask->nb[0] + iq*raw_mask->nb[1] + is*raw_mask->nb[3]);
+        }
+        std::fill(out + n_raw, out + n_raw + n_comp, neg_inf);
+
+        for (int64_t i = 0; i < n_sel; ++i) {
+            const int32_t idx = *(const int32_t *) ((const char *) comp_idx->data +
+                    i*comp_idx->nb[0] + iq*comp_idx->nb[1] + is*comp_idx->nb[3]);
+            GGML_ASSERT(idx >= 0 && idx < n_comp);
+            out[n_raw + idx] = *(const ggml_fp16_t *) ((const char *) comp_mask->data +
+                    idx*comp_mask->nb[0] + iq*comp_mask->nb[1] + is*comp_mask->nb[3]);
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_sparse_pack
+
+void ggml_compute_forward_dsv4_sparse_pack(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * raw_k     = dst->src[0];
+    const ggml_tensor * comp_k    = dst->src[1];
+    const ggml_tensor * raw_mask  = dst->src[2];
+    const ggml_tensor * comp_mask = dst->src[3];
+    const ggml_tensor * comp_idx  = dst->src[4];
+
+    const int64_t d  = raw_k->ne[0];
+    const int64_t nq = raw_mask->ne[1];
+    const int64_t nt = dst->ne[1];
+    const int64_t nr = ggml_get_op_params_i32(dst, 0);
+    const int64_t nc = comp_idx->ne[0];
+    const int64_t nk = nr + nc;
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    ggml_to_float_t const k_to_float = raw_k->type == GGML_TYPE_F16 ? nullptr : ggml_get_type_traits(raw_k->type)->to_float;
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || k_to_float);
+    float * k_row_f32 = k_to_float ? (float *) params->wdata + params->ith*d : nullptr;
+
+    const auto copy_k_row = [&](const ggml_tensor * k, int64_t idx, int64_t is, ggml_fp16_t * out) {
+        const char * row = (const char *) k->data + idx*k->nb[2] + is*k->nb[3];
+        if (k_to_float) {
+            k_to_float(row, k_row_f32, d);
+            ggml_fp32_to_fp16_row(k_row_f32, out, d);
+        } else {
+            memcpy(out, row, d*sizeof(ggml_fp16_t));
+        }
+    };
+
+    for (int64_t it = params->ith; it < nt; it += params->nth) {
+        const int64_t iq = it % nq;
+        const int64_t is = it / nq;
+        ggml_fp16_t * out = (ggml_fp16_t *) ((char *) dst->data + it*dst->nb[1]);
+        ggml_fp16_t * out_k = out;
+        ggml_fp16_t * out_m = out + d*nk;
+
+        int64_t ir = 0;
+        for (int64_t idx = 0; idx < raw_k->ne[2] && ir < nr; ++idx) {
+            const ggml_fp16_t m = *(const ggml_fp16_t *) ((const char *) raw_mask->data + idx*raw_mask->nb[0] + iq*raw_mask->nb[1] + is*raw_mask->nb[3]);
+            if (!std::isfinite(GGML_CPU_FP16_TO_FP32(m))) {
+                continue;
+            }
+            copy_k_row(raw_k, idx, is, out_k + ir*d);
+            out_m[ir] = m;
+            ++ir;
+        }
+        for (; ir < nr; ++ir) {
+            memset(out_k + ir*d, 0, d*sizeof(ggml_fp16_t));
+            out_m[ir] = GGML_CPU_FP32_TO_FP16(-INFINITY);
+        }
+
+        for (int64_t i = 0; i < nc; ++i) {
+            const int64_t oi = nr + i;
+            const int32_t idx = *(const int32_t *) ((const char *) comp_idx->data + i*comp_idx->nb[0] + iq*comp_idx->nb[1] + is*comp_idx->nb[3]);
+            GGML_ASSERT(idx >= 0 && idx < comp_k->ne[2]);
+            copy_k_row(comp_k, idx, is, out_k + oi*d);
+            const ggml_fp16_t m = *(const ggml_fp16_t *) ((const char *) comp_mask->data + idx*comp_mask->nb[0] + iq*comp_mask->nb[1] + is*comp_mask->nb[3]);
+            out_m[oi] = m;
+        }
+    }
+}
 
 // ggml_compute_forward_dsv4_hc_comb
 
