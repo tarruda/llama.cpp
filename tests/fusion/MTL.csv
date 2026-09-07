@@ -20,6 +20,7 @@ bailingmoe3         ,1   ,any     ,GATED_DELTA_NET+CPY         ,      1
 bailingmoe3         ,1   ,any     ,MUL+ADD                     ,      2
 bailingmoe3         ,1   ,any     ,RMS_NORM+MUL                ,      8
 bailingmoe3         ,1   ,any     ,RMS_NORM+SCALE              ,      2
+bailingmoe3         ,1   ,any     ,UNARY+SCALE                 ,      1
 beam                ,0   ,any     ,MUL+ADD                     ,      6
 beam                ,0   ,any     ,RMS_NORM+MUL                ,     25
 bloom               ,0   ,any     ,NORM+MUL+ADD                ,      6
@@ -47,10 +48,16 @@ deepseek32          ,0   ,any     ,ADD+ADD                     ,      1
 deepseek32          ,0   ,any     ,MUL+ADD                     ,      2
 deepseek32          ,0   ,any     ,NORM+MUL+ADD                ,      2
 deepseek32          ,0   ,any     ,RMS_NORM+MUL                ,      9
-deepseek4           ,0   ,any     ,MUL+ADD                     ,      8
+deepseek4           ,0   ,any     ,ADD+DSV4_HC_POST            ,      4
+deepseek4           ,0   ,any     ,MUL+ADD+UNARY+SCALE         ,      1
 deepseek4           ,0   ,any     ,RMS_NORM+MUL                ,     20
+deepseek4           ,0   ,any     ,UNARY+SQRT                  ,      4
+deepseek41          ,0   ,prefill ,ADD+DSV4_HC_POST            ,      4
+deepseek41          ,0   ,decode  ,ADD+DSV4_HC_POST            ,      2
 deepseek41          ,0   ,any     ,MUL+ADD                     ,     12
 deepseek41          ,0   ,any     ,RMS_NORM+MUL                ,     29
+deepseek41          ,0   ,decode  ,UNARY+MUL+ADD               ,      2
+deepseek41          ,0   ,any     ,UNARY+SQRT                  ,      6
 dots1               ,0   ,any     ,ADD+ADD                     ,      1
 dots1               ,0   ,any     ,MUL+ADD                     ,      2
 dots1               ,0   ,any     ,RMS_NORM+MUL                ,      9
@@ -93,9 +100,11 @@ glm4moe             ,1   ,any     ,RMS_NORM+MUL                ,      9
 glm5-next           ,0   ,any     ,ADD+ADD+ADD                 ,      1
 glm5-next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 glm5-next           ,0   ,any     ,MUL+ADD                     ,      2
+glm5-next           ,0   ,any     ,MUL+ADD+UNARY+SCALE         ,      8
 glm5-next           ,0   ,any     ,NORM+MUL+ADD                ,      1
 glm5-next           ,0   ,any     ,RMS_NORM+MUL                ,      8
 glm5-next           ,0   ,any     ,RMS_NORM+SCALE              ,      2
+glm5-next           ,0   ,any     ,UNARY+SCALE                 ,      1
 gpt-oss             ,0   ,any     ,MUL+ADD                     ,      4
 gpt-oss             ,0   ,any     ,RMS_NORM+MUL                ,      5
 gpt2                ,0   ,any     ,NORM+MUL+ADD                ,      5
@@ -127,8 +136,11 @@ hy_v3               ,0   ,any     ,ADD+ADD                     ,      2
 hy_v3               ,0   ,any     ,MUL+ADD                     ,      4
 hy_v3               ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v4               ,0   ,any     ,MUL+ADD                     ,      2
+hy_v4               ,0   ,prefill ,MUL+ADD+UNARY+SCALE         ,      7
+hy_v4               ,0   ,decode  ,MUL+ADD+UNARY+SCALE         ,      9
 hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
+hy_v4               ,0   ,prefill ,UNARY+SCALE                 ,      2
 internlm2           ,0   ,any     ,RMS_NORM+MUL                ,      5
 jais                ,0   ,any     ,NORM+MUL+ADD                ,      5
 jais2               ,0   ,any     ,NORM+MUL+ADD                ,      5
@@ -141,10 +153,12 @@ kimi-k3             ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 kimi-k3             ,0   ,any     ,MUL+ADD                     ,      2
 kimi-k3             ,0   ,any     ,RMS_NORM+MUL                ,     17
 kimi-k3             ,0   ,any     ,RMS_NORM+SCALE              ,      2
+kimi-k3             ,0   ,any     ,UNARY+SCALE                 ,      1
 kimi-linear         ,0   ,any     ,ADD+ADD                     ,      1
 kimi-linear         ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 kimi-linear         ,0   ,any     ,MUL+ADD                     ,      2
-kimi-linear         ,0   ,any     ,RMS_NORM+MUL                ,      7
+kimi-linear         ,0   ,any     ,RMS_NORM+MUL                ,      6
+kimi-linear         ,0   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
 kimi-linear         ,0   ,any     ,RMS_NORM+SCALE              ,      2
 kolibri1            ,0   ,any     ,MUL+ADD                     ,      4
 kolibri1            ,0   ,any     ,RMS_NORM+MUL                ,     10
@@ -156,6 +170,7 @@ lfm2                ,0   ,any     ,RMS_NORM+MUL                ,      7
 lfm2moe             ,1   ,any     ,MUL+ADD                     ,      2
 lfm2moe             ,1   ,any     ,RMS_NORM+MUL                ,      7
 lfm3                ,0   ,any     ,RMS_NORM+MUL                ,     17
+limite              ,0   ,any     ,UNARY+SCALE                 ,      1
 llada               ,0   ,any     ,RMS_NORM+MUL                ,      5
 llada-moe           ,1   ,any     ,MUL+ADD                     ,      4
 llada-moe           ,1   ,any     ,RMS_NORM+MUL                ,      9
@@ -247,37 +262,45 @@ qwen2vl             ,0   ,any     ,RMS_NORM+MUL                ,      5
 qwen3               ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen35              ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen35              ,0   ,any     ,RMS_NORM+MUL                ,      8
-qwen35              ,0   ,any     ,RMS_NORM+SCALE              ,      2
-qwen35              ,0   ,any     ,SSM_CONV+UNARY              ,      1
-qwen35moe           ,1   ,any     ,ADD+ADD                     ,      2
+qwen35              ,0   ,prefill ,RMS_NORM+SCALE              ,      2
+qwen35              ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35              ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
 qwen35moe           ,1   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen35moe           ,1   ,any     ,MUL+ADD                     ,      4
 qwen35moe           ,1   ,any     ,RMS_NORM+MUL                ,      8
-qwen35moe           ,1   ,any     ,RMS_NORM+SCALE              ,      2
+qwen35moe           ,1   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen35moe           ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen35moe           ,1   ,any     ,SSM_CONV+UNARY              ,      1
+qwen35moe           ,1   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35moe           ,1   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen35moe           ,1   ,any     ,UNARY+MUL+ADD               ,      2
 qwen3moe            ,1   ,any     ,MUL+ADD                     ,      4
 qwen3moe            ,1   ,any     ,RMS_NORM+MUL                ,      9
 qwen3moe            ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen3next           ,0   ,any     ,ADD+ADD                     ,      2
 qwen3next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen3next           ,0   ,any     ,MUL+ADD                     ,      4
 qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      8
-qwen3next           ,0   ,any     ,RMS_NORM+SCALE              ,      2
+qwen3next           ,0   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen3next           ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen3next           ,0   ,any     ,SSM_CONV+UNARY              ,      1
+qwen3next           ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen3next           ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen3next           ,0   ,any     ,UNARY+MUL+ADD               ,      2
 qwen3tts            ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vl             ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vlmoe          ,1   ,any     ,MUL+ADD                     ,      4
 qwen3vlmoe          ,1   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vlmoe          ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen4exp            ,0   ,any     ,ADD+ADD+ADD                 ,      2
+qwen4exp            ,0   ,any     ,ADD+ADD+ADD                 ,      1
 qwen4exp            ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
+qwen4exp            ,0   ,any     ,IM2COL+MUL_MAT+CONT+UNARY+CONT+ADD+ADD,      1
 qwen4exp            ,0   ,any     ,MUL+ADD                     ,      4
-qwen4exp            ,0   ,any     ,RMS_NORM+MUL                ,     13
-qwen4exp            ,0   ,any     ,RMS_NORM+SCALE              ,      2
-qwen4exp            ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen4exp            ,0   ,any     ,SSM_CONV+UNARY              ,      1
+qwen4exp            ,0   ,any     ,MUL+SUM_ROWS+SCALE+UNARY+UNARY+CLAMP+SQRT+MUL+UNARY,      1
+qwen4exp            ,0   ,any     ,RMS_NORM+MUL                ,     10
+qwen4exp            ,0   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
+qwen4exp            ,0   ,prefill ,RMS_NORM+SCALE              ,      2
+qwen4exp            ,0   ,any     ,SCALE+UNARY                 ,      5
+qwen4exp            ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen4exp            ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen4exp            ,0   ,any     ,UNARY+MUL+ADD               ,      2
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 rnd1                ,0   ,any     ,MUL+ADD                     ,      4

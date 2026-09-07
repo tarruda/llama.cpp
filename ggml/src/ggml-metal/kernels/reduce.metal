@@ -1,5 +1,32 @@
 #include "common.h"
 
+kernel void kernel_ple_gate_f32(
+        constant ggml_metal_kargs_ple_gate & args,
+        device const float * key,
+        device const float * query,
+        device float * dst,
+        uint group [[threadgroup_position_in_grid]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+#pragma clang fp contract(off)
+    const uint row = group*4 + sg;
+    if (row >= args.n_rows) {
+        return;
+    }
+    float sum = 0.0f;
+    for (uint i = lane; i < args.n_embd; i += 32) {
+        const uint offset = row*args.n_embd + i;
+        sum += key[offset]*query[offset];
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        const float s = fma(sum, args.scale, args.bias);
+        const float sign = float(s > 0.0f) - float(s < 0.0f);
+        const float z = sign*sqrt(clamp(abs(s), args.min, args.max));
+        dst[row] = 1.0f/(1.0f + exp(-z));
+    }
+}
+
 kernel void kernel_op_sum_f32(
         constant ggml_metal_kargs_sum & args,
         device const float * src0,

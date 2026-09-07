@@ -1,53 +1,6 @@
 #include "common.h"
 #include "dequantize.h"
 
-// dequantize a quantized KV cache tensor to contiguous F16 before running the F16 flash attention kernels
-// - one thread per block; dispatched separately for K and V
-// - ref: https://github.com/ggml-org/llama.cpp/pull/27390
-template <
-    typename block_t,
-    short QK,
-    void (*deq_t4x4)(device const block_t *, short, thread float4x4 &)>
-kernel void kernel_flash_attn_ext_kv_f16(
-        constant ggml_metal_kargs_flash_attn_ext_kv_f16 & args,
-        device const char * x,
-        device       half * x_dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= (uint) args.nblocks) {
-        return;
-    }
-
-    const uint nb = args.ne0/QK;
-    const uint i0 = gid%nb;
-    uint ib       = gid/nb;
-    const uint i1 = ib%args.ne1;
-    ib /= args.ne1;
-    const uint i2 = ib%args.ne2;
-    const uint i3 = ib/args.ne2;
-
-    const uint64_t offs = i0*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3;
-
-    device const block_t * src = (device const block_t *) (x + offs);
-    device half4 * dst = (device half4 *) x_dst + (QK/4)*gid;
-
-    for (short i = 0; i < QK/16; ++i) {
-        float4x4 reg;
-        deq_t4x4(src, i, reg);
-        dst[4*i + 0] = (half4) reg[0];
-        dst[4*i + 1] = (half4) reg[1];
-        dst[4*i + 2] = (half4) reg[2];
-        dst[4*i + 3] = (half4) reg[3];
-    }
-}
-
-typedef decltype(kernel_flash_attn_ext_kv_f16<block_q8_0, 32, dequantize_q8_0>) kernel_flash_attn_ext_kv_f16_t;
-
-template [[host_name("kernel_flash_attn_ext_kv_q4_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q4_0, 32, dequantize_q4_0>;
-template [[host_name("kernel_flash_attn_ext_kv_q4_1_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q4_1, 32, dequantize_q4_1>;
-template [[host_name("kernel_flash_attn_ext_kv_q5_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q5_0, 32, dequantize_q5_0>;
-template [[host_name("kernel_flash_attn_ext_kv_q5_1_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q5_1, 32, dequantize_q5_1>;
-template [[host_name("kernel_flash_attn_ext_kv_q8_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q8_0, 32, dequantize_q8_0>;
-
 constant bool FC_flash_attn_ext_pad_has_mask [[function_constant(FC_FLASH_ATTN_EXT_PAD + 0)]];
 
 constant int32_t FC_flash_attn_ext_pad_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_PAD + 25)]];
@@ -144,20 +97,18 @@ kernel void kernel_flash_attn_ext_blk(
 
     char res = i0*C + C > args.ne30 || i1*Q + Q > args.ne31 ? 1 : 0;
 
-    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-
     // detailed check of the elements of the block
     if ((C > NW || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
+        const short nq_mask = args.ne31 == 1 ? 1 : Q;
+        FOR_UNROLL (short j = 0; j < nq_mask; ++j) {
+            device const half * mask_src = (device const half *) (mask + ((i1*Q + j)%args.ne31)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                 mmin = min(mmin, mask_src[ii*NW]);
                 mmax = max(mmax, mask_src[ii*NW]);
             }
-
-            mask_src += args.nb31/2;
         }
 
         mmin = simd_min(mmin);
@@ -331,10 +282,128 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
 constant short FC_lightning_indexer_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];
 
+template<typename k4_t>
+kernel void kernel_lightning_indexer_tiled(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device char * dst,
+        threadgroup float * shared [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float * qs = shared;
+    threadgroup float * ks = qs + 32*64;
+    const uint tx = tid%8;
+    const uint ty = tid/8;
+    const uint iq = group.y*16 + ty;
+    const uint ik = group.x*32 + tx*4;
+    float4 acc[4] = {};
+    for (uint kc = 0; kc < 128; kc += 32) {
+        FOR_UNROLL (uint j = 0; j < 4; ++j) {
+            const uint i = tid + j*128;
+            const uint row = i/8;
+            const uint col = 4*(i%8);
+            const uint query = group.y*16 + row/4;
+            float4 v = 0.0f;
+            if (query < args.n_batch) {
+                v = *(device const float4 *) (q + group.z*args.nbq3 + query*args.nbq2 + (row%4)*args.nbq1 + (kc + col)*sizeof(float));
+            }
+            FOR_UNROLL (uint x = 0; x < 4; ++x) {
+                qs[(col + x)*64 + row] = v[x];
+            }
+        }
+        FOR_UNROLL (uint j = 0; j < 2; ++j) {
+            const uint i = tid + j*128;
+            const uint row = i/8;
+            const uint col = 4*(i%8);
+            const uint key = group.x*32 + row;
+            float4 v = 0.0f;
+            if (key < args.n_kv) {
+                v = float4(*(device const k4_t *) (k + group.z*args.nbk3 + key*args.nbk2 + (kc + col)*sizeof(k4_t)/4));
+            }
+            FOR_UNROLL (uint x = 0; x < 4; ++x) {
+                ks[(col + x)*32 + row] = v[x];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint x = 0; x < 32; ++x) {
+            const float4 qv = *(threadgroup float4 *) (qs + x*64 + ty*4);
+            const float4 kv = *(threadgroup float4 *) (ks + x*32 + tx*4);
+            FOR_UNROLL (uint h = 0; h < 4; ++h) {
+                acc[h] = fma(float4(qv[h]), kv, acc[h]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (iq < args.n_batch) {
+        device const float * weights = (device const float *) (w + iq*args.nbw1 + group.z*args.nbw3);
+        device const half * mask = (device const half *) (m + iq*args.nbm1 + (group.z%args.mask_ne3)*args.nbm3);
+        float4 score = 0.0f;
+        FOR_UNROLL (uint h = 0; h < 4; ++h) {
+            score += max(acc[h], 0.0f)*weights[h];
+        }
+        FOR_UNROLL (uint j = 0; j < 4; ++j) {
+            if (ik + j < args.n_kv) {
+                *(device float *) (dst + (ik + j)*sizeof(float) + iq*args.nb1 + group.z*args.nb3) = score[j] + float(mask[ik + j]);
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_tiled<float4>) kernel_lightning_indexer_tiled_t;
+template [[host_name("kernel_lightning_indexer_tiled_f32")]] kernel kernel_lightning_indexer_tiled_t kernel_lightning_indexer_tiled<float4>;
+template [[host_name("kernel_lightning_indexer_tiled_f16")]] kernel kernel_lightning_indexer_tiled_t kernel_lightning_indexer_tiled<half4>;
+
+template<typename k4_t>
+kernel void kernel_lightning_indexer_vec(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int iq = tgpig.y;
+    const int is = tgpig.z;
+    device const char * q_row = q + iq*args.nbq2 + is*args.nbq3 + tiisg*sizeof(float4);
+    device const float * weights = (device const float *) (w + iq*args.nbw1 + is*args.nbw3);
+    float4 q_reg[OP_LIGHTNING_INDEXER_VEC_NH];
+    FOR_UNROLL (ushort ih = 0; ih < OP_LIGHTNING_INDEXER_VEC_NH; ++ih) {
+        q_reg[ih] = *(device const float4 *) (q_row + ih*args.nbq1);
+    }
+
+    const int ib0 = (tgpig.x*OP_LIGHTNING_INDEXER_VEC_NSG + sgitg)*OP_LIGHTNING_INDEXER_VEC_NKPSG;
+    FOR_UNROLL (ushort ik = 0; ik < OP_LIGHTNING_INDEXER_VEC_NKPSG; ++ik) {
+        const int ib = ib0 + ik;
+        if (ib >= args.n_kv) {
+            return;
+        }
+        device const k4_t * k_row = (device const k4_t *) (k + ib*args.nbk2 + is*args.nbk3);
+        const float4 kv = float4(k_row[tiisg]);
+        float score = 0.0f;
+        FOR_UNROLL (ushort ih = 0; ih < OP_LIGHTNING_INDEXER_VEC_NH; ++ih) {
+            score += max(simd_sum(dot(q_reg[ih], kv)), 0.0f)*weights[ih];
+        }
+        if (tiisg == 0) {
+            device const half * mask = (device const half *) (m + iq*args.nbm1 + (is % args.mask_ne3)*args.nbm3);
+            *(device float *) (dst + ib*sizeof(float) + iq*args.nb1 + is*args.nb3) = score + float(mask[ib]);
+        }
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_vec<float4>) kernel_lightning_indexer_vec_t;
+template [[host_name("kernel_lightning_indexer_vec_f32")]] kernel kernel_lightning_indexer_vec_t kernel_lightning_indexer_vec<float4>;
+template [[host_name("kernel_lightning_indexer_vec_f16")]] kernel kernel_lightning_indexer_vec_t kernel_lightning_indexer_vec<half4>;
+
 template<
     typename kd4x4_t,
     short nl_k,
-    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &)>
+    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &),
+    bool direct_k>
 kernel void kernel_lightning_indexer(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,
@@ -361,38 +430,48 @@ kernel void kernel_lightning_indexer(
     constexpr short NTG = 32*NSG;    // threads per threadgroup
 
     const int i_stream = tgpig.z;
-    const int i_kv_0   = tgpig.x*NK;            // first key of this threadgroup
+    const int i_kv_0   = args.kv_offset + tgpig.x*NK; // first key of this threadgroup
     const int i_kv     = i_kv_0 + sgitg*NKPSG;  // first key of this simdgroup
 
-    threadgroup half sk[NK * DK16 * 16];
-    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) sk;
-
-    for (short i = tiitg; i < NK*DK16; i += NTG) {
-        const short ik  = i/DK16;
-        const short i16 = i%DK16;
-
-        half4x4 tmp;
-
-        if (i_kv_0 + ik < args.n_kv) {
-            device const kd4x4_t * kr = (device const kd4x4_t *) (k + (i_kv_0 + ik)*args.nbk2 + i_stream*args.nbk3);
-
-            deq_k(kr + i16/nl_k, i16%nl_k, tmp);
-        } else {
-            FOR_UNROLL (short j = 0; j < 4; ++j) {
-                tmp[j] = half4(0.0h);
-            }
-        }
-
-        sk4x4[i] = tmp;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // K tile of this simdgroup, transposed to [DK, NKPSG]
     simdgroup_half8x8 mk[DK8];
 
-    FOR_UNROLL (short i = 0; i < DK8; ++i) {
-        simdgroup_load(mk[i], sk + sgitg*NKPSG*DK + 8*i, DK, 0, true);
+    threadgroup half sk[direct_k ? 1 : NK * DK16 * 16];
+    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) sk;
+
+    if (direct_k) {
+        device const half * pk = (device const half *) (k + i_kv*args.nbk2 + i_stream*args.nbk3);
+
+        FOR_UNROLL (short i = 0; i < DK8; ++i) {
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mk[i], pk + 8*i, args.nbk2/sizeof(half), 0, true);
+            simdgroup_barrier(mem_flags::mem_none);
+        }
+    } else {
+        for (short i = tiitg; i < NK*DK16; i += NTG) {
+            const short ik  = i/DK16;
+            const short i16 = i%DK16;
+
+            half4x4 tmp;
+
+            if (i_kv_0 + ik < args.n_kv) {
+                device const kd4x4_t * kr = (device const kd4x4_t *) (k + (i_kv_0 + ik)*args.nbk2 + i_stream*args.nbk3);
+
+                deq_k(kr + i16/nl_k, i16%nl_k, tmp);
+            } else {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    tmp[j] = half4(0.0h);
+                }
+            }
+
+            sk4x4[i] = tmp;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // K tile of this simdgroup, transposed to [DK, NKPSG]
+        FOR_UNROLL (short i = 0; i < DK8; ++i) {
+            simdgroup_load(mk[i], sk + sgitg*NKPSG*DK + 8*i, DK, 0, true);
+        }
     }
 
     threadgroup half4   sq4[NHPTG*DK4];
@@ -469,17 +548,18 @@ kernel void kernel_lightning_indexer(
     }
 }
 
-typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_t;
+typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16, false>) kernel_lightning_indexer_t;
 
-template [[host_name("kernel_lightning_indexer_f32")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<float4x4, 1, dequantize_f32>;
-template [[host_name("kernel_lightning_indexer_f16")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16>;
+template [[host_name("kernel_lightning_indexer_f32")]]        kernel kernel_lightning_indexer_t kernel_lightning_indexer<float4x4, 1, dequantize_f32, false>;
+template [[host_name("kernel_lightning_indexer_f16")]]        kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16, false>;
+template [[host_name("kernel_lightning_indexer_f16_direct")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16, true>;
 
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<bfloat4x4, 1, dequantize_bf16>;
+template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<bfloat4x4, 1, dequantize_bf16, false>;
 #endif
 
-template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_0, 2, dequantize_q4_0>;
-template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_1, 2, dequantize_q4_1>;
-template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
-template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
-template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_0, 2, dequantize_q4_0, false>;
+template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_1, 2, dequantize_q4_1, false>;
+template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0, false>;
+template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1, false>;
+template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0, false>;
