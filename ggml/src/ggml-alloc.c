@@ -956,6 +956,12 @@ void ggml_gallocr_reserve_n_size(
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[i] == galloc->buf_tallocs[j]) {
+                sizes[i] = 0;
+                break;
+            }
+        }
     }
 }
 

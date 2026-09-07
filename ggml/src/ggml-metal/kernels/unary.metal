@@ -1,5 +1,21 @@
 #include "common.h"
 
+kernel void kernel_sigmoid_mul_add_f32(
+        constant ggml_metal_kargs_sigmoid_mul_add & args,
+        device const float * gate,
+        device const float * shared,
+        device const float * residual,
+        device float * dst,
+        uint2 i [[thread_position_in_grid]]) {
+#pragma clang fp contract(off)
+    if (i.x >= args.n_embd) {
+        return;
+    }
+    const uint offset = i.y*args.n_embd + i.x;
+    const float g = 1.0f/(1.0f + exp(-gate[i.y]));
+    dst[offset] = residual[offset] + shared[offset]*g;
+}
+
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
 
@@ -51,6 +67,11 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) (args.scale * x + args.bias);
         }
 
+        if (FC_OP == OP_UNARY_NUM_SCALE_SILU) {
+            const TC scaled = args.scale * x + args.bias;
+            dst_ptr[i0] = (T) (scaled / (1 + exp(-scaled)));
+        }
+
         if (FC_OP == OP_UNARY_NUM_FILL) {
             dst_ptr[i0] = (T) args.val;
         }
@@ -93,6 +114,11 @@ kernel void kernel_unary_impl(
 
         if (FC_OP == OP_UNARY_NUM_SIGMOID) {
             dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
+        }
+
+        if (FC_OP == OP_UNARY_NUM_SIGMOID_SCALE) {
+            const TC sigmoid = 1 / (1 + exp(-x));
+            dst_ptr[i0] = (T) (args.scale * sigmoid + args.bias);
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
@@ -145,6 +171,11 @@ kernel void kernel_unary_impl(
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
             dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_SOFTPLUS_SQRT) {
+            const TC softplus = select(log(1 + exp(x)), x, x > 20);
+            dst_ptr[i0] = (T) sqrt(softplus);
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {

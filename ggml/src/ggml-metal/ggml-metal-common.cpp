@@ -34,9 +34,11 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne01 = op->src[0]->ne[1];
     const int64_t ne11 = op->src[1]->ne[1];
 
-    return !ggml_is_transposed(op->src[0]) &&
+    return ne01 > 4 &&
+           !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
            has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
 }
@@ -147,14 +149,15 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     // the batch shape goes into int16 function constants
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
-    return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
+    return ggml_metal_op_mul_mat_may_use_mma(op) && ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
         src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
 
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
-    return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
+    return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 2) != GGML_PREC_F32 && ggml_get_op_params_i32(op, 3) != GGML_PREC_F32;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -304,7 +307,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
     return true;
 }
 
-static bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
 
     ggml_mem_range mr = ggml_mem_range_from_tensor_src(tensor);

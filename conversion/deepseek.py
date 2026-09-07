@@ -895,7 +895,7 @@ class DeepseekV4Model(TextModel):
         del bid  # unused
 
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
-            return gguf.GGMLQuantizationType.Q8_0
+            return gguf.GGMLQuantizationType.Q8_0 if self._fp8_as_q8 else gguf.GGMLQuantizationType.BF16
         if new_name.endswith(".nextn.eh_proj.weight"):
             return gguf.GGMLQuantizationType.Q8_0
         if name in self._dsv4_f32_tensors:
