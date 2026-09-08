@@ -3918,6 +3918,12 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    // With row sinks, the query rows are heads and do not shrink with the token batch.
+    const bool sinks_rows = ggml_get_op_params_i32(op, 5);
+    if (sinks_rows && !ggml_metal_op_flash_attn_ext_use_vec(op) && ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op) == 0) {
+        return 0;
+    }
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
   //GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -3947,10 +3953,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-    //    return 0;
-    //}
+    if (!ggml_is_quantized(op->src[1]->type)) {
+        return 0;
+    }
+
+    // Reserve quantized KV scratch for batch sizes that enable the F16 conversion.
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
