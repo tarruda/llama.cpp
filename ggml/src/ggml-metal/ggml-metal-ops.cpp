@@ -3423,6 +3423,10 @@ static bool ggml_metal_op_mul_mat_id_use_compact(const ggml_tensor * op) {
     return n_expert >= 128 && n_expert_used < n_expert && n_tokens >= 128;
 }
 
+static bool ggml_metal_op_mul_mat_id_use_tail16(const ggml_tensor * op) {
+    return ggml_metal_op_mul_mat_id_use_compact(op) && op->src[0]->type == GGML_TYPE_IQ3_XXS && op->src[1]->type == GGML_TYPE_F32;
+}
+
 size_t ggml_metal_op_mul_mat_id_extra_tasks(const ggml_tensor * op) {
     assert(op->op == GGML_OP_MUL_MAT_ID);
 
@@ -3527,21 +3531,27 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         const bool compact = ggml_metal_op_mul_mat_id_use_compact(op);
+        const bool split_tail = ggml_metal_op_mul_mat_id_use_tail16(op) && !props_dev->has_tensor;
+        const int64_t n_tasks = ne02 + (ne21*ne20 + 31)/32;
         if (compact) {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map1(lib);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map1(lib, split_tail);
             int32_t n_expert = ne02;
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
             ggml_metal_encoder_set_bytes   (enc, &n_expert, sizeof(n_expert), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,   1);
             ggml_metal_encoder_set_buffer  (enc, bid_tasks, 2);
+            if (split_tail) {
+                int32_t capacity = n_tasks;
+                ggml_metal_encoder_set_bytes(enc, &capacity, sizeof(capacity), 3);
+            }
             ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
 
             ggml_metal_op_concurrency_reset(ctx);
         }
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact, false);
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
@@ -3576,8 +3586,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
             if (compact) {
-                const int64_t n_tasks = ne02 + (ne21*ne20 + 31)/32;
                 ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, n_tasks, 1, 128, 1, 1);
+                if (split_tail) {
+                    auto tail_pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, true, true);
+                    ggml_metal_encoder_set_pipeline(enc, tail_pipeline);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, tail_pipeline.smem, 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, ne02, 1, 128, 1, 1);
+                }
             } else {
                 ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
             }
