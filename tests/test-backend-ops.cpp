@@ -5517,9 +5517,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const float amax; // magnitude of src1
+    const bool tail_pattern;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, amax);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, amax, tail_pattern);
     }
 
     double max_nmse_err() override {
@@ -5542,10 +5543,11 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            float amax = 1.0f)
+            float amax = 1.0f, bool tail_pattern = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), amax(amax) {
+            m(m), n(n), k(k), amax(amax), tail_pattern(tail_pattern) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(!tail_pattern || (n == 256 && n_used == 1 && n_mats >= 9));
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5571,6 +5573,17 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, amax);
+        if (tail_pattern) {
+            ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+            int64_t token = 0;
+            int32_t expert = 0;
+            for (int count : {1, 15, 16, 17, 31, 32, 33, 48, 63}) {
+                for (int j = 0; j < count; ++j) {
+                    ggml_backend_tensor_set(ids, &expert, token++*ids->nb[1], sizeof(expert));
+                }
+                ++expert;
+            }
+        }
     }
 
     void reinit_perf_iter(ggml_context * ctx) override {
@@ -10764,7 +10777,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
+    for (int64_t m : {63, 64, 65}) {
+        for (int64_t k : {256, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 1, true, m, 256, k, 1.0f, true));
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, 6, b, 65, 2048, 4096, 3, true));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
