@@ -3398,7 +3398,7 @@ kernel void kernel_mul_mv_id_iq3_xxs_f32_decode(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const int idx = tgpig.z;
     const int32_t i02 = ((device const int32_t *) ids)[idx];
-    const int64_t i11 = args.ne11 == 1 ? 0 : idx;
+    const int64_t i11 = idx % args.ne11;
 
     device const char * src0_cur = src0s + i02*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11;

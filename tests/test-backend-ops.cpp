@@ -5518,9 +5518,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t k;
     const float amax; // magnitude of src1
     const bool tail_pattern;
+    const int64_t n_b;
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, amax, tail_pattern);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, amax, tail_pattern, n_b);
     }
 
     double max_nmse_err() override {
@@ -5543,11 +5544,12 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            float amax = 1.0f, bool tail_pattern = false)
+            float amax = 1.0f, bool tail_pattern = false, int64_t n_b = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), amax(amax), tail_pattern(tail_pattern) {
+            m(m), n(n), k(k), amax(amax), tail_pattern(tail_pattern), n_b(n_b ? n_b : (b ? 1 : n_used)) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(!tail_pattern || (n == 256 && n_used == 1 && n_mats >= 9));
+            GGML_ASSERT(this->n_b > 0 && n_used % this->n_b == 0);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5562,7 +5564,7 @@ struct test_mul_mat_id : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_b, n);
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
@@ -10776,6 +10778,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
+    }
+    for (int n : {1, 2}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 4, false, 64, n, 256, 1.0f, false, 2));
     }
     for (int64_t m : {63, 64, 65}) {
         for (int64_t k : {256, 4096}) {
