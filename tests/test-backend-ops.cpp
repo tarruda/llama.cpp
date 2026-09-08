@@ -4401,9 +4401,10 @@ struct test_moe_weights_fuse : public test_case {
     const int64_t n_tokens;
     const float scale;
     const float bias;
+    const bool norm_all;
 
-    test_moe_weights_fuse(int64_t n_expert, int64_t n_expert_used, int64_t n_tokens, float scale, float bias)
-        : n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens), scale(scale), bias(bias) {}
+    test_moe_weights_fuse(int64_t n_expert, int64_t n_expert_used, int64_t n_tokens, float scale, float bias, bool norm_all = false)
+        : n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens), scale(scale), bias(bias), norm_all(norm_all) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4411,7 +4412,7 @@ struct test_moe_weights_fuse : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_expert, n_expert_used, n_tokens, scale, bias);
+        return VARS_TO_STR6(n_expert, n_expert_used, n_tokens, scale, bias, norm_all);
     }
 
     bool run_whole_graph() override { return true; }
@@ -4424,7 +4425,7 @@ struct test_moe_weights_fuse : public test_case {
 
         probs = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
         ggml_tensor * weights = ggml_get_rows(ctx, probs, ids);
-        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        weights = ggml_reshape_2d(ctx, weights, norm_all ? n_expert_used*n_tokens : n_expert_used, norm_all ? 1 : n_tokens);
         ggml_tensor * sum = ggml_sum_rows(ctx, weights);
         sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
         weights = ggml_div(ctx, weights, sum);
@@ -5655,9 +5656,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const bool tail_pattern;
+    const int64_t n_b;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k) + (tail_pattern ? ",tail_pattern=1" : "");
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k) + (tail_pattern ? ",tail_pattern=1" : "") + (n_b != (b ? 1 : n_used) ? "," + VAR_TO_STR(n_b) : "");
     }
 
     double max_nmse_err() override {
@@ -5679,11 +5681,12 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool tail_pattern = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool tail_pattern = false, int64_t n_b = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), tail_pattern(tail_pattern) {
+            m(m), n(n), k(k), tail_pattern(tail_pattern), n_b(n_b ? n_b : (b ? 1 : n_used)) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(!tail_pattern || (n == 256 && n_used == 1 && n_mats >= 9));
+            GGML_ASSERT(this->n_b > 0 && n_used % this->n_b == 0);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5698,7 +5701,7 @@ struct test_mul_mat_id : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_b, n);
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
@@ -9764,6 +9767,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_moe_weights_fuse(256, 6, 1, 2.5f, 0.0f));
     test_cases.emplace_back(new test_moe_weights_fuse(37, 7, 17, 0.75f, 0.1f));
+    test_cases.emplace_back(new test_moe_weights_fuse(37, 7, 17, 0.75f, 0.1f, true));
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
@@ -10919,6 +10923,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
+    }
+    for (int n : {1, 2}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 4, false, 64, n, 256, false, 2));
     }
     for (int64_t m : {63, 64, 65}) {
         for (int64_t k : {256, 4096}) {

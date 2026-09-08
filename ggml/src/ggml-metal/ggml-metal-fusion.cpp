@@ -337,6 +337,7 @@ static bool ggml_metal_fusion_check_moe_weights(
         n_expert > 0 && n_expert_used > 0 && n_expert_used <= 32 && n_expert_used <= n_expert &&
         ids->ne[2] == 1 && ids->ne[3] == 1 && get_rows->ne[0] == 1 && get_rows->ne[1] == n_expert_used &&
         get_rows->ne[2] == n_tokens && get_rows->ne[3] == 1 && ggml_are_same_shape(get_rows, scale_op) &&
+        weights->ne[0] == n_expert_used && weights->ne[1] == n_tokens && weights->ne[2] == 1 && weights->ne[3] == 1 &&
         ggml_is_contiguous(probs) && ggml_is_contiguous(ids) && ggml_is_contiguous(scale_op);
     return can_fuse;
 }
