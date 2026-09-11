@@ -575,6 +575,12 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
 
+    struct ggml_tensor * engram_embd       = nullptr;
+    struct ggml_tensor * engram_embd_scale = nullptr;
+    struct ggml_tensor * engram_kv         = nullptr;
+    struct ggml_tensor * engram_k_weight   = nullptr;
+    struct ggml_tensor * engram_q_weight   = nullptr;
+
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
     struct ggml_tensor * ple_norm_key   = nullptr;

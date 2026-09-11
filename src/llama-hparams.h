@@ -294,6 +294,12 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_source;
+    int32_t  dsv41_candidate_source_layer = -1;
+    uint32_t dsv41_candidate_topk_blocks  = 0;
+    uint32_t dsv41_candidate_block_size   = 0;
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 

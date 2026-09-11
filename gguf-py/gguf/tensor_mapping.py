@@ -1331,6 +1331,54 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.index_q_norm", # MSA
         ),
 
+        MODEL_TENSOR.ENGRAM_EMBD: (
+            "layers.{bid}.engram.embed",
+        ),
+
+        MODEL_TENSOR.ENGRAM_EMBD_SCALE: (
+            "layers.{bid}.engram.embed.scale",
+        ),
+
+        MODEL_TENSOR.ENGRAM_KV: (
+            "layers.{bid}.engram.wkv",
+        ),
+
+        MODEL_TENSOR.ENGRAM_K_WEIGHT: (
+            "layers.{bid}.engram.k_weight",
+        ),
+
+        MODEL_TENSOR.ENGRAM_Q_WEIGHT: (
+            "layers.{bid}.engram.q_weight",
+        ),
+
+        MODEL_TENSOR.ATTN_KV: (
+            "layers.{bid}.attn.wkv",
+        ),
+
+        MODEL_TENSOR.ATTN_OUT_A: (
+            "layers.{bid}.attn.wo_a",
+        ),
+
+        MODEL_TENSOR.ATTN_OUT_B: (
+            "layers.{bid}.attn.wo_b",
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_WKV: (
+            "layers.{bid}.attn.compressor.wkv",
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE: (
+            "layers.{bid}.attn.compressor.wgate",
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM: (
+            "layers.{bid}.attn.compressor.norm",
+        ),
+
+        MODEL_TENSOR.FFN_EXP_PROBS_B_VL: (
+            "layers.{bid}.ffn.gate.bias_vl",
+        ),
+
         MODEL_TENSOR.HC_ATTN_FN: (
             "model.layers.{bid}.hc_attn_layer.hc_pre.hc_fn", # hy-v4
         ),

@@ -1178,6 +1178,27 @@ struct llama_model_dots3note : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_deepseek41 : public llama_model_base {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    struct {
+        uint32_t ngram_size = 0;
+        uint32_t n_heads = 0;
+        uint32_t head_dim = 0;
+        uint32_t compressed_vocab_size = 0;
+        uint32_t pad_token_id = 0;
+        std::vector<uint32_t> layers;
+        std::vector<uint32_t> embedding_counts;
+        std::vector<uint32_t> bucket_sizes;
+        std::vector<uint32_t> offsets;
+        std::vector<uint64_t> multipliers;
+        std::vector<int32_t> token_map;
+    } engram;
+};
+
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
