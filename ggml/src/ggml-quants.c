@@ -416,6 +416,110 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+static uint8_t ggml_fp32_to_e4m3_rne(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0;
+    if (isnan(x)) {
+        return sign | 0x7f;
+    }
+    const float a = fminf(fabsf(x), 448.0f);
+    if (a < 0x1p-6f) {
+        const float scaled = a * 512.0f;
+        const uint32_t lo = (uint32_t) scaled;
+        const float remainder = scaled - lo;
+        return sign | (uint8_t) (lo + (remainder > 0.5f || (remainder == 0.5f && (lo & 1))));
+    }
+    uint32_t bits;
+    memcpy(&bits, &a, sizeof(bits));
+    bits += 0x7ffff + ((bits >> 20) & 1);
+    return sign | (uint8_t) ((bits >> 20) - 120*8);
+}
+
+static uint8_t ggml_fp32_to_e2m1_rne(float x) {
+    static const float midpoints[] = { 0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f };
+    const float a = fabsf(x);
+    uint8_t code = 0;
+    for (uint8_t i = 0; i < 7; ++i) {
+        if (a > midpoints[i] || (a == midpoints[i] && (i & 1))) {
+            code = i + 1;
+        } else {
+            break;
+        }
+    }
+    return code | (signbit(x) ? 8 : 0);
+}
+
+static uint8_t ggml_act_scale_e8m0(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return (uint8_t) (((bits >> 23) & 255) + ((bits & 0x7fffff) != 0));
+}
+
+void quantize_row_mxfp4_act_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP4 == 0);
+    for (int64_t i = 0; i < k / QK_MXFP4; ++i) {
+        const float * xb = x + i*QK_MXFP4;
+        float amax = 6.0f * 0x1p-126f;
+        for (int j = 0; j < QK_MXFP4; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+        y[i].e = ggml_act_scale_e8m0(amax * (1.0f / 6.0f));
+        const float scale = GGML_E8M0_TO_FP32(y[i].e);
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            const uint8_t lo = ggml_fp32_to_e2m1_rne(xb[j] / scale);
+            const uint8_t hi = ggml_fp32_to_e2m1_rne(xb[j + QK_MXFP4/2] / scale);
+            y[i].qs[j] = lo | (hi << 4);
+        }
+    }
+}
+
+void quantize_row_nvfp4_act_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NVFP4 == 0);
+    for (int64_t i = 0; i < k / QK_NVFP4; ++i) {
+        for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
+            const float * xb = x + i*QK_NVFP4 + s*QK_NVFP4_SUB;
+            float amax = 6.0f * 0x1p-9f;
+            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+                amax = fmaxf(amax, fabsf(xb[j]));
+            }
+            y[i].d[s] = ggml_fp32_to_e4m3_rne(amax / 6.0f);
+            const float scale = 2.0f * ggml_ue4m3_to_fp32(y[i].d[s]);
+            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                const uint8_t lo = ggml_fp32_to_e2m1_rne(xb[j] / scale);
+                const uint8_t hi = ggml_fp32_to_e2m1_rne(xb[j + QK_NVFP4_SUB/2] / scale);
+                y[i].qs[s*(QK_NVFP4_SUB/2) + j] = lo | (hi << 4);
+            }
+        }
+    }
+}
+
+void quantize_row_mxfp8_act_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k/32; ++i) {
+        float amax = 1e-4f;
+        for (int j = 0; j < 32; ++j) {
+            amax = fmaxf(amax, fabsf(x[i*32 + j]));
+        }
+        const uint8_t exponent = ggml_act_scale_e8m0(amax * (1.0f / 448.0f));
+        const float scale = GGML_E8M0_TO_FP32(exponent);
+        y[i*33] = exponent;
+        for (int j = 0; j < 32; ++j) {
+            y[i*33 + 1 + j] = ggml_fp32_to_e4m3_rne(x[i*32 + j] / scale);
+        }
+    }
+}
+
+void dequantize_row_mxfp8_act(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k/32; ++i) {
+        const float scale = GGML_E8M0_TO_FP32(x[i*33]);
+        for (int j = 0; j < 32; ++j) {
+            const uint8_t code = x[i*33 + 1 + j];
+            const float value = (code & 127) == 127 ? NAN : 2.0f * ggml_ue4m3_to_fp32(code & 127);
+            y[i*32 + j] = (code & 128 ? -value : value) * scale;
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 

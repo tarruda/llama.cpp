@@ -4452,6 +4452,30 @@ struct test_moe_weights_fuse : public test_case {
     }
 };
 
+struct test_dsv41_act_quant : public test_case {
+    const ggml_dsv41_quant_type quant_type;
+    const int64_t width;
+    const bool strided;
+
+    test_dsv41_act_quant(ggml_dsv41_quant_type quant_type, int64_t width, bool strided)
+        : quant_type(quant_type), width(width), strided(strided) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(quant_type, width, strided);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, strided ? 2*width : width, 5, 3, 2);
+        if (strided) {
+            x = ggml_view_4d(ctx, x, width, 5, 3, 2, x->nb[1], x->nb[2], x->nb[3], width*sizeof(float));
+            x = ggml_permute(ctx, x, 0, 2, 1, 3);
+        }
+        return ggml_dsv41_act_quant(ctx, x, quant_type);
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -9781,6 +9805,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_dsv4_hc_affine(1, 1.0f, 1e-6f));
     test_cases.emplace_back(new test_dsv4_hc_affine(17, 2.0f, 0.0f));
+
+    for (auto type : { GGML_DSV41_QUANT_BF16, GGML_DSV41_QUANT_MXFP8, GGML_DSV41_QUANT_MXFP4, GGML_DSV41_QUANT_NVFP4 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_act_quant(type, 64, strided));
+            test_cases.emplace_back(new test_dsv41_act_quant(type, 512, strided));
+        }
+    }
+    test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_BF16, 31, true));
+    test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_MXFP4, 96, true));
+    test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_MXFP8, 96, true));
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));

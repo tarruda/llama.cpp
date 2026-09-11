@@ -1369,6 +1369,17 @@ typedef struct {
 } ggml_metal_kargs_dsv4_sparse_pack;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  n_bits;
+    int32_t  block_size;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+} ggml_metal_kargs_dsv41_act_quant;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;

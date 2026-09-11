@@ -120,6 +120,7 @@ void ggml_compute_forward_dsv4_top_k_mask(const struct ggml_compute_params * par
 void ggml_compute_forward_dsv4_sparse_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv41_act_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_qwen4exp_hc_reduce(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_qwen4exp_hc_combine(const struct ggml_compute_params * params, struct ggml_tensor * dst);

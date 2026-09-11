@@ -546,6 +546,128 @@ kernel void kernel_dsv4_hc_comb_f32(
     }
 }
 
+static uchar dsv41_e4m3_rne(float x) {
+    const uchar sign = (as_type<uint>(x) >> 24) & 0x80;
+    if (isnan(x)) {
+        return sign | 0x7f;
+    }
+    const float a = min(abs(x), 448.0f);
+    if (a < 0x1p-6f) {
+        const float scaled = a*512.0f;
+        const uint lo = uint(scaled);
+        const float remainder = scaled - lo;
+        return sign | uchar(lo + (remainder > 0.5f || (remainder == 0.5f && (lo & 1))));
+    }
+    uint bits = as_type<uint>(a);
+    bits += 0x7ffff + ((bits >> 20) & 1);
+    return sign | uchar((bits >> 20) - 120*8);
+}
+
+static float dsv41_e4m3_value(uchar code) {
+    const uint magnitude = code & 127;
+    const uint exponent = magnitude >> 3;
+    const float value = exponent == 0 ? float(magnitude)*0x1p-9f : as_type<float>((exponent + 120) << 23 | (magnitude & 7) << 20);
+    return copysign(magnitude == 127 ? NAN : value, code & 128 ? -1.0f : 1.0f);
+}
+
+static float dsv41_e8m0_scale(float x) {
+    const uint bits = as_type<uint>(x);
+    const uint exponent = ((bits >> 23) & 255) + ((bits & 0x7fffff) != 0);
+    return as_type<float>(exponent << 23);
+}
+
+// Metal arithmetic can flush subnormals. Apply power-of-two scales through the bits.
+static float dsv41_scale_pow2(float x, int shift) {
+    const uint bits = as_type<uint>(x);
+    const uint sign = bits & 0x80000000;
+    int exponent = (bits >> 23) & 255;
+    uint mantissa = bits & 0x7fffff;
+    if (exponent == 255 || (exponent == 0 && mantissa == 0)) {
+        return x;
+    }
+    if (exponent == 0) {
+        const int normalize = clz(mantissa) - 8;
+        mantissa <<= normalize;
+        exponent = 1 - normalize;
+    } else {
+        mantissa |= 0x800000;
+    }
+    exponent += shift;
+    if (exponent >= 255) {
+        return as_type<float>(sign | 0x7f800000);
+    }
+    if (exponent > 0) {
+        return as_type<float>(sign | uint(exponent) << 23 | (mantissa & 0x7fffff));
+    }
+    const int right = 1 - exponent;
+    if (right > 24) {
+        return as_type<float>(sign);
+    }
+    uint rounded = mantissa >> right;
+    const uint remainder = mantissa & ((1u << right) - 1);
+    const uint halfway = 1u << (right - 1);
+    rounded += remainder > halfway || (remainder == halfway && (rounded & 1));
+    return as_type<float>(sign | rounded);
+}
+
+static float dsv41_e2m1_value(float x) {
+    constexpr float midpoints[] = { 0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f };
+    constexpr float values[] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const float a = abs(x);
+    uint code = 0;
+    FOR_UNROLL (uint i = 0; i < 7; ++i) {
+        if (a > midpoints[i] || (a == midpoints[i] && (i & 1))) {
+            code = i + 1;
+        } else {
+            break;
+        }
+    }
+    return copysign(values[code], x);
+}
+
+kernel void kernel_dsv41_act_quant(
+        constant ggml_metal_kargs_dsv41_act_quant & args,
+        device const char * src,
+        device      float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+    const int row = tgpig.y;
+    const int i1 = row % args.ne1;
+    const int i2 = row / args.ne1 % args.ne2;
+    const int i3 = row / (args.ne1*args.ne2);
+    const float x = i0 < args.ne0 ? *(device const float *) (src + i1*args.nb01 + i2*args.nb02 + i3*args.nb03 + i0*sizeof(float)) : 0.0f;
+
+    float result;
+    if (args.n_bits == 16) {
+        uint bits = as_type<uint>(x);
+        bits = (bits & 0x7fffffff) > 0x7f800000 ? bits | 0x400000 : bits + 0x7fff + ((bits >> 16) & 1);
+        result = as_type<float>(bits & 0xffff0000);
+    } else {
+        float amax = abs(x);
+        float scale;
+        if (args.block_size == 16) {
+            FOR_UNROLL (ushort offset = 1; offset < 16; offset *= 2) {
+                amax = max(amax, simd_shuffle_xor(amax, offset));
+            }
+            scale = dsv41_e4m3_value(dsv41_e4m3_rne(precise::divide(max(amax, 6.0f*0x1p-9f), 6.0f)));
+        } else {
+            amax = simd_max(amax);
+            const float unrounded = args.n_bits == 4 ? max(amax, 6.0f*0x1p-126f)*(1.0f/6.0f) : max(amax, 1e-4f)*(1.0f/448.0f);
+            scale = dsv41_e8m0_scale(unrounded);
+        }
+        const int exponent = int(as_type<uint>(scale) >> 23) - 127;
+        const float value = args.block_size == 32 ? dsv41_scale_pow2(x, -exponent) : precise::divide(x, scale);
+        const float rounded = args.n_bits == 8 ? dsv41_e4m3_value(dsv41_e4m3_rne(value)) : dsv41_e2m1_value(value);
+        result = args.block_size == 32 ? dsv41_scale_pow2(rounded, exponent) : rounded*scale;
+    }
+    if (i0 < args.ne0) {
+        dst[row*args.ne0 + i0] = result;
+    }
+}
+
 kernel void kernel_dsv4_hc_pre_f32(
         constant ggml_metal_kargs_dsv4_hc_pre & args,
         device const char * x,

@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV41_ACT_QUANT,
         GGML_OP_QWEN4EXP_HC_REDUCE,
         GGML_OP_QWEN4EXP_HC_COMBINE,
         GGML_OP_QSA_BLOCK_SCORE,
@@ -2786,6 +2787,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    enum ggml_dsv41_quant_type {
+        GGML_DSV41_QUANT_BF16,
+        GGML_DSV41_QUANT_MXFP8,
+        GGML_DSV41_QUANT_MXFP4,
+        GGML_DSV41_QUANT_NVFP4,
+    };
+
+    // Round F32 rows to the model's activation values and return F32.
+    // This does not pack cache storage or implicitly round the input to BF16.
+    GGML_API struct ggml_tensor * ggml_dsv41_act_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            enum ggml_dsv41_quant_type type);
 
     // Qwen4-Exp hyper-connection reduction
     // x, gate: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]

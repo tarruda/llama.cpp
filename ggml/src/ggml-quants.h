@@ -26,6 +26,13 @@ GGML_API void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * 
 GGML_API void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k);
 
+// V4.1 activation rules use round-to-nearest-even and different scales from weight quantization.
+GGML_API void quantize_row_mxfp4_act_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_nvfp4_act_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k);
+// Each MXFP8 block stores one E8M0 scale followed by 32 E4M3 values.
+GGML_API void quantize_row_mxfp8_act_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_mxfp8_act(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void quantize_row_q2_K_ref(const float * GGML_RESTRICT x, block_q2_K * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q3_K_ref(const float * GGML_RESTRICT x, block_q3_K * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t k);

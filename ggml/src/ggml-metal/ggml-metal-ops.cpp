@@ -357,6 +357,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
             } break;
+        case GGML_OP_DSV41_ACT_QUANT:
+            {
+                n_fuse = ggml_metal_op_dsv41_act_quant(ctx, idx);
+            } break;
         case GGML_OP_QWEN4EXP_HC_REDUCE:
             {
                 n_fuse = ggml_metal_op_qwen4exp_hc_reduce(ctx, idx);
@@ -1710,6 +1714,34 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, nth, 1, 1);
     }
 
+    return 1;
+}
+
+int ggml_metal_op_dsv41_act_quant(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * x = op->src[0];
+    const auto type = (ggml_dsv41_quant_type) ggml_get_op_params_i32(op, 0);
+
+    ggml_metal_kargs_dsv41_act_quant args = {
+        /*.ne0        =*/ (int32_t) x->ne[0],
+        /*.ne1        =*/ (int32_t) x->ne[1],
+        /*.ne2        =*/ (int32_t) x->ne[2],
+        /*.n_bits     =*/ type == GGML_DSV41_QUANT_BF16 ? 16 : type == GGML_DSV41_QUANT_MXFP8 ? 8 : 4,
+        /*.block_size =*/ type == GGML_DSV41_QUANT_NVFP4 ? 16 : 32,
+        /*.nb01       =*/ x->nb[1],
+        /*.nb02       =*/ x->nb[2],
+        /*.nb03       =*/ x->nb[3],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),  1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
+
+    const int nsg = std::min(4, (args.ne0 + 31)/32);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + 32*nsg - 1)/(32*nsg), ggml_nrows(x), 1, 32, nsg, 1);
     return 1;
 }
 

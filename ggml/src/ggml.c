@@ -1088,6 +1088,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV41_ACT_QUANT",
     "QWEN4EXP_HC_REDUCE",
     "QWEN4EXP_HC_COMBINE",
     "QSA_BLOCK_SCORE",
@@ -1108,7 +1109,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv41_act_quant(x)",
     "qwen4exp_hc_reduce(x, gate)",
     "qwen4exp_hc_combine(residual, x, injection)",
     "qsa_block_score(q, k, cells, mask)",
@@ -1230,7 +1232,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6775,6 +6777,25 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[2] = post;
     result->src[3] = comb;
 
+    return result;
+}
+
+// ggml_dsv41_act_quant
+
+struct ggml_tensor * ggml_dsv41_act_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        enum ggml_dsv41_quant_type type) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(type >= GGML_DSV41_QUANT_BF16 && type <= GGML_DSV41_QUANT_NVFP4);
+    const int block = type == GGML_DSV41_QUANT_BF16 ? 1 : type == GGML_DSV41_QUANT_NVFP4 ? 64 : 32;
+    GGML_ASSERT(x->ne[0] % block == 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->op = GGML_OP_DSV41_ACT_QUANT;
+    result->src[0] = x;
+    ggml_set_op_params_i32(result, 0, type);
     return result;
 }
 

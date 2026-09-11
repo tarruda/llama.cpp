@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11527,6 +11528,49 @@ void ggml_compute_forward_dsv4_hc_comb(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+void ggml_compute_forward_dsv41_act_quant(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const auto type = (ggml_dsv41_quant_type) ggml_get_op_params_i32(dst, 0);
+    const int64_t width = src->ne[0];
+    const int64_t rows = ggml_nrows(src);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    for (int64_t row = params->ith; row < rows; row += params->nth) {
+        const int64_t i1 = row % src->ne[1];
+        const int64_t i2 = row / src->ne[1] % src->ne[2];
+        const int64_t i3 = row / (src->ne[1] * src->ne[2]);
+        const float * x = (const float *) ((const char *) src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
+        float * y = (float *) dst->data + row*width;
+        for (int64_t offset = 0; offset < width; offset += 64) {
+            const int64_t count = std::min<int64_t>(64, width - offset);
+            switch (type) {
+                case GGML_DSV41_QUANT_BF16:
+                    for (int64_t j = 0; j < count; ++j) {
+                        y[offset + j] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[offset + j]));
+                    }
+                    break;
+                case GGML_DSV41_QUANT_MXFP8: {
+                    uint8_t packed[66];
+                    quantize_row_mxfp8_act_ref(x + offset, packed, count);
+                    dequantize_row_mxfp8_act(packed, y + offset, count);
+                } break;
+                case GGML_DSV41_QUANT_MXFP4: {
+                    block_mxfp4 packed[2];
+                    quantize_row_mxfp4_act_ref(x + offset, packed, count);
+                    dequantize_row_mxfp4(packed, y + offset, count);
+                } break;
+                case GGML_DSV41_QUANT_NVFP4: {
+                    block_nvfp4 packed;
+                    quantize_row_nvfp4_act_ref(x + offset, &packed, count);
+                    dequantize_row_nvfp4(&packed, y + offset, count);
+                } break;
+                default:
+                    GGML_ABORT("invalid V4.1 activation quantization");
+            }
+        }
     }
 }
 

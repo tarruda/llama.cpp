@@ -1840,6 +1840,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]) &&
                 ggml_is_contiguous_rows(op->src[4]);
+        case GGML_OP_DSV41_ACT_QUANT:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_DSV4_HC_COMB:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_F32 &&
