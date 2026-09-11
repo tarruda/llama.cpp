@@ -2855,7 +2855,8 @@ extern "C" {
             struct ggml_tensor  * rows,
             enum ggml_dsv41_quant_type type);
 
-    // Score packed MXFP4 keys with BF16 dot, weighted-head, and final-sum rounding. Causal and optional candidate masks produce -inf.
+    // Score packed MXFP4 keys with BF16 dot, weighted-head, and final-sum rounding. Unreachable positions produce -inf.
+    // Optional candidate block IDs must be sorted and unique, with trailing -1 padding. Scores use candidate order and have width min(n_keys, n_candidates*block_size).
     GGML_API struct ggml_tensor * ggml_dsv41_index_scores(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2867,10 +2868,12 @@ extern "C" {
             int32_t               block_size);
 
     // Select positions and optional candidate blocks from F32 scores. Ties favor lower IDs; output IDs are sorted, with -1 padding.
+    // For compact scores, pass the same candidate block IDs used by ggml_dsv41_index_scores.
     GGML_API struct ggml_tensor * ggml_dsv41_select(
             struct ggml_context * ctx,
             struct ggml_tensor  * scores,
             struct ggml_tensor  * positions,
+            struct ggml_tensor  * candidates,
             int32_t               top_k,
             int32_t               ratio,
             int32_t               top_k_blocks,

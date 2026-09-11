@@ -1842,7 +1842,8 @@ int ggml_metal_op_dsv41_index_scores(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_dsv41_index_scores args = {
         /*.dim          =*/ (int32_t) q->ne[0],
         /*.heads        =*/ (int32_t) q->ne[1],
-        /*.n_keys       =*/ (int32_t) op->ne[0],
+        /*.n_keys       =*/ (int32_t) op->src[1]->ne[1],
+        /*.n_scores     =*/ (int32_t) op->ne[0],
         /*.ratio        =*/ ggml_get_op_params_i32(op, 0),
         /*.block_size   =*/ ggml_get_op_params_i32(op, 1),
         /*.n_candidates =*/ candidates ? (int32_t) candidates->ne[0] : 0,
@@ -1862,12 +1863,13 @@ int ggml_metal_op_dsv41_index_scores(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i] ? op->src[i] : op->src[3]), i + 1);
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
-    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_keys + 3)/4, op->ne[1], 1, 32, 4, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_scores + 3)/4, op->ne[1], 1, 32, 4, 1);
     return 1;
 }
 
 int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+    const auto * candidates = op->src[2];
     ggml_metal_kargs_dsv41_select args = {
         /*.n_keys           =*/ (int32_t) op->src[0]->ne[0],
         /*.top_k            =*/ ggml_get_op_params_i32(op, 0),
@@ -1875,8 +1877,11 @@ int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
         /*.top_k_blocks     =*/ ggml_get_op_params_i32(op, 2),
         /*.block_size       =*/ ggml_get_op_params_i32(op, 3),
         /*.candidate_source =*/ ggml_get_op_params_i32(op, 4),
+        /*.n_candidates     =*/ candidates ? (int32_t) candidates->ne[0] : 0,
         /*.nb_s1            =*/ op->src[0]->nb[1],
         /*.nb_p0            =*/ op->src[1]->nb[0],
+        /*.nb_c0            =*/ candidates ? candidates->nb[0] : 0,
+        /*.nb_c1            =*/ candidates ? candidates->nb[1] : 0,
     };
     auto enc = ctx->enc;
     auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
@@ -1884,7 +1889,8 @@ int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(candidates ? candidates : op->src[1]), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
     ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, 256, 1, 1);
     return 1;
 }

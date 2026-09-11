@@ -11723,16 +11723,14 @@ void ggml_compute_forward_dsv41_index_scores(const ggml_compute_params * params,
     const auto bf16 = [](float x) { return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x)); };
     std::vector<float> key(q->ne[0]);
     for (int64_t i = params->ith; i < ggml_nelements(dst); i += params->nth) {
-        const int64_t ik = i % dst->ne[0], it = i / dst->ne[0];
+        const int64_t slot = i % dst->ne[0], it = i / dst->ne[0];
+        int64_t ik = slot;
         const int32_t pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
-        bool valid = ik < (pos + 1)/ratio;
-        if (valid && candidates) {
-            valid = false;
-            for (int64_t j = 0; j < candidates->ne[0]; ++j) {
-                const int32_t id = *(const int32_t *) ((const char *) candidates->data + it*candidates->nb[1] + j*candidates->nb[0]);
-                if (id == ik/block_size) { valid = true; break; }
-            }
+        if (candidates) {
+            const int32_t id = *(const int32_t *) ((const char *) candidates->data + it*candidates->nb[1] + (slot/block_size)*candidates->nb[0]);
+            ik = int64_t(id)*block_size + slot % block_size;
         }
+        const bool valid = ik >= 0 && ik < keys->ne[1] && ik < (int64_t(pos) + 1)/ratio;
         float sum = -INFINITY;
         if (valid) {
             dequantize_row_mxfp4((const block_mxfp4 *) ((const char *) keys->data + ik*keys->nb[1]), key.data(), q->ne[0]);
@@ -11767,17 +11765,32 @@ static void ggml_dsv41_select_ids(const std::vector<float> & scores, int count, 
 }
 
 void ggml_compute_forward_dsv41_select(const ggml_compute_params * params, ggml_tensor * dst) {
-    const ggml_tensor * scores = dst->src[0], * positions = dst->src[1];
+    const ggml_tensor * scores = dst->src[0], * positions = dst->src[1], * candidates = dst->src[2];
     const int top_k = ggml_get_op_params_i32(dst, 0), ratio = ggml_get_op_params_i32(dst, 1);
     const int top_k_blocks = ggml_get_op_params_i32(dst, 2), block_size = ggml_get_op_params_i32(dst, 3);
     const bool candidate_source = ggml_get_op_params_i32(dst, 4);
     for (int64_t it = params->ith; it < scores->ne[1]; it += params->nth) {
         const int32_t pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
-        const int visible = std::clamp<int64_t>((int64_t(pos) + 1)/ratio, 0, scores->ne[0]);
+        const int64_t n_visible = std::max<int64_t>((int64_t(pos) + 1)/ratio, 0);
+        int visible = std::min<int64_t>(n_visible, scores->ne[0]);
+        const auto candidate = [&](int64_t i) { return *(const int32_t *) ((const char *) candidates->data + it*candidates->nb[1] + i*candidates->nb[0]); };
+        if (candidates) {
+            int64_t lo = 0, hi = candidates->ne[0];
+            while (lo < hi) {
+                const int64_t mid = (lo + hi)/2;
+                const int32_t id = candidate(mid);
+                if (id >= 0 && id < n_visible/block_size) { lo = mid + 1; } else { hi = mid; }
+            }
+            const int64_t tail = lo < candidates->ne[0] && candidate(lo) == n_visible/block_size ? n_visible % block_size : 0;
+            visible = std::min<int64_t>(scores->ne[0], lo*block_size + tail);
+        }
         const float * row = (const float *) ((const char *) scores->data + it*scores->nb[1]);
         auto * out = (int32_t *) ((char *) dst->data + it*dst->nb[1]);
         std::fill_n(out, dst->ne[0], -1);
         ggml_dsv41_select_ids(std::vector<float>(row, row + visible), top_k, out);
+        if (candidates) {
+            for (int i = 0; i < top_k && out[i] >= 0; ++i) { out[i] = candidate(out[i]/block_size)*block_size + out[i] % block_size; }
+        }
         if (candidate_source && visible > 0) {
             std::vector<float> blocks((visible + block_size - 1)/block_size, -INFINITY);
             for (int i = 0; i < visible; ++i) { blocks[i/block_size] = std::max(blocks[i/block_size], row[i]); }

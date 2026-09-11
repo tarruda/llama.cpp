@@ -503,7 +503,7 @@ struct dsv41_graph : public llm_graph_context {
                 }
                 cb(scores, "dsv41_index_scores", il);
                 const bool source = il == hparams.dsv41_candidate_source_layer;
-                indices[il] = ggml_dsv41_select(ctx0, scores, positions, hparams.indexer_top_k, ratio,
+                indices[il] = ggml_dsv41_select(ctx0, scores, positions, blocks, hparams.indexer_top_k, ratio,
                         source ? hparams.dsv41_candidate_topk_blocks : 0, hparams.dsv41_candidate_block_size, source);
                 if (on_cpu) { ggml_backend_sched_set_tensor_backend(sched, indices[il], backend_cpu); }
                 cb(indices[il], "dsv41_index_selected", il);

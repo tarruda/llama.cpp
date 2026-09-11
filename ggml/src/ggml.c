@@ -6946,7 +6946,8 @@ struct ggml_tensor * ggml_dsv41_index_scores(
     if (candidates) {
         GGML_ASSERT(candidates->type == GGML_TYPE_I32 && ggml_is_matrix(candidates) && candidates->ne[0] > 0 && candidates->ne[1] == q->ne[2] && block_size > 0);
     }
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, keys->ne[1], q->ne[2]);
+    const int64_t n_scores = candidates ? MIN(keys->ne[1], candidates->ne[0]*block_size) : keys->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_scores, q->ne[2]);
     result->op = GGML_OP_DSV41_INDEX_SCORES;
     result->src[0] = q;
     result->src[1] = keys;
@@ -6962,15 +6963,22 @@ struct ggml_tensor * ggml_dsv41_select(
         struct ggml_context * ctx,
         struct ggml_tensor  * scores,
         struct ggml_tensor  * positions,
+        struct ggml_tensor  * candidates,
         int32_t top_k, int32_t ratio, int32_t top_k_blocks, int32_t block_size, bool candidate_source) {
     GGML_ASSERT(scores->type == GGML_TYPE_F32 && ggml_is_matrix(scores) && ggml_is_contiguous_rows(scores));
     GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == scores->ne[1]);
     GGML_ASSERT(top_k > 0 && top_k_blocks >= 0 && (ratio == 1 || ratio == 2));
     GGML_ASSERT(!candidate_source || (top_k_blocks > 0 && block_size > 0));
+    if (candidates) {
+        GGML_ASSERT(!candidate_source && top_k_blocks == 0 && block_size > 0);
+        GGML_ASSERT(candidates->type == GGML_TYPE_I32 && ggml_is_matrix(candidates) && candidates->ne[1] == scores->ne[1]);
+        GGML_ASSERT(scores->ne[0] <= candidates->ne[0]*block_size);
+    }
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (int64_t) top_k + top_k_blocks, scores->ne[1]);
     result->op = GGML_OP_DSV41_SELECT;
     result->src[0] = scores;
     result->src[1] = positions;
+    result->src[2] = candidates;
     ggml_set_op_params_i32(result, 0, top_k);
     ggml_set_op_params_i32(result, 1, ratio);
     ggml_set_op_params_i32(result, 2, top_k_blocks);

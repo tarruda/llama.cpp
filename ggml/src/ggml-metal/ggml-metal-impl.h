@@ -1442,6 +1442,7 @@ typedef struct {
     int32_t dim;
     int32_t heads;
     int32_t n_keys;
+    int32_t n_scores;
     int32_t ratio;
     int32_t block_size;
     int32_t n_candidates;
@@ -1461,8 +1462,11 @@ typedef struct {
     int32_t top_k_blocks;
     int32_t block_size;
     int32_t candidate_source;
+    int32_t n_candidates;
     uint64_t nb_s1;
     uint64_t nb_p0;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
 } ggml_metal_kargs_dsv41_select;
 
 typedef struct {

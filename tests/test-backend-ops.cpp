@@ -4553,7 +4553,7 @@ struct test_dsv41_index_scores : public test_case {
             const int32_t p = tokens == 1 ? 1000 : i == 0 ? 0 : 55 + i;
             ggml_backend_tensor_set(pos, &p, i*pos->nb[0], sizeof(p));
             if (candidates) {
-                const int32_t ids[] = { i == 1 ? -1 : 0, i == 1 ? -1 : p/16 };
+                const int32_t ids[] = { i == 1 ? -1 : 0, i == 1 || p/16 == 0 ? -1 : p/16 };
                 ggml_backend_tensor_set(candidates, ids, i*candidates->nb[1], sizeof(ids));
             }
         }
@@ -4565,33 +4565,48 @@ struct test_dsv41_select : public test_case {
     const int64_t tokens;
     const bool candidate_source;
     const bool strided;
+    const bool compact;
 
-    test_dsv41_select(int64_t width, int64_t tokens, bool candidate_source, bool strided) : width(width), tokens(tokens), candidate_source(candidate_source), strided(strided) {}
-    std::string vars() override { return VARS_TO_STR4(width, tokens, candidate_source, strided); }
+    test_dsv41_select(int64_t width, int64_t tokens, bool candidate_source, bool strided, bool compact = false) : width(width), tokens(tokens), candidate_source(candidate_source), strided(strided), compact(compact) {}
+    std::string vars() override { return VARS_TO_STR5(width, tokens, candidate_source, strided, compact); }
     double max_nmse_err() override { return 0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? width + 7 : width, tokens);
         auto * pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        const int64_t n_candidates = (width + 7)/8;
+        ggml_tensor * candidates = compact ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2*tokens + 1 : tokens, n_candidates) : nullptr;
         if (strided) {
             scores = ggml_view_2d(ctx, scores, width, tokens, scores->nb[1], 3*sizeof(float));
             pos = ggml_view_2d(ctx, pos, 1, tokens, pos->nb[1], sizeof(int32_t));
+            if (candidates) { candidates = ggml_view_2d(ctx, candidates, tokens, n_candidates, candidates->nb[1], sizeof(int32_t)); }
         }
         pos = ggml_transpose(ctx, pos);
         ggml_set_name(scores, "dsv41_select_scores");
         ggml_set_name(pos, "dsv41_select_positions");
-        return ggml_dsv41_select(ctx, scores, pos, width >= 4096 ? 512 : 16, tokens > 1 ? 2 : 1, width >= 4096 ? 2048 : 8, 8, candidate_source);
+        if (candidates) {
+            candidates = ggml_transpose(ctx, candidates);
+            ggml_set_name(candidates, "dsv41_select_candidates");
+        }
+        return ggml_dsv41_select(ctx, scores, pos, candidates, width >= 4096 ? 512 : 16, tokens > 1 ? 2 : 1, compact ? 0 : width >= 4096 ? 2048 : 8, 8, candidate_source);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         test_case::initialize_tensors(ctx);
         auto * scores = ggml_get_tensor(ctx, "dsv41_select_scores");
         auto * positions = ggml_get_tensor(ctx, "dsv41_select_positions");
+        auto * candidates = ggml_get_tensor(ctx, "dsv41_select_candidates");
         const int ratio = tokens > 1 ? 2 : 1;
         std::vector<float> row(width);
         for (int64_t it = 0; it < tokens; ++it) {
             const int32_t pos = tokens > 1 && it == 0 ? 0 : width*ratio - 1 - it % ratio;
             ggml_backend_tensor_set(positions, &pos, it*positions->nb[0], sizeof(pos));
+            if (candidates) {
+                for (int64_t i = 0; i < candidates->ne[0]; ++i) {
+                    const int32_t id = it == 1 || (it == 5 && i + 1 == candidates->ne[0]) ? -1 : 3*i + it % 2;
+                    ggml_backend_tensor_set(candidates, &id, it*candidates->nb[1] + i*candidates->nb[0], sizeof(id));
+                }
+            }
             for (int64_t i = 0; i < width; ++i) {
                 row[i] = it == 1 ? -INFINITY : it == 2 ? (i % 2 ? -0.0f : 0.0f) : it == 3 ? std::nextafter(1.0f, i % 2 ? 2.0f : 0.0f) : float(i % 7 - 3);
                 if (it == 4) { row[i] = (i % 2 ? 1.0f : -1.0f)*std::numeric_limits<float>::denorm_min(); }
@@ -4752,17 +4767,34 @@ struct test_dsv41_hc_split : public test_case {
     const int64_t tokens;
     const int iterations;
     const bool strided;
+    const bool boundary;
 
-    test_dsv41_hc_split(int64_t tokens, int iterations, bool strided) : tokens(tokens), iterations(iterations), strided(strided) {}
-    std::string vars() override { return VARS_TO_STR3(tokens, iterations, strided); }
-    double max_nmse_err() override { return 1e-12; }
+    test_dsv41_hc_split(int64_t tokens, int iterations, bool strided, bool boundary = false) : tokens(tokens), iterations(iterations), strided(strided), boundary(boundary) {}
+    std::string vars() override { return VARS_TO_STR4(tokens, iterations, strided, boundary); }
+    double max_nmse_err() override { return boundary ? 0 : 1e-12; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 48 : 24, tokens);
+        ggml_set_name(mixes, "mixes");
         if (strided) { mixes = ggml_view_2d(ctx, mixes, 24, tokens, mixes->nb[1], 24*sizeof(float)); }
         auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
         auto * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+        ggml_set_name(scale, "scale");
+        ggml_set_name(base, "base");
         return ggml_dsv41_hc_split(ctx, mixes, scale, base, 1e-6f, iterations);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (!boundary) { return; }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name != "mixes" && name != "scale" && name != "base") { continue; }
+            std::vector<float> data(ggml_nelements(t), name == "scale" ? 1.0f : 0.0f);
+            // One exp ULP changes the post gate.
+            if (name == "base") { data[5] = 0.25009235739707947f; }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
     }
 };
 
@@ -10182,6 +10214,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv41_select(128000, 1, source, false));
     }
     test_cases.emplace_back(new test_dsv41_select(1, 3, true, true));
+    for (bool strided : { false, true }) {
+        test_cases.emplace_back(new test_dsv41_select(1, 3, false, strided, true));
+        test_cases.emplace_back(new test_dsv41_select(33, 7, false, strided, true));
+        test_cases.emplace_back(new test_dsv41_select(16384, 7, false, strided, true));
+    }
     for (int64_t dim : { 63, 512 }) {
         for (bool strided : { false, true }) {
             test_cases.emplace_back(new test_dsv41_pool(dim, 1, strided));
@@ -10210,6 +10247,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_dsv41_hc_split(33, iterations, strided));
         }
     }
+    test_cases.emplace_back(new test_dsv41_hc_split(1, 20, false, true));
 
     for (float limit : { 0.0f, 10.0f }) {
         for (bool weighted : { false, true }) {

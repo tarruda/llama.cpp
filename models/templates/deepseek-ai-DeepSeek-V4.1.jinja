@@ -1,0 +1,128 @@
+{%- if thinking is not defined -%}
+    {%- set thinking = enable_thinking | default(false) -%}
+{%- endif -%}
+{%- set add_generation_prompt = add_generation_prompt | default(false) -%}
+{%- set drop_thinking = drop_thinking | default(true) -%}
+{%- set dsml_token = '｜DSML｜' -%}
+{%- set effort = reasoning_effort | default('high') -%}
+{%- if effort is none -%}{%- set effort = 'high' -%}{%- endif -%}
+{%- set efforts = {'low': 50, 'high': 75, 'max': 100} -%}
+{%- if effort is string -%}
+    {%- if effort in efforts -%}
+        {%- set effort = efforts[effort] -%}
+    {%- elif (effort | int | string) == effort -%}
+        {%- set effort = effort | int -%}
+    {%- else -%}
+        {{- raise_exception('Invalid DeepSeek V4.1 reasoning effort') -}}
+    {%- endif -%}
+{%- endif -%}
+{%- if effort is not integer or effort < 1 or effort > 100 -%}
+    {{- raise_exception('DeepSeek V4.1 reasoning effort must be in [1, 100]') -}}
+{%- endif -%}
+{%- set tools_header = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n" -%}
+{%- set tools_footer = "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n" -%}
+{%- macro text_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable -%}
+        {%- for part in content -%}
+            {%- if part['type'] != 'text' -%}{{- raise_exception('DeepSeek V4.1 template requires text content') -}}{%- endif -%}
+            {%- if not loop.first -%}{{- '\n\n' -}}{%- endif -%}
+            {{- part['text'] -}}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if (tools or response_format) and (not messages or messages[0]['role'] != 'system') -%}
+    {%- set messages = [{'role': 'system', 'content': ''}] + messages -%}
+{%- endif -%}
+{%- set state = namespace(last_user=-1, drop=drop_thinking, in_user=false) -%}
+{%- if tools -%}{%- set state.drop = false -%}{%- endif -%}
+{%- for message in messages -%}
+    {%- if message['tools'] -%}{%- set state.drop = false -%}{%- endif -%}
+    {%- if message['role'] in ['user', 'tool'] or (message['role'] == 'system' and not loop.first) -%}
+        {%- set state.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{{- bos_token -}}
+{%- if messages and (thinking or messages[0]['role'] == 'system') -%}
+    {{- '<｜System｜>' -}}
+{%- endif -%}
+{%- if messages and thinking -%}
+    {{- 'Reasoning Effort: ' + (effort | string) + ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- set role = message['role'] -%}
+    {%- if role == 'system' -%}
+        {%- set state.in_user = false -%}
+        {%- if not loop.first -%}{{- '<｜System｜>' -}}{%- endif -%}
+        {{- text_content(message['content']) -}}
+        {%- set message_tools = message['tools'] | default(tools if loop.first else []) -%}
+        {%- if message_tools -%}
+            {{- '\n\n' + tools_header -}}
+            {%- for tool in message_tools -%}
+                {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+                {{- tool['function'] | tojson -}}
+            {%- endfor -%}
+            {{- tools_footer -}}
+        {%- endif -%}
+        {%- set schema = message['response_format'] | default(response_format if loop.first else none) -%}
+        {%- if schema -%}
+            {{- '\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' -}}
+            {{- schema | tojson -}}
+        {%- endif -%}
+    {%- elif role in ['user', 'tool'] -%}
+        {%- if state.in_user -%}
+            {{- '\n\n' -}}
+        {%- else -%}
+            {{- '<｜User｜>' -}}
+        {%- endif -%}
+        {%- set state.in_user = true -%}
+        {%- if role == 'tool' -%}{{- '<tool_result>' -}}{%- endif -%}
+        {{- text_content(message['content']) -}}
+        {%- if role == 'tool' -%}{{- '</tool_result>' -}}{%- endif -%}
+    {%- elif role == 'assistant' -%}
+        {%- set state.in_user = false -%}
+        {%- if thinking and (not state.drop or loop.index0 > state.last_user) -%}
+            {{- message['reasoning_content'] | default('', true) -}}
+            {{- '</think>' -}}
+        {%- endif -%}
+        {{- text_content(message['content']) -}}
+        {%- if message['tool_calls'] -%}
+            {{- '\n\n<' + dsml_token + ' calls>\n' -}}
+            {%- for call in message['tool_calls'] -%}
+                {%- set function = call['function'] -%}
+                {{- '<' + dsml_token + ' invoke name="' + function['name'] + '">\n' -}}
+                {%- set args = function['arguments'] -%}
+                {%- if args is string -%}{%- set args = args | from_json -%}{%- endif -%}
+                {%- for key, value in args.items() -%}
+                    {{- '<' + dsml_token + ' parameter name="' + key + '" string="' -}}
+                    {%- if value is string -%}
+                        {{- 'true">' + value -}}
+                    {%- else -%}
+                        {{- 'false">' -}}{{- value | tojson -}}
+                    {%- endif -%}
+                    {{- '</' + dsml_token + ' parameter>\n' -}}
+                {%- endfor -%}
+                {%- if not args -%}{{- '\n' -}}{%- endif -%}
+                {{- '</' + dsml_token + ' invoke>\n' -}}
+            {%- endfor -%}
+            {{- '</' + dsml_token + ' calls>' -}}
+        {%- endif -%}
+        {%- if not message['wo_eos'] -%}{{- eos_token -}}{%- endif -%}
+    {%- elif role == 'latest_reminder' -%}
+        {%- set state.in_user = false -%}
+        {{- '<｜latest_reminder｜>' -}}{{- text_content(message['content']) -}}
+    {%- else -%}
+        {{- raise_exception('Unsupported DeepSeek V4.1 message role: ' + role) -}}
+    {%- endif -%}
+    {%- set next_role = messages[loop.index0 + 1]['role'] if not loop.last else none -%}
+    {%- if (role in ['user', 'tool'] or (role == 'system' and not loop.first)) and (next_role in ['assistant', 'latest_reminder'] or (loop.last and add_generation_prompt)) -%}
+        {{- '<｜Assistant｜>' -}}
+        {%- if thinking and (not state.drop or loop.index0 >= state.last_user) -%}
+            {{- '<think>' -}}
+        {%- else -%}
+            {{- '</think>' -}}
+        {%- endif -%}
+        {%- set state.in_user = false -%}
+    {%- endif -%}
+{%- endfor -%}

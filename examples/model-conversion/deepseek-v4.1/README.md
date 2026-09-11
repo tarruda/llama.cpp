@@ -4,6 +4,8 @@ DeepSeek V4.1 numerical reference
 
 The fixture keeps all 40 backbone layers and the released KV/index source topology. Widths, expert counts, Engram tables, sliding window, and index/candidate limits are reduced. Its default 33-token prompt crosses the 16-token window, ratio-2 compression boundaries, top-8 indexing threshold, and four candidate blocks of four positions. Four subsequent decode steps exercise incomplete and completed compressor groups. Weights are deterministic and nonuniform; all residual copies, output groups, and routed experts have distinct parameters. The synthetic tokenizer has 128 unique entries and exercises the official hash implementation, but does not replace real-tokenizer validation.
 
+For text chat with the existing converted GGUF, override its older embedded template with `--jinja --chat-template-file models/templates/deepseek-ai-DeepSeek-V4.1.jinja`. The override preserves reminders, applies the official reasoning-history policy and joins typed text blocks with two newlines. It accepts reasoning effort `low`, `high`, `max`, or an integer from 1 to 100; decimal strings are also accepted for CLI settings. Thinking mode defaults to effort 75. Native DeepSeek preprocessing orders tool results, and the parser recognizes V4.1's spaced DSML tags. Reminder text stays in the model prompt and is excluded from parsed assistant output and grammar prefill. This template is for the native text chat path; it does not implement the official encoder's vision or auxiliary task interfaces.
+
 From the repository root, using an environment with PyTorch 2.11, NumPy, SymPy, tokenizers, and Pillow:
 
 ```sh
@@ -19,6 +21,18 @@ From the repository root, using an environment with PyTorch 2.11, NumPy, SymPy, 
 `weights.npz` and `weights.json` preserve parameter storage bytes, names, shapes, and dtypes. `reference.json` records configuration, seeds, source/adapter hashes, software versions, and invocation results. Each `stages-NNNNN.npz` contains input token IDs, complete final-position logits, original routing IDs/weights, intermediate activations, HC residual/pre coefficients, and live cache/state values for that call. Floating-point stage values are exported as F32, including values rounded to BF16 by the model; parameter storage is kept separately in its original format. Files are emitted into the explicit output directory, not this source directory.
 
 The CPU checks cover FP4 midpoint ties, adjacent source nibble packing, zero scales, the activation scale rule, FP8 rounding, block-scaled GEMMs, attention sinks/masks/duplicate indices, and HC normalization. The reference runner checks finite stages, valid distinct original expert IDs, and normalized routing weights. These are foundations for native graph comparisons; they do not establish correctness of the rebuilt llama.cpp model or fidelity to an actual execution of the released CUDA kernels.
+
+Use `compare-stages.py` with an existing native evaluation-callback capture to locate the first observed numerical difference. It reads the native `index.jsonl` records (`position`, `name`, `file`, `type`, `shape`, `strides`) and raw F32/I32 tensor files, and compares named forward stages against the reference `stages-NNNNN.npz` files. No model execution or tensor injection occurs. Both captures must use the same weights, tokens, full-forward batching, state and reference corrections. The reader expects matching token spans, not decoder-only CED replay layouts.
+
+```sh
+.venv/bin/python examples/model-conversion/deepseek-v4.1/compare-stages.py \
+    /tmp/dsv41-reference-fp8 /tmp/dsv41-native \
+    --output /tmp/dsv41-drift.json --dump-first /tmp/dsv41-first-drift.npz
+```
+
+The terminal summary reports the first unequal value, the first value exceeding `atol + rtol * abs(reference)`, the first unequal attention/FFN residual, and the first changed routed-expert set. Each numerical event includes the call position, layer, stage, absolute token position, full reference-layout element index and both values. The JSON includes every matched stage, error counts, relative L2 error, missing stages and unmapped reference stages. Integer routing IDs always require exact agreement; expert order is retained, with set changes reported separately. Use `--position 0` to isolate prefill or `--stage-regex '^dsv41_(attn_post|layer)-'` to focus on residual outputs. Defaults are `--atol 1e-6 --rtol 1e-5`; use zero for exact numerical equality. The optional NPZ saves the first failing pair and the preceding matched stage, not all graph inputs. Nonfinite values and missing mapped stages fail the comparison. Exit code 0 means only that matched stages meet the requested tolerance; it does not accept unmapped operations or cache/state handling.
+
+Stage order follows the reference archive's capture order, not the native scheduler order or token order across the whole model. The first observed difference brackets where to investigate; it does not prove which instruction caused it. Reference captures with the extra `dsv41_*` HC tensors provide finer coverage than module hooks alone. The existing CPU check script also tests threshold reporting, token coordinates, strided reads, routing comparisons and missing-stage handling.
 
 The released standalone `generate.py` calls `Transformer.forward`, which processes every supplied prompt token through all 40 layers. It does not implement the decoder-skipping and bounded-replay optimization described in the technical report.
 
@@ -71,7 +85,7 @@ build-dsv41/bin/test-backend-ops test -o DSV41_ENGRAM,DSV41_ROPE -b MTL0
 
 These backend cases cover real model widths, inverse rotations, and strided inputs. They compare CPU and Metal implementations; they do not establish end-to-end model parity.
 
-`DSV41_HC_SPLIT` computes the HC affine transforms, sigmoid gates, and Sinkhorn normalization. It adds epsilon after the row or column sum, as the released equations specify. The CPU and Metal implementations use ordered four-element sums; Metal uses precise division and exponential functions. Small coefficient differences can cross BF16 rounding boundaries in the residual streams and accumulate through later layers.
+`DSV41_HC_SPLIT` computes the HC affine transforms, sigmoid gates, and Sinkhorn normalization. It adds epsilon after the row or column sum, as the released equations specify. The CPU and Metal implementations use ordered four-element sums; Metal uses precise division and the compensated `dsv41_exp` helper. A captured `precise::exp` error of one F32 ULP changed a post gate and crossed a BF16 residual boundary. The helper corrects that case without changing other models' HC paths.
 
 The CPU reference adapter now evaluates the initial HC softmax as separate maximum subtraction, exponential, sum, and division steps, following the released kernel. Older references used PyTorch's fused softmax, which can round differently. Keep those outputs as a separate reference variant and check the recorded adapter hash. Changing only this reference evaluation changed the reduced fixtures' full logits by several percent with identical weights; agreement with either CPU variant alone does not establish CUDA parity.
 
@@ -79,7 +93,9 @@ The CPU reference adapter now evaluates the initial HC softmax as separate maxim
 build-dsv41/bin/test-backend-ops test -o DSV41_HC_SPLIT -b MTL0
 ```
 
-These cases cover one and 20 normalization iterations, single-token and multi-token inputs, and strided rows.
+These cases cover one and 20 normalization iterations, single-token and multi-token inputs, strided rows, and the captured post-gate rounding boundary.
+
+CPU reference arithmetic can also cause consequential differences. Separate diagnostics evaluate HC and attention exponentials and HC inverse square roots in F64, then round each result to F32 before subsequent arithmetic. Under this common contract, both 33-token reduced fixtures with four decode steps match native full logits to about `1e-7` relative L2 and have exact decoded cache values. Original reference outputs remain separate. This does not establish CUDA parity, bitwise equality of every intermediate, or real-model quality; F32 reductions and matrix/vector dispatch can still change rounding.
 
 `DSV41_SWIGLU` fuses gate/up clamping, SiLU, optional route weighting, and BF16 rounding. Gate and up inputs contain BF16 values in F32; route weights remain F32 and are applied before the result is rounded. The shared expert omits route weights. Metal uses precise exponential and division functions and preserves the multiplication order. Quantization for the down projection remains a separate operation.
 
@@ -97,7 +113,7 @@ build-dsv41/bin/test-backend-ops test -o DSV41_SET_ROWS -b MTL0
 
 These cases cover all three packed formats, single-token and multi-token writes, skipped rows, and contiguous or strided views.
 
-`DSV41_INDEX_SCORES` reads packed MXFP4 index keys without expanding the key cache. Queries are F32 matrices of dequantized MXFP4 values, arranged as `[dimension, heads, tokens]`. Head weights contain BF16 values in F32. The operation rounds the dot products, weighted head terms, and final head sum to BF16 values in F32. It masks future positions and optional candidate block IDs with negative infinity. Its output has one score per key and token, without a temporary head dimension.
+`DSV41_INDEX_SCORES` reads packed MXFP4 index keys without expanding the key cache. Queries are F32 matrices of dequantized MXFP4 values, arranged as `[dimension, heads, tokens]`. Head weights contain BF16 values in F32. The operation rounds the dot products, weighted head terms, and final head sum to BF16 values in F32. It masks future positions with negative infinity. Without candidates, its output has one score per key and token; with candidates, it has one score per position in the candidate blocks. Neither layout has a temporary head dimension.
 
 ```sh
 build-dsv41/bin/test-backend-ops test -o DSV41_INDEX_SCORES -b MTL0
@@ -105,7 +121,7 @@ build-dsv41/bin/test-backend-ops test -o DSV41_INDEX_SCORES -b MTL0
 
 These cases cover causal masks, empty candidate selections, strided inputs, ratio-1 and ratio-2 caches, and the real index width of 128 with 32 heads. With KV offload enabled, index keys for Metal layers are allocated on Metal and both their writes and scoring run there. Disabling KV offload keeps keys and scoring on the CPU. Snapshot I/O also supports private Metal buffers.
 
-`DSV41_SELECT` selects context positions and optional candidate blocks from F32 index scores. It masks future positions, sets the newest visible candidate block's score to positive infinity, and breaks score ties by lower original ID. Both output sections are sorted by ID and padded with -1. Metal finds the score threshold with radix histograms, then emits selected IDs in order. Integer comparisons preserve subnormal scores and treat signed zeros as equal.
+`DSV41_SELECT` selects context positions and optional candidate blocks from F32 index scores. It masks future positions, sets the newest visible candidate block's score to positive infinity, and breaks score ties by lower original ID. When consuming compact scores, pass the scorer's candidate tensor so selection maps slots back to original context positions. Candidate block IDs must be sorted, unique and followed by any -1 padding. Both output sections are sorted by ID and padded with -1. Metal finds the score threshold with radix histograms, then emits selected IDs in order. Integer comparisons preserve subnormal scores and treat signed zeros as equal.
 
 ```sh
 build-dsv41/bin/test-backend-ops test -o DSV41_SELECT -b MTL0
@@ -121,7 +137,7 @@ These cases cover exact ties, negative infinity, signed zeros, subnormal scores,
 build-dsv41/bin/test-backend-ops test -o DSV41_ATTN -b MTL0
 ```
 
-These cases cover prefill, early decode, ring wraparound, ratio-1 and ratio-2 context, duplicate and masked IDs, strided inputs, and the real 64-head, 512-wide shape. Metal uses a local exponential with high/low F32 range reduction and a degree-12 Taylor polynomial. The standard Metal `precise::exp` changed a captured denominator by one F32 step and crossed a BF16 output boundary; the local implementation fixes that case. The `dsv41_exp` helper is used by V4.1 attention and compressor pooling; HC and SwiGLU retain their existing exponentials.
+These cases cover prefill, early decode, ring wraparound, ratio-1 and ratio-2 context, duplicate and masked IDs, strided inputs, and the real 64-head, 512-wide shape. Metal uses a local exponential with high/low F32 range reduction and a degree-12 Taylor polynomial. The standard Metal `precise::exp` changed a captured denominator by one F32 step and crossed a BF16 output boundary; the local implementation fixes that case. The `dsv41_exp` helper is used by V4.1 attention, compressor pooling and HC split; SwiGLU retains its existing exponential.
 
 `DSV41_POOL` reads F32 compressor values and scores from history rings and pools completed ratio-2 groups with ordered F32 softmax weights. It returns BF16 values in F32 and zero for incomplete groups. The graph writes both histories with the existing `SET_ROWS` operation before pooling. History allocation and pooling follow cache placement, including private Metal buffers and CPU placement when KV offload is disabled. The text graph no longer uses CPU custom callbacks.
 
@@ -133,6 +149,6 @@ These cases cover single-token and multi-token inputs, strided histories and pos
 
 Longer private fixtures use a 193-token prompt and nine decode tokens, crossing the 80-row and 23-row history rings multiple times. Snapshot restore, reset, and rollback with consistent batching preserve logits and live cache bytes. Changing between matrix and vector evaluation can change HC projection rounding: at one captured point, identical inputs and RMS factors produce different BF16 residuals after HC mixing. The short fixture's batching agreement therefore does not establish general batching parity. Neither fixture replaces real-model quality validation.
 
-Score matrices currently use the full cache width: for a 128000-key cache and 512-token microbatch, one F32 score matrix is 250 MiB. Selection no longer requires a CPU copy of that matrix, but the Metal scratch storage is separate from the compact persistent cache and still needs optimization. The attention kernel establishes a tested GPU implementation; matrix tiling and shared KV reuse across heads remain performance work.
+Indexers without candidates still use the full cache width: for a 128000-key cache and 512-token microbatch, one F32 score matrix is 250 MiB. Candidate-consuming indexers use compact scores; 16384 candidate positions at the same microbatch size require 32 MiB. These are individual tensor sizes, not peak scratch measurements. Selection requires no CPU copy of the score matrix. Full-width source-indexer scratch, attention matrix tiling and shared KV reuse across heads remain performance work.
 
 The native indexer breaks exact score ties by ascending original position or block ID. This keeps masked future padding from changing the selected context. PyTorch `topk` can choose other equally scoring IDs. Check cutoff scores and membership when comparing index selections, or record an explicit reference variant with the same tie rule; do not silently replace the original reference outputs.

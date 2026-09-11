@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
+import json
+from pathlib import Path
+import runpy
+import tempfile
 import unittest
 
+import numpy as np
 import torch
 
 import cpu_kernel as kernel
+
+stage_comparison = runpy.run_path(str(Path(__file__).with_name('compare-stages.py')))
 
 
 class CPUKernelChecks(unittest.TestCase):
@@ -78,6 +85,97 @@ class CPUKernelChecks(unittest.TestCase):
         torch.testing.assert_close(post, torch.ones(1, 2, 4))
         torch.testing.assert_close(comb.sum(-1), torch.ones(1, 2, 4), atol=2e-6, rtol=0)
         torch.testing.assert_close(comb.sum(-2), torch.ones(1, 2, 4), atol=2e-6, rtol=0)
+
+
+class StageComparisonChecks(unittest.TestCase):
+    def test_first_difference_and_tolerance(self):
+        expected = np.ones((1, 2, 3), dtype=np.float32)
+        actual = expected.copy()
+        actual[0, 0, 2] = np.nextafter(np.float32(1), np.float32(2))
+        actual[0, 1, 1] = 1.015625
+        result = stage_comparison['compare_arrays'](actual, expected, 1e-6, 1e-5, 1, 33)
+        self.assertEqual(result['nonexact'], 2)
+        self.assertEqual(result['outside_tolerance'], 1)
+        self.assertEqual(result['first_nonexact']['index'], [0, 0, 2])
+        self.assertEqual(result['first_outside_tolerance']['index'], [0, 1, 1])
+        self.assertEqual(result['first_outside_tolerance']['token'], 34)
+        self.assertEqual(result['max_abs'], .015625)
+
+    def test_ids_are_exact_and_nonfinite_fails(self):
+        result = stage_comparison['compare_arrays'](np.array([2]), np.array([1]), 100, 100, 0, 0)
+        self.assertEqual(result['outside_tolerance'], 1)
+        for value in (np.nan, np.inf, -np.inf):
+            result = stage_comparison['compare_arrays'](np.array([value]), np.array([1.]), 1e-6, 1e-5, 0, 0)
+            self.assertEqual(result['nonfinite'], 1)
+            self.assertEqual(result['outside_tolerance'], 1)
+            json.dumps(result, allow_nan=False)
+
+    def test_strides_and_shape_validation(self):
+        base = np.arange(14, dtype=np.float32).reshape(2, 7)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / 'view.bin').write_bytes(base.tobytes()[8:])
+            record = dict(name='view', type='f32', file='view.bin', shape=[3, 2, 1, 1], strides=[4, 28, 56, 56])
+            actual = stage_comparison['load_native'](folder, record, (1, 2, 3))
+            np.testing.assert_array_equal(actual, base[:, 2:5][None])
+            with self.assertRaises(ValueError):
+                stage_comparison['load_native'](folder, record, (1, 3, 2))
+
+    def test_capture_order_routing_and_missing_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            native, reference = folder / 'native', folder / 'reference'
+            native.mkdir()
+            reference.mkdir()
+            stages = {'layers.0.attn_norm': np.ones((1, 2, 3), dtype=np.float32),
+                      'layers.0.ffn.gate.1': np.array([[1, 2], [2, 3]], dtype=np.int32)}
+            np.savez(reference / 'stages-00033.npz', tokens=np.array([[4, 5]]), **stages)
+            records = []
+            for key, value in stages.items():
+                name = stage_comparison['native_name'](key)
+                data = value.copy()
+                if key.endswith('gate.1'):
+                    data[:] = [[2, 1], [2, 4]]
+                else:
+                    data[0, 1, 2] = 1.25
+                filename = name + '.bin'
+                (native / filename).write_bytes(data.tobytes())
+                shape = list(data.shape[::-1])
+                strides = list(data.strides[::-1])
+                records.append(dict(position=33, name=name, file=filename, type='i32' if data.dtype == np.int32 else 'f32',
+                                    shape=shape + [1] * (4 - len(shape)), strides=strides + [data.nbytes] * (4 - len(strides))))
+            index = native / 'index.jsonl'
+            index.write_text(''.join(json.dumps(row) + '\n' for row in records[::-1]))
+            report = stage_comparison['compare'](reference, native, 1e-6, 1e-5)
+            self.assertEqual(report['first_nonexact']['stage'], 'dsv41_attn_norm-0')
+            self.assertEqual(report['first_nonexact']['point']['token'], 34)
+            self.assertEqual(report['first_routing_change']['token'], 34)
+            self.assertEqual(report['stages'][1]['routing']['changed_token_sets'], 1)
+            index.write_text(json.dumps(records[0]) + '\n')
+            report = stage_comparison['compare'](reference, native, 10, 10)
+            self.assertIsNone(report['first_outside_tolerance'])
+            self.assertFalse(report['passed'])
+            self.assertEqual(report['missing'][0]['stage'], 'dsv41_expert_ids-0')
+            index.write_text(json.dumps(records[0]) + '\n' + json.dumps(dict(records[0], file='different.bin')) + '\n')
+            with self.assertRaises(ValueError):
+                stage_comparison['load_index'](native)
+
+    def test_capture_positions_sort_numerically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            native, reference = folder / 'native', folder / 'reference'
+            native.mkdir()
+            reference.mkdir()
+            records = []
+            for position in (100000, 99999):
+                np.savez(reference / f'stages-{position:05d}.npz', tokens=np.array([[4]]), logits=np.zeros((1, 3), dtype=np.float32))
+                filename = f'{position}-logits.bin'
+                (native / filename).write_bytes(np.ones(3, dtype=np.float32).tobytes())
+                records.append(dict(position=position, name='logits', file=filename, type='f32', shape=[3, 1, 1, 1], strides=[4, 12, 12, 12]))
+            (native / 'index.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
+            report = stage_comparison['compare'](reference, native, 0, 0)
+            self.assertEqual(report['first_nonexact']['position'], 99999)
+            self.assertEqual(report['first_nonexact']['point']['token'], 99999)
 
 
 if __name__ == '__main__':

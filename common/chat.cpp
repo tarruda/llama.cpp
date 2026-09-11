@@ -1161,14 +1161,13 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_minimax_m3(tmpl, params);
     }
 
-    // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
-    // The template source contains the token as a variable assignment, not as a literal in markup.
-    // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".
+    // DeepSeek V3.2/V4/V4.1 templates construct DSML tags from a variable.
+    // Tool call fields identify the format even when the block name differs.
     if (src.find("dsml_token") != std::string::npos &&
         src.find("DSML") != std::string::npos &&
         (src.find("function_calls") != std::string::npos ||
          src.find("tool_calls") != std::string::npos)) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2/V4\n");
+        LOG_DBG("Using specialized template: DeepSeek V3.2/V4/V4.1\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
     }
 

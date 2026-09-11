@@ -1268,7 +1268,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
             }
         }
 
-        if (!use_reasoning_budget_path) {
+        if (parser.params_.grammar_lazy && !use_reasoning_budget_path) {
             // Legacy path: find triggers without thinking-awareness
             for (const auto & trigger : parser.params_.grammar_triggers) {
                 size_t      pos = std::string::npos;
@@ -7087,6 +7087,92 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
+static void test_deepseek_v41_dsml() {
+    auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+
+    const std::string dsml = "\uff5cDSML\uff5c";
+    const std::string call = "<" + dsml + " invoke name=\"special_function\">\n<" + dsml +
+        " parameter name=\"arg1\" string=\"false\">1</" + dsml + " parameter>\n</" + dsml + " invoke>\n";
+
+    for (bool thinking : {false, true}) {
+        for (bool parallel : {false, true}) {
+            for (auto choice : {COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED}) {
+                test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                    tc.params.enable_thinking = thinking;
+                    tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                    tc.params.tools = {special_function_tool};
+                    tc.params.tool_choice = choice;
+                    tc.params.parallel_tool_calls = parallel;
+                    tc.params.add_generation_prompt = true;
+                    tc.input = (thinking ? "Checking</think>" : "") + std::string("\n\n<") + dsml + " calls>\n" + call;
+                    if (parallel) { tc.input += call; }
+                    tc.input += "</" + dsml + " calls>";
+                    tc.expect = message_assist_call;
+                    if (thinking) { tc.expect.reasoning_content = "Checking"; }
+                    if (parallel) { tc.expect.tool_calls.push_back(tc.expect.tool_calls.front()); }
+                    tc.expect_reconstruction = true;
+                }, false);
+            }
+        }
+    }
+}
+
+static void test_deepseek_v41_reminder() {
+    auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+    common_chat_msg user;
+    user.role = "user";
+    user.content_parts = {{"text", "First"}, {"text", "Second"}};
+    common_chat_msg reminder;
+    reminder.role = "latest_reminder";
+    reminder.content = "Remember this.";
+    const std::string assistant = "<\uff5cAssistant\uff5c>";
+    for (bool thinking : {false, true}) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = {user, reminder};
+        inputs.enable_thinking = thinking;
+        inputs.add_generation_prompt = true;
+        const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        const auto header = assistant + (thinking ? "<think>" : "</think>");
+        assert_contains(params.prompt, "First\n\nSecond" + header + "<\uff5clatest_reminder\uff5c>Remember this.");
+        assert_equals(header, params.generation_prompt);
+        test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+            tc.params = inputs;
+            tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            tc.input = thinking ? "Checking</think>Done" : "Done";
+            tc.expect = simple_assist_msg("Done", thinking ? "Checking" : "");
+            tc.expect_reconstruction = true;
+        }, false);
+        for (auto continuation : {COMMON_CHAT_CONTINUATION_CONTENT, COMMON_CHAT_CONTINUATION_REASONING}) {
+            if (!thinking && continuation == COMMON_CHAT_CONTINUATION_REASONING) { continue; }
+            const bool content = continuation == COMMON_CHAT_CONTINUATION_CONTENT;
+            auto continued = inputs;
+            continued.continue_final_message = continuation;
+            continued.messages.push_back(simple_assist_msg(content ? "Hello, " : "", thinking ? (content ? "Checking" : "Check") : ""));
+            const auto continued_params = common_chat_templates_apply(tmpls.get(), continued);
+            const std::string tail = content ? (thinking ? "Checking</think>Hello, " : "Hello, ") : "Check";
+            assert_equals(params.prompt + tail, continued_params.prompt);
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params = continued;
+                tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                tc.input = content ? "world" : "ing</think>Done";
+                tc.expect = simple_assist_msg(content ? "Hello, world" : "Done", thinking ? "Checking" : "");
+            }, false);
+        }
+        if (thinking) {
+            auto continued = inputs;
+            continued.continue_final_message = COMMON_CHAT_CONTINUATION_REASONING;
+            continued.messages.push_back(simple_assist_msg(""));
+            assert_equals(params.prompt, common_chat_templates_apply(tmpls.get(), continued).prompt);
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params = continued;
+                tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                tc.input = "Checking</think>Done";
+                tc.expect = simple_assist_msg("Done", "Checking");
+            }, false);
+        }
+    }
+}
+
 static void test_reasoning_budget_tokens_per_request() {
     LOG_DBG("%s\n", __func__);
     // Use Qwen3 template which has <think>...</think> reasoning markers.
@@ -7161,6 +7247,7 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_supports_effort("models/templates/deepseek-ai-DeepSeek-V4.jinja", true);
+    assert_supports_effort("models/templates/deepseek-ai-DeepSeek-V4.1.jinja", true);
     assert_supports_effort("models/templates/muse-glimmer.jinja", true);
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
     assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
@@ -7328,6 +7415,8 @@ int main(int argc, char ** argv) {
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
+        test_deepseek_v41_dsml();
+        test_deepseek_v41_reminder();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();

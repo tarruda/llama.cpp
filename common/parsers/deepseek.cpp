@@ -75,6 +75,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     // non-thinking generation prompt ends with a bare </think> instead of an empty
     // <think></think> pair.
     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+    const bool is_v41 = tmpl.source().find(" calls>") != std::string::npos;
 
     std::optional<json> adjusted_messages;
     if (is_v4) {
@@ -94,13 +95,14 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string DSML_TAG     = DSML + (is_v41 ? " " : "");
+    const std::string TC_BLOCK     = is_v41 ? "calls" : is_v4 ? "tool_calls" : "function_calls";
+    const std::string FC_START     = "<" + DSML_TAG + TC_BLOCK + ">";
+    const std::string FC_END       = "</" + DSML_TAG + TC_BLOCK + ">";
+    const std::string INVOKE_START = "<" + DSML_TAG + "invoke";
+    const std::string INVOKE_END   = "</" + DSML_TAG + "invoke>";
+    const std::string PARAM_START  = "<" + DSML_TAG + "parameter";
+    const std::string PARAM_END    = "</" + DSML_TAG + "parameter>";
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
 
@@ -108,6 +110,17 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.generation_prompt = common_chat_template_generation_prompt_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+    bool generation_header_in_prompt = false;
+    if (is_v41 && adjusted_messages && !adjusted_messages->empty() && adjusted_messages->back().value("role", "") == "latest_reminder") {
+        auto generation_messages = *adjusted_messages;
+        while (!generation_messages.empty() && generation_messages.back().value("role", "") == "latest_reminder") {
+            generation_messages.erase(generation_messages.size() - 1);
+        }
+        // Reminders follow the header but are not assistant output.
+        generation_header_in_prompt = data.generation_prompt.empty();
+        data.generation_prompt = common_chat_template_generation_prompt_impl(
+            tmpl, inputs, generation_messages, std::nullopt, additional_context);
+    }
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;
@@ -118,22 +131,35 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         THINK_END,
     };
 
-    if (inputs.has_continuation()) {
+    if (inputs.has_continuation() || (is_v41 && inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && inputs.continue_msg.role == "assistant")) {
         const auto & msg = inputs.continue_msg;
 
-        if (is_v4 && msg.reasoning_content.empty()) {
+        if (is_v41 && !data.generation_prompt.empty()) {
+            const auto header = data.generation_prompt;
+            const bool thinking = string_ends_with(header, THINK_START);
+            if (!thinking && inputs.continue_final_message == COMMON_CHAT_CONTINUATION_REASONING) {
+                throw std::invalid_argument("DeepSeek V4.1 reasoning continuation requires thinking mode");
+            }
+            std::string prefill = thinking ? msg.reasoning_content : "";
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                if (thinking) { prefill += THINK_END; }
+                prefill += msg.render_content();
+            }
+            data.generation_prompt += prefill;
+            data.prompt += generation_header_in_prompt ? prefill : data.generation_prompt;
+        } else if (is_v4 && msg.reasoning_content.empty()) {
             data.generation_prompt = GEN_PROMPT + THINK_END;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += msg.render_content();
             }
+            data.prompt += data.generation_prompt;
         } else {
             data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += THINK_END + msg.render_content();
             }
+            data.prompt += data.generation_prompt;
         }
-
-        data.prompt += data.generation_prompt;
     }
 
     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
