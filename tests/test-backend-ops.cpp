@@ -4511,6 +4511,193 @@ struct test_dsv41_set_rows : public test_case {
     }
 };
 
+struct test_dsv41_index_scores : public test_case {
+    const int64_t dim;
+    const int64_t tokens;
+    const bool masked;
+    const bool strided;
+
+    test_dsv41_index_scores(int64_t dim, int64_t tokens, bool masked, bool strided) : dim(dim), tokens(tokens), masked(masked), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR4(dim, tokens, masked, strided); }
+    double max_nmse_err() override { return 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t heads = dim == 128 ? 32 : 4;
+        const int64_t n_keys = tokens == 1 ? 1024 : 33;
+        auto * q = ggml_dsv41_act_quant(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, strided ? 2*heads : heads, tokens), GGML_DSV41_QUANT_MXFP4);
+        auto * w = ggml_dsv41_act_quant(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2*heads : heads, tokens), GGML_DSV41_QUANT_BF16);
+        const int64_t bytes = ggml_row_size(GGML_TYPE_MXFP4, dim);
+        auto * keys = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, strided ? bytes + 11 : bytes, n_keys);
+        auto * key_ids = ggml_arange(ctx, 0, n_keys, 1);
+        keys = ggml_dsv41_set_rows(ctx, strided ? ggml_view_2d(ctx, keys, bytes, n_keys, keys->nb[1], 5) : keys,
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, n_keys), ggml_cast(ctx, key_ids, GGML_TYPE_I32), GGML_DSV41_QUANT_MXFP4);
+        auto * pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        ggml_tensor * candidates = masked ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 4 : 2, tokens) : nullptr;
+        if (strided) {
+            q = ggml_view_3d(ctx, q, dim, heads, tokens, q->nb[1], q->nb[2], heads*q->nb[1]);
+            w = ggml_view_2d(ctx, w, heads, tokens, w->nb[1], heads*sizeof(float));
+            pos = ggml_view_2d(ctx, pos, 1, tokens, pos->nb[1], sizeof(int32_t));
+            if (candidates) { candidates = ggml_view_2d(ctx, candidates, 2, tokens, candidates->nb[1], sizeof(int32_t)); }
+        }
+        pos = ggml_transpose(ctx, pos);
+        ggml_set_name(pos, "dsv41_index_positions");
+        if (candidates) { ggml_set_name(candidates, "dsv41_index_candidates"); }
+        return ggml_dsv41_index_scores(ctx, q, keys, w, pos, candidates, tokens == 1 ? 1 : 2, 8);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * pos = ggml_get_tensor(ctx, "dsv41_index_positions");
+        auto * candidates = ggml_get_tensor(ctx, "dsv41_index_candidates");
+        for (int64_t i = 0; i < tokens; ++i) {
+            const int32_t p = tokens == 1 ? 1000 : i == 0 ? 0 : 55 + i;
+            ggml_backend_tensor_set(pos, &p, i*pos->nb[0], sizeof(p));
+            if (candidates) {
+                const int32_t ids[] = { i == 1 ? -1 : 0, i == 1 ? -1 : p/16 };
+                ggml_backend_tensor_set(candidates, ids, i*candidates->nb[1], sizeof(ids));
+            }
+        }
+    }
+};
+
+struct test_dsv41_select : public test_case {
+    const int64_t width;
+    const int64_t tokens;
+    const bool candidate_source;
+    const bool strided;
+
+    test_dsv41_select(int64_t width, int64_t tokens, bool candidate_source, bool strided) : width(width), tokens(tokens), candidate_source(candidate_source), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR4(width, tokens, candidate_source, strided); }
+    double max_nmse_err() override { return 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? width + 7 : width, tokens);
+        auto * pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        if (strided) {
+            scores = ggml_view_2d(ctx, scores, width, tokens, scores->nb[1], 3*sizeof(float));
+            pos = ggml_view_2d(ctx, pos, 1, tokens, pos->nb[1], sizeof(int32_t));
+        }
+        pos = ggml_transpose(ctx, pos);
+        ggml_set_name(scores, "dsv41_select_scores");
+        ggml_set_name(pos, "dsv41_select_positions");
+        return ggml_dsv41_select(ctx, scores, pos, width >= 4096 ? 512 : 16, tokens > 1 ? 2 : 1, width >= 4096 ? 2048 : 8, 8, candidate_source);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * scores = ggml_get_tensor(ctx, "dsv41_select_scores");
+        auto * positions = ggml_get_tensor(ctx, "dsv41_select_positions");
+        const int ratio = tokens > 1 ? 2 : 1;
+        std::vector<float> row(width);
+        for (int64_t it = 0; it < tokens; ++it) {
+            const int32_t pos = tokens > 1 && it == 0 ? 0 : width*ratio - 1 - it % ratio;
+            ggml_backend_tensor_set(positions, &pos, it*positions->nb[0], sizeof(pos));
+            for (int64_t i = 0; i < width; ++i) {
+                row[i] = it == 1 ? -INFINITY : it == 2 ? (i % 2 ? -0.0f : 0.0f) : it == 3 ? std::nextafter(1.0f, i % 2 ? 2.0f : 0.0f) : float(i % 7 - 3);
+                if (it == 4) { row[i] = (i % 2 ? 1.0f : -1.0f)*std::numeric_limits<float>::denorm_min(); }
+            }
+            ggml_backend_tensor_set(scores, row.data(), it*scores->nb[1], row.size()*sizeof(float));
+        }
+    }
+};
+
+struct test_dsv41_pool : public test_case {
+    const int64_t dim;
+    const int64_t tokens;
+    const bool strided;
+
+    test_dsv41_pool(int64_t dim, int64_t tokens, bool strided) : dim(dim), tokens(tokens), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR3(dim, tokens, strided); }
+    double max_nmse_err() override { return 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? dim + 3 : dim, 37);
+        auto * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? dim + 5 : dim, 37);
+        auto * positions = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        if (strided) {
+            kv = ggml_view_2d(ctx, kv, dim, 37, kv->nb[1], sizeof(float));
+            scores = ggml_view_2d(ctx, scores, dim, 37, scores->nb[1], 2*sizeof(float));
+            positions = ggml_view_2d(ctx, positions, 1, tokens, positions->nb[1], sizeof(int32_t));
+        }
+        positions = ggml_transpose(ctx, positions);
+        ggml_set_name(positions, "dsv41_pool_positions");
+        return ggml_dsv41_pool(ctx, kv, scores, positions);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * positions = ggml_get_tensor(ctx, "dsv41_pool_positions");
+        for (int64_t it = 0; it < tokens; ++it) {
+            const int32_t pos = tokens == 1 ? 37 : it == 0 ? 0 : it + 31;
+            ggml_backend_tensor_set(positions, &pos, it*positions->nb[0], sizeof(pos));
+        }
+    }
+};
+
+struct test_dsv41_attn : public test_case {
+    const int64_t dim;
+    const int64_t tokens;
+    const int start;
+    const int ratio;
+    const bool strided;
+    const int window_start;
+
+    test_dsv41_attn(int64_t dim, int64_t tokens, int start, int ratio, bool strided, int window_start = 0)
+        : dim(dim), tokens(tokens), start(start), ratio(ratio), strided(strided), window_start(window_start) {}
+    std::string vars() override { return VARS_TO_STR6(dim, tokens, start, ratio, strided, window_start); }
+    // F32 exp differences can cross BF16 rounding boundaries.
+    double max_nmse_err() override { return 1e-8; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t heads = dim == 512 ? 64 : 4;
+        const int window = dim == 512 ? 128 : 16;
+        auto * q = ggml_dsv41_act_quant(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, strided ? heads + 1 : heads, tokens), GGML_DSV41_QUANT_BF16);
+        const auto cache = [&](ggml_dsv41_quant_type type, int rows) {
+            const int64_t bytes = type == GGML_DSV41_QUANT_MXFP8 ? dim/32*33 : ggml_row_size(GGML_TYPE_NVFP4, dim);
+            auto * packed = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, strided ? bytes + 11 : bytes, rows);
+            if (strided) { packed = ggml_view_2d(ctx, packed, bytes, rows, packed->nb[1], 5); }
+            return ggml_dsv41_set_rows(ctx, packed, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, rows), ggml_cast(ctx, ggml_arange(ctx, 0, rows, 1), GGML_TYPE_I32), type);
+        };
+        auto * raw = cache(GGML_DSV41_QUANT_MXFP8, window + tokens + 5);
+        auto * kv = ratio ? cache(GGML_DSV41_QUANT_NVFP4, 1024) : nullptr;
+        auto * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2 : 1, heads);
+        auto * positions = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        const int topk = dim == 512 ? 512 : 65;
+        auto * indices = ratio ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? topk + 3 : topk, tokens) : nullptr;
+        if (strided) {
+            q = ggml_view_3d(ctx, q, dim, heads, tokens, q->nb[1], q->nb[2], q->nb[1]);
+            sinks = ggml_view_2d(ctx, sinks, 1, heads, sinks->nb[1], sizeof(float));
+            positions = ggml_view_2d(ctx, positions, 1, tokens, positions->nb[1], sizeof(int32_t));
+            if (indices) { indices = ggml_view_2d(ctx, indices, topk, tokens, indices->nb[1], sizeof(int32_t)); }
+        }
+        sinks = ggml_transpose(ctx, sinks);
+        positions = ggml_transpose(ctx, positions);
+        ggml_set_name(positions, "dsv41_attn_positions");
+        if (indices) { ggml_set_name(indices, "dsv41_attn_indices"); }
+        auto * result = ggml_dsv41_attn(ctx, q, raw, sinks, positions, indices, kv, window, ratio);
+        ggml_dsv41_attn_set_window_start(result, window_start);
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * positions = ggml_get_tensor(ctx, "dsv41_attn_positions");
+        auto * indices = ggml_get_tensor(ctx, "dsv41_attn_indices");
+        for (int64_t it = 0; it < tokens; ++it) {
+            const int32_t pos = start + it;
+            ggml_backend_tensor_set(positions, &pos, it*positions->nb[0], sizeof(pos));
+            if (indices) {
+                std::vector<int32_t> ids(indices->ne[0], -1);
+                const int visible = std::min(1024, (pos + 1)/ratio);
+                for (int i = 0; i < (int) ids.size(); ++i) {
+                    if (visible && i % 7) { ids[i] = (i/2) % visible; }
+                }
+                ggml_backend_tensor_set(indices, ids.data(), it*indices->nb[1], ids.size()*sizeof(int32_t));
+            }
+        }
+    }
+};
+
 struct test_dsv41_engram : public test_case {
     const int64_t dim;
     const int64_t tokens;
@@ -9977,6 +10164,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool strided : { false, true }) {
             test_cases.emplace_back(new test_dsv41_engram(dim, 1, strided));
             test_cases.emplace_back(new test_dsv41_engram(dim, 5, strided));
+        }
+    }
+    for (int64_t dim : { 64, 128 }) {
+        for (bool masked : { false, true }) {
+            for (bool strided : { false, true }) {
+                test_cases.emplace_back(new test_dsv41_index_scores(dim, 1, masked, strided));
+                test_cases.emplace_back(new test_dsv41_index_scores(dim, 7, masked, strided));
+            }
+        }
+    }
+    for (bool source : { false, true }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_select(33, 7, source, strided));
+            test_cases.emplace_back(new test_dsv41_select(1025, 7, source, strided));
+        }
+        test_cases.emplace_back(new test_dsv41_select(128000, 1, source, false));
+    }
+    test_cases.emplace_back(new test_dsv41_select(1, 3, true, true));
+    for (int64_t dim : { 63, 512 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_pool(dim, 1, strided));
+            test_cases.emplace_back(new test_dsv41_pool(dim, 33, strided));
+        }
+    }
+    for (int ratio : { 0, 1, 2 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_attn(64, 33, 0, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(64, 1, 3, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(64, 5, 61, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(512, 1, 1285, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(64, 5, 61, ratio, strided, 61));
+            test_cases.emplace_back(new test_dsv41_attn(512, 4, 1285, ratio, strided, 1286));
         }
     }
     for (int64_t dim : { 64, 128, 512 }) {

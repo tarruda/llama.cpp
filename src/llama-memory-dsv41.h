@@ -16,7 +16,7 @@ public:
         ggml_tensor * comp_score = nullptr;
     };
 
-    llama_memory_dsv41(const llama_model & model, uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch);
+    llama_memory_dsv41(const llama_model & model, uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch, bool offload);
 
     llama_memory_context_ptr init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override;
     llama_memory_context_ptr init_full() override;
@@ -35,11 +35,9 @@ public:
     void state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) override;
 
     bool apply(const llama_ubatch & ubatch);
-    void write_raw(int il, llama_pos pos, const float * values);
+    void complete(const llama_ubatch & ubatch, bool success);
     void read_raw(int il, llama_pos pos, float * values) const;
-    void write_kv(int il, llama_pos pos, const float * values);
     void read_kv(int il, llama_pos pos, float * values) const;
-    void write_index(int il, llama_pos pos, const float * values);
     void read_index(int il, llama_pos pos, float * values) const;
 
     const llama_hparams hparams;
@@ -48,11 +46,15 @@ public:
     const uint32_t n_vocab;
     std::vector<layer> layers;
     std::vector<llama_token> tokens;
+    ggml_tensor * encoder_hidden = nullptr;
+    ggml_tensor * encoder_pre = nullptr;
+    uint32_t decoder_start = 0;
+    bool decoder_ready = true;
+    bool prefill = false;
 
 private:
     uint32_t ring_end = 0;
-    ggml_context_ptr ctx;
-    ggml_backend_buffer_ptr buffer;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 };
 
 class llama_memory_dsv41_context : public llama_memory_context_i {
@@ -61,6 +63,7 @@ public:
     bool next() override;
     bool apply() override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_replay_tokens() const;
     llama_memory_status get_status() const override { return status; }
     llama_memory_dsv41 * memory;
 

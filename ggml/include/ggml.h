@@ -595,6 +595,10 @@ extern "C" {
         GGML_OP_DSV41_HC_SPLIT,
         GGML_OP_DSV41_SWIGLU,
         GGML_OP_DSV41_SET_ROWS,
+        GGML_OP_DSV41_INDEX_SCORES,
+        GGML_OP_DSV41_SELECT,
+        GGML_OP_DSV41_ATTN,
+        GGML_OP_DSV41_POOL,
         GGML_OP_QWEN4EXP_HC_REDUCE,
         GGML_OP_QWEN4EXP_HC_COMBINE,
         GGML_OP_QSA_BLOCK_SCORE,
@@ -2850,6 +2854,50 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * rows,
             enum ggml_dsv41_quant_type type);
+
+    // Score packed MXFP4 keys with BF16 dot, weighted-head, and final-sum rounding. Causal and optional candidate masks produce -inf.
+    GGML_API struct ggml_tensor * ggml_dsv41_index_scores(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * keys,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * candidates,
+            int32_t               ratio,
+            int32_t               block_size);
+
+    // Select positions and optional candidate blocks from F32 scores. Ties favor lower IDs; output IDs are sorted, with -1 padding.
+    GGML_API struct ggml_tensor * ggml_dsv41_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores,
+            struct ggml_tensor  * positions,
+            int32_t               top_k,
+            int32_t               ratio,
+            int32_t               top_k_blocks,
+            int32_t               block_size,
+            bool                  candidate_source);
+
+    // Sparse attention over an MXFP8 ring and optional NVFP4 context. Queries and output contain BF16 values in F32.
+    GGML_API struct ggml_tensor * ggml_dsv41_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * raw,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * kv,
+            int32_t               window,
+            int32_t               ratio);
+
+    // Mask SWA positions before the replay boundary. Global context keeps its normal causal mask.
+    GGML_API void ggml_dsv41_attn_set_window_start(struct ggml_tensor * a, int32_t window_start);
+
+    // Pool completed adjacent pairs from F32 history rings. Even positions return zero; completed pairs are rounded to BF16.
+    GGML_API struct ggml_tensor * ggml_dsv41_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * scores,
+            struct ggml_tensor  * positions);
 
     // Qwen4-Exp hyper-connection reduction
     // x, gate: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]

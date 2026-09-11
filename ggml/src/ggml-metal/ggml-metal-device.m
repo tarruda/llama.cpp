@@ -1865,6 +1865,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->type == GGML_TYPE_I8 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op);
+        case GGML_OP_DSV41_INDEX_SCORES:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I8 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_I32 &&
+                (!op->src[4] || op->src[4]->type == GGML_TYPE_I32) &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) && ggml_is_contiguous(op);
+        case GGML_OP_DSV41_SELECT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_DSV41_ATTN:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 512 &&
+                op->src[1]->type == GGML_TYPE_I8 && ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_DSV41_POOL:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_DSV41_SWIGLU:
             return op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&

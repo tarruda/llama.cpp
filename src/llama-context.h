@@ -141,7 +141,7 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp, bool prefill = false);
 
     //
     // state save/load
@@ -249,7 +249,7 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 

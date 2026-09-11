@@ -2141,6 +2141,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv41_set_rows(params, tensor);
             } break;
+        case GGML_OP_DSV41_INDEX_SCORES:
+            {
+                ggml_compute_forward_dsv41_index_scores(params, tensor);
+            } break;
+        case GGML_OP_DSV41_SELECT:
+            {
+                ggml_compute_forward_dsv41_select(params, tensor);
+            } break;
+        case GGML_OP_DSV41_ATTN:
+            {
+                ggml_compute_forward_dsv41_attn(params, tensor);
+            } break;
+        case GGML_OP_DSV41_POOL:
+            {
+                ggml_compute_forward_dsv41_pool(params, tensor);
+            } break;
         case GGML_OP_QWEN4EXP_HC_REDUCE:
             {
                 ggml_compute_forward_qwen4exp_hc_reduce(params, tensor);
@@ -2345,6 +2361,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV41_HC_SPLIT:
         case GGML_OP_DSV41_SWIGLU:
         case GGML_OP_DSV41_SET_ROWS:
+        case GGML_OP_DSV41_INDEX_SCORES:
+        case GGML_OP_DSV41_SELECT:
+        case GGML_OP_DSV41_ATTN:
+        case GGML_OP_DSV41_POOL:
         case GGML_OP_QWEN4EXP_HC_REDUCE:
         case GGML_OP_QWEN4EXP_HC_COMBINE:
         case GGML_OP_QSA_BLOCK_SCORE:

@@ -2439,7 +2439,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK41:
-            res = new llama_memory_dsv41(*this, cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_ubatch);
+            res = new llama_memory_dsv41(*this, cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_ubatch, cparams.offload_kqv);
             break;
         case LLM_ARCH_DEEPSEEK4:
             {
@@ -2838,7 +2838,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
         return 0;
     }
     return model->hparams.n_swa;

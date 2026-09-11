@@ -75,6 +75,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
         case GGML_OP_DSV41_HC_SPLIT:  op_str = "dsv41_hc_split";  break;
         case GGML_OP_DSV41_SWIGLU:    op_str = "dsv41_swiglu";    break;
         case GGML_OP_DSV41_SET_ROWS:  op_str = "dsv41_set_rows";  break;
+        case GGML_OP_DSV41_INDEX_SCORES: op_str = "dsv41_index_scores"; break;
+        case GGML_OP_DSV41_SELECT: op_str = "dsv41_select"; break;
+        case GGML_OP_DSV41_ATTN: op_str = "dsv41_attn"; break;
+        case GGML_OP_DSV41_POOL: op_str = "dsv41_pool"; break;
         default: GGML_ABORT("fatal error");
     };
 

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <numeric>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -11708,6 +11710,174 @@ void ggml_compute_forward_dsv41_set_rows(const ggml_compute_params * params, ggm
             case GGML_DSV41_QUANT_NVFP4: quantize_row_nvfp4_act_ref(src, (block_nvfp4 *) out, x->ne[0]); break;
             default: GGML_ABORT("invalid V4.1 cache quantization");
         }
+    }
+}
+
+void ggml_compute_forward_dsv41_index_scores(const ggml_compute_params * params, ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const ggml_tensor * q = dst->src[0], * keys = dst->src[1], * weights = dst->src[2];
+    const ggml_tensor * positions = dst->src[3], * candidates = dst->src[4];
+    const int ratio = ggml_get_op_params_i32(dst, 0), block_size = ggml_get_op_params_i32(dst, 1);
+    const auto bf16 = [](float x) { return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x)); };
+    std::vector<float> key(q->ne[0]);
+    for (int64_t i = params->ith; i < ggml_nelements(dst); i += params->nth) {
+        const int64_t ik = i % dst->ne[0], it = i / dst->ne[0];
+        const int32_t pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
+        bool valid = ik < (pos + 1)/ratio;
+        if (valid && candidates) {
+            valid = false;
+            for (int64_t j = 0; j < candidates->ne[0]; ++j) {
+                const int32_t id = *(const int32_t *) ((const char *) candidates->data + it*candidates->nb[1] + j*candidates->nb[0]);
+                if (id == ik/block_size) { valid = true; break; }
+            }
+        }
+        float sum = -INFINITY;
+        if (valid) {
+            dequantize_row_mxfp4((const block_mxfp4 *) ((const char *) keys->data + ik*keys->nb[1]), key.data(), q->ne[0]);
+            sum = 0;
+            const float * w = (const float *) ((const char *) weights->data + it*weights->nb[1]);
+            for (int64_t ih = 0; ih < q->ne[1]; ++ih) {
+                const float * query = (const float *) ((const char *) q->data + it*q->nb[2] + ih*q->nb[1]);
+                float dot = 0;
+                for (int64_t j = 0; j < q->ne[0]; ++j) { dot += query[j]*key[j]; }
+                sum += bf16(std::max(bf16(dot), 0.0f)*w[ih]);
+            }
+        }
+        ((float *) dst->data)[i] = bf16(sum);
+    }
+}
+
+static void ggml_dsv41_select_ids(const std::vector<float> & scores, int count, int32_t * out) {
+    std::vector<int32_t> ids(scores.size());
+    std::iota(ids.begin(), ids.end(), 0);
+    count = std::min<int>(count, ids.size());
+    if (count == 0) { return; }
+    const auto compare = [&](int32_t a, int32_t b) { return scores[a] > scores[b] || (scores[a] == scores[b] && a < b); };
+    if (count*64 <= (int) ids.size()) {
+        std::partial_sort(ids.begin(), ids.begin() + count, ids.end(), compare);
+    } else {
+        std::nth_element(ids.begin(), ids.begin() + count - 1, ids.end(), compare);
+    }
+    ids.resize(count);
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int32_t id) { return scores[id] == -INFINITY; }), ids.end());
+    std::sort(ids.begin(), ids.end());
+    std::copy(ids.begin(), ids.end(), out);
+}
+
+void ggml_compute_forward_dsv41_select(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * scores = dst->src[0], * positions = dst->src[1];
+    const int top_k = ggml_get_op_params_i32(dst, 0), ratio = ggml_get_op_params_i32(dst, 1);
+    const int top_k_blocks = ggml_get_op_params_i32(dst, 2), block_size = ggml_get_op_params_i32(dst, 3);
+    const bool candidate_source = ggml_get_op_params_i32(dst, 4);
+    for (int64_t it = params->ith; it < scores->ne[1]; it += params->nth) {
+        const int32_t pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
+        const int visible = std::clamp<int64_t>((int64_t(pos) + 1)/ratio, 0, scores->ne[0]);
+        const float * row = (const float *) ((const char *) scores->data + it*scores->nb[1]);
+        auto * out = (int32_t *) ((char *) dst->data + it*dst->nb[1]);
+        std::fill_n(out, dst->ne[0], -1);
+        ggml_dsv41_select_ids(std::vector<float>(row, row + visible), top_k, out);
+        if (candidate_source && visible > 0) {
+            std::vector<float> blocks((visible + block_size - 1)/block_size, -INFINITY);
+            for (int i = 0; i < visible; ++i) { blocks[i/block_size] = std::max(blocks[i/block_size], row[i]); }
+            blocks.back() = INFINITY;
+            ggml_dsv41_select_ids(blocks, top_k_blocks, out + top_k);
+        }
+    }
+}
+
+void ggml_compute_forward_dsv41_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const ggml_tensor * q = dst->src[0], * raw = dst->src[1], * sinks = dst->src[2];
+    const ggml_tensor * positions = dst->src[3], * indices = dst->src[4], * kv = dst->src[5];
+    const int dim = q->ne[0], heads = q->ne[1], nt = q->ne[2];
+    const int window_size = ggml_get_op_params_i32(dst, 0), ratio = ggml_get_op_params_i32(dst, 1);
+    const int window_start = ggml_get_op_params_i32(dst, 2);
+    const auto position = [&](int it) { return *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]); };
+    const bool prefill = position(0) == 0;
+    const int window = prefill ? std::min(nt, window_size) : window_size;
+    const int topk = indices ? std::clamp<int64_t>((int64_t(position(nt - 1)) + 1)/ratio, 0, indices->ne[0]) : 0;
+    const float scale = 1.0f/std::sqrt(float(dim));
+    const auto bf16 = [](float x) { return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x)); };
+    // Round the F64 exponential to F32 before accumulation.
+    const auto exp_f32 = [](float x) { return float(std::exp(double(x))); };
+    std::vector<float> tile(64*dim), accumulator(dim);
+    for (int row = params->ith; row < nt*heads; row += params->nth) {
+        const int it = row/heads, ih = row % heads, pos = position(it);
+        const auto * query = (const float *) ((const char *) q->data + ih*q->nb[1] + it*q->nb[2]);
+        std::fill(accumulator.begin(), accumulator.end(), 0.0f);
+        float maximum = -1e30f, denominator = 0;
+        for (int start = 0; start < window + topk; start += 64) {
+            const int count = std::min(64, window + topk - start);
+            float scores[64], weights[64], next_maximum = maximum;
+            for (int slot = 0; slot < count; ++slot) {
+                float * values = tile.data() + slot*dim;
+                bool valid;
+                if (start + slot < window) {
+                    const int first = pos - window_size + 1;
+                    const int p = (prefill ? std::max(0, first) : first) + start + slot;
+                    valid = p >= window_start && p <= pos;
+                    if (valid) { dequantize_row_mxfp8_act((const uint8_t *) raw->data + (p % raw->ne[1])*raw->nb[1], values, dim); }
+                } else {
+                    const auto * ids = (const int32_t *) ((const char *) indices->data + it*indices->nb[1]);
+                    const int id = ids[start + slot - window];
+                    GGML_ASSERT(id >= -1 && id < kv->ne[1]);
+                    valid = id >= 0 && id < (int64_t(pos) + 1)/ratio;
+                    if (valid) { dequantize_row_nvfp4((const block_nvfp4 *) ((const char *) kv->data + id*kv->nb[1]), values, dim); }
+                }
+                if (!valid) { std::fill_n(values, dim, 0.0f); }
+                float dot = 0;
+                for (int j = 0; j < dim; ++j) { dot += query[j]*values[j]; }
+                scores[slot] = valid ? dot*scale : -INFINITY;
+                next_maximum = std::max(next_maximum, scores[slot]);
+            }
+            const float correction = exp_f32(maximum - next_maximum);
+            float sum = 0;
+            for (int slot = 0; slot < count; ++slot) {
+                const float probability = exp_f32(scores[slot] - next_maximum);
+                sum += probability;
+                weights[slot] = bf16(probability);
+            }
+            denominator = denominator*correction + sum;
+            for (int j = 0; j < dim; ++j) {
+                float value = 0;
+                for (int slot = 0; slot < count; ++slot) { value += weights[slot]*tile[slot*dim + j]; }
+                accumulator[j] = accumulator[j]*correction + value;
+            }
+            maximum = next_maximum;
+        }
+        const float sink = *(const float *) ((const char *) sinks->data + ih*sinks->nb[0]);
+        denominator += exp_f32(sink - maximum);
+        auto * out = (float *) ((char *) dst->data + ih*dst->nb[1] + it*dst->nb[2]);
+        for (int j = 0; j < dim; ++j) { out[j] = bf16(accumulator[j]/denominator); }
+    }
+}
+
+void ggml_compute_forward_dsv41_pool(const ggml_compute_params * params, ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+    const ggml_tensor * kv = dst->src[0], * scores = dst->src[1], * positions = dst->src[2];
+    for (int64_t i = params->ith; i < ggml_nelements(dst); i += params->nth) {
+        const int64_t it = i/dst->ne[0], j = i % dst->ne[0];
+        const int32_t pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
+        GGML_ASSERT(pos >= 0);
+        float result = 0;
+        if (pos % 2) {
+            const int64_t prev = (pos - 1) % kv->ne[1], curr = pos % kv->ne[1];
+            const float a = ((const float *) ((const char *) scores->data + prev*scores->nb[1]))[j];
+            const float b = ((const float *) ((const char *) scores->data + curr*scores->nb[1]))[j];
+            const float maximum = std::max(a, b);
+            const float ea = std::exp(a - maximum), eb = std::exp(b - maximum);
+            const float va = ((const float *) ((const char *) kv->data + prev*kv->nb[1]))[j];
+            const float vb = ((const float *) ((const char *) kv->data + curr*kv->nb[1]))[j];
+            result = va*(ea/(ea + eb)) + vb*(eb/(ea + eb));
+        }
+        ((float *) dst->data)[i] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(result));
     }
 }
 

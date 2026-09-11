@@ -1439,6 +1439,61 @@ typedef struct {
 } ggml_metal_kargs_dsv41_set_rows;
 
 typedef struct {
+    int32_t dim;
+    int32_t heads;
+    int32_t n_keys;
+    int32_t ratio;
+    int32_t block_size;
+    int32_t n_candidates;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    uint64_t nb_k1;
+    uint64_t nb_w1;
+    uint64_t nb_p0;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+} ggml_metal_kargs_dsv41_index_scores;
+
+typedef struct {
+    int32_t n_keys;
+    int32_t top_k;
+    int32_t ratio;
+    int32_t top_k_blocks;
+    int32_t block_size;
+    int32_t candidate_source;
+    uint64_t nb_s1;
+    uint64_t nb_p0;
+} ggml_metal_kargs_dsv41_select;
+
+typedef struct {
+    int32_t dim;
+    int32_t heads;
+    int32_t tokens;
+    int32_t n_ring;
+    int32_t n_kv;
+    int32_t top_k;
+    int32_t window;
+    int32_t ratio;
+    int32_t window_start;
+    float scale;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    uint64_t nb_r1;
+    uint64_t nb_s0;
+    uint64_t nb_p0;
+    uint64_t nb_i1;
+    uint64_t nb_k1;
+} ggml_metal_kargs_dsv41_attn;
+
+typedef struct {
+    int32_t dim;
+    int32_t n_rows;
+    uint64_t nb_k1;
+    uint64_t nb_s1;
+    uint64_t nb_p0;
+} ggml_metal_kargs_dsv41_pool;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;

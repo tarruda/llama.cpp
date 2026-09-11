@@ -95,7 +95,8 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, ep
     pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
     post = 2 * torch.sigmoid(mixes[..., hc:2*hc] * hc_scale[1] + hc_base[hc:2*hc])
     comb = (mixes[..., 2*hc:] * hc_scale[2] + hc_base[2*hc:]).unflatten(-1, (hc, hc))
-    comb = comb.softmax(-1) + eps
+    comb = (comb - comb.amax(-1, keepdim=True)).exp()
+    comb = comb / comb.sum(-1, keepdim=True) + eps
     comb = comb / (comb.sum(-2, keepdim=True) + eps)
     for _ in range(sinkhorn_iters - 1):
         comb = comb / (comb.sum(-1, keepdim=True) + eps)

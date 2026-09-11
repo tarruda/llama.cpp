@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-dsv41.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -741,6 +742,22 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+    }
+
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && !cparams.embeddings && !cparams.embeddings_nextn && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        // Decoder replay can be wider than the encoder microbatch.
+        std::vector<size_t> sizes(backend_ptrs.size());
+        for (uint32_t count : {1u, n_tokens}) {
+            for (uint32_t outputs : {0u, 1u}) {
+                auto * gf = graph_reserve(count, 1, outputs, mctx.get(), model.hparams.no_alloc,
+                        model.hparams.no_alloc ? sizes.data() : nullptr, LLM_GRAPH_TYPE_CED_PREFILL);
+                if (!gf) { throw std::runtime_error("failed to allocate CED compute buffers"); }
+                if (model.hparams.no_alloc) {
+                    for (size_t i = 0; i < sizes.size(); ++i) { backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]); }
+                }
+            }
+            if (n_tokens == 1) { break; }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -1726,7 +1743,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, bool prefill) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1743,6 +1760,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
+    auto * dsv41_memory = dynamic_cast<llama_memory_dsv41 *>(memory.get());
+    const bool ced = prefill && dsv41_memory;
+    if (dsv41_memory) { dsv41_memory->prefill = ced; }
+    if (ced && (cparams.embeddings || cparams.embeddings_nextn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT)) {
+        LLAMA_LOG_ERROR("%s: CED prefill requires a text generation context\n", __func__);
+        return -1;
+    }
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
@@ -1794,6 +1818,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    if (ced && (n_outputs_all > 1 || (n_outputs_all == 1 && !balloc->get_batch().logits[n_tokens_all - 1]))) {
+        LLAMA_LOG_ERROR("%s: CED prefill supports only the final token's logits; use llama_decode for full outputs\n", __func__);
+        return -1;
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -1909,7 +1938,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ced ? LLM_GRAPH_TYPE_CED_PREFILL : ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (res && dsv41_memory) { dsv41_memory->complete(ubatch, true); }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1933,6 +1963,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 memory->seq_rm(s, pos_min[s], -1);
             }
+
+            if (dsv41_memory) { dsv41_memory->complete(ubatch, false); }
 
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
@@ -2500,9 +2532,9 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, llm_graph_type gtype) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || gtype == LLM_GRAPH_TYPE_CED_PREFILL);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -2527,7 +2559,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, gtype == LLM_GRAPH_TYPE_DEFAULT ? ctx_type_to_graph_type(cparams.ctx_type) : gtype);
 
     res->reset();
 
@@ -4338,6 +4370,16 @@ int32_t llama_decode(
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
+    return ret;
+}
+
+int32_t llama_prefill(
+        llama_context * ctx,
+          llama_batch   batch) {
+    const int ret = ctx->decode(batch, true);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to prefill, ret = %d\n", __func__, ret);
+    }
     return ret;
 }
 

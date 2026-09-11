@@ -4,8 +4,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
-#include <numeric>
 #include <stdexcept>
 
 static void dsv41_require(bool valid, const char * message) {
@@ -213,20 +211,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
 namespace {
 
-float dsv41_bf16(float x) {
-    return ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-}
-
-const float * dsv41_frow(const ggml_tensor * t, int64_t row) {
-    GGML_ASSERT(t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float));
-    return (const float *) ((const char *) t->data + row*t->nb[1]);
-}
-
-struct dsv41_op_data {
-    llama_memory_dsv41 * memory;
-    int il;
-};
-
 class llm_graph_input_dsv41 : public llm_graph_input_i {
 public:
     llm_graph_input_dsv41(const llama_model_deepseek41 & model, llama_memory_dsv41 * memory) : model(model), memory(memory) {}
@@ -255,24 +239,39 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         const auto & e = model.engram;
         const uint32_t heads = (e.ngram_size - 1)*e.n_heads;
-        std::vector<float> values(ubatch->n_tokens*heads*e.head_dim);
+        std::vector<int32_t> pos(n_tokens);
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            pos[it] = replay ? memory->tokens.size() - n_tokens + it : ubatch->pos[it];
+        }
+        if (positions) { ggml_backend_tensor_set(positions, pos.data(), 0, pos.size()*sizeof(int32_t)); }
+        const int32_t window_start = replay ? pos[0] : memory->decoder_start;
+        for (auto * attention : decoder_attention) { ggml_dsv41_attn_set_window_start(attention, window_start); }
+        for (int ratio = 0; ratio < 3; ++ratio) {
+            if (!cache_rows[ratio]) { continue; }
+            std::vector<int32_t> ids(n_tokens);
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                ids[it] = ratio == 0 ? pos[it] % memory->n_ring : (pos[it] + 1) % ratio == 0 ? pos[it]/ratio : -1;
+            }
+            ggml_backend_tensor_set(cache_rows[ratio], ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
         for (int mode = 0; mode < 3; ++mode) {
             if (!rotations[mode]) { continue; }
             const auto & freq = frequencies[mode != 0];
-            std::vector<float> cs(ubatch->n_tokens*freq.size()*2);
-            for (uint32_t it = 0; it < ubatch->n_tokens; ++it) {
-                const int32_t pos = mode == 2 ? ubatch->pos[it]/2*2 : ubatch->pos[it];
+            std::vector<float> cs(n_tokens*freq.size()*2);
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                const int32_t position = mode == 2 ? pos[it]/2*2 : pos[it];
                 for (size_t i = 0; i < freq.size(); ++i) {
-                    const float angle = pos*freq[i];
+                    const float angle = position*freq[i];
                     cs[2*(it*freq.size() + i)]     = std::cos(angle);
                     cs[2*(it*freq.size() + i) + 1] = std::sin(angle);
                 }
             }
             ggml_backend_tensor_set(rotations[mode], cs.data(), 0, cs.size()*sizeof(float));
         }
-        for (size_t ie = 0; ie < e.layers.size(); ++ie) {
+        std::vector<float> values(engram.empty() ? 0 : n_tokens*heads*e.head_dim);
+        for (size_t ie = 0; ie < engram.size(); ++ie) {
             const auto & layer = model.layers[e.layers[ie]];
-            for (uint32_t it = 0; it < ubatch->n_tokens; ++it) {
+            for (int64_t it = 0; it < n_tokens; ++it) {
                 uint64_t hash = 0;
                 for (uint32_t shift = 0; shift < e.ngram_size; ++shift) {
                     const int64_t pos = (int64_t) ubatch->pos[it] - shift;
@@ -300,217 +299,30 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         const auto * mctx = static_cast<const llama_memory_dsv41_context *>(params.mctx);
-        return mctx && mctx->memory == memory && n_tokens == params.ubatch.n_tokens;
-    }
-
-    dsv41_op_data * add_op(int il) {
-        ops.push_back(std::make_unique<dsv41_op_data>(dsv41_op_data{memory, il}));
-        return ops.back().get();
+        const int64_t count = replay ? std::min<size_t>(memory->tokens.size(), model.hparams.n_swa) : params.ubatch.n_tokens;
+        return mctx && mctx->memory == memory && n_tokens == count;
     }
 
     const llama_model_deepseek41 & model;
     llama_memory_dsv41 * memory;
     int64_t n_tokens = 0;
+    bool replay = false;
+    ggml_tensor * positions = nullptr;
+    std::vector<ggml_tensor *> decoder_attention;
     std::array<std::vector<float>, 2> frequencies;
     std::array<ggml_tensor *, 3> rotations = {};
+    std::array<ggml_tensor *, 3> cache_rows = {};
     std::vector<ggml_tensor *> engram;
-    std::vector<std::unique_ptr<dsv41_op_data>> ops;
 };
-
-// CPU cache operations establish the reference graph before backend-specific cache kernels.
-void dsv41_pool(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
-    GGML_UNUSED(nth);
-    const auto & op = *(const dsv41_op_data *) userdata;
-    auto & layer = op.memory->layers[op.il];
-    const auto * pos = (const int32_t *) dst->src[2]->data;
-    for (int64_t it = 0; it < dst->ne[1]; ++it) {
-        const auto slot = pos[it] % op.memory->n_ring;
-        const auto * kv = dsv41_frow(dst->src[0], it);
-        const auto * score = dsv41_frow(dst->src[1], it);
-        auto * saved_kv = (float *) ((char *) layer.comp_kv->data + slot*layer.comp_kv->nb[1]);
-        auto * saved_score = (float *) ((char *) layer.comp_score->data + slot*layer.comp_score->nb[1]);
-        std::memcpy(saved_kv, kv, dst->nb[1]);
-        std::memcpy(saved_score, score, dst->nb[1]);
-        auto * out = (float *) ((char *) dst->data + it*dst->nb[1]);
-        for (int64_t j = 0; j < dst->ne[0]; ++j) {
-            out[j] = 0;
-            if (pos[it] % 2 == 0) {
-                continue;
-            }
-            const auto prev = (pos[it] - 1) % op.memory->n_ring;
-            const auto a = dsv41_frow(layer.comp_score, prev)[j];
-            const auto b = score[j];
-            const float maximum = std::max(a, b);
-            const float ea = std::exp(a - maximum), eb = std::exp(b - maximum);
-            out[j] = dsv41_bf16(dsv41_frow(layer.comp_kv, prev)[j]*(ea/(ea + eb)) + kv[j]*(eb/(ea + eb)));
-        }
-    }
-}
-
-void dsv41_publish(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
-    GGML_UNUSED(nth);
-    const auto & op = *(const dsv41_op_data *) userdata;
-    const auto * pos = (const int32_t *) dst->src[2]->data;
-    const auto ratio = op.memory->hparams.dsv4_compress_ratios[op.il];
-    for (int64_t it = 0; it < dst->src[0]->ne[1]; ++it) {
-        if ((pos[it] + 1) % ratio == 0) {
-            op.memory->write_kv(op.il, pos[it]/ratio, dsv41_frow(dst->src[0], it));
-            op.memory->write_index(op.il, pos[it]/ratio, dsv41_frow(dst->src[1], it));
-        }
-    }
-    *(float *) dst->data = 0;
-}
-
-std::vector<int32_t> dsv41_topk(const std::vector<float> & scores, int count) {
-    std::vector<int32_t> ids(scores.size());
-    std::iota(ids.begin(), ids.end(), 0);
-    count = std::min<int>(count, ids.size());
-    // Keep tied selections independent of masked padding.
-    const auto compare = [&](int32_t a, int32_t b) { return scores[a] > scores[b] || (scores[a] == scores[b] && a < b); };
-    if (count > 0) {
-        if (count*64 <= (int) ids.size()) {
-            std::partial_sort(ids.begin(), ids.begin() + count, ids.end(), compare);
-        } else {
-            std::nth_element(ids.begin(), ids.begin() + count - 1, ids.end(), compare);
-        }
-    }
-    ids.resize(count);
-    return ids;
-}
-
-void dsv41_index(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
-    GGML_UNUSED(nth);
-    const auto & op = *(const dsv41_op_data *) userdata;
-    const auto & hp = op.memory->hparams;
-    const auto * q = dst->src[0];
-    const auto * weights = dst->src[1];
-    const auto * pos = (const int32_t *) dst->src[2]->data;
-    const int ratio = hp.dsv4_compress_ratios[op.il];
-    const bool candidate_source = op.il == hp.dsv41_candidate_source_layer;
-    const bool uses_candidates = hp.dsv41_candidate_source_layer >= 0 && op.il > hp.dsv41_candidate_source_layer;
-    const int block_size = hp.dsv41_candidate_block_size;
-    std::vector<float> key(hp.indexer_head_size);
-    const int width = (pos[dst->ne[1] - 1] + 1)/ratio;
-    for (int64_t it = 0; it < dst->ne[1]; ++it) {
-        const int visible = (pos[it] + 1)/ratio;
-        auto * out = (int32_t *) ((char *) dst->data + it*dst->nb[1]);
-        std::fill_n(out, dst->ne[0], -1);
-        std::vector<float> scores(width, -INFINITY);
-        for (int ik = 0; ik < visible; ++ik) {
-            if (uses_candidates) {
-                const auto * blocks = (const int32_t *) ((const char *) dst->src[4]->data + it*dst->src[4]->nb[1]) + hp.indexer_top_k;
-                if (std::find(blocks, blocks + hp.dsv41_candidate_topk_blocks, ik/block_size) == blocks + hp.dsv41_candidate_topk_blocks) {
-                    continue;
-                }
-            }
-            op.memory->read_index(op.il, ik, key.data());
-            float sum = 0;
-            for (uint32_t ih = 0; ih < hp.indexer_n_head; ++ih) {
-                const auto * query = (const float *) ((const char *) q->data + ih*q->nb[1] + it*q->nb[2]);
-                float dot = 0;
-                for (uint32_t j = 0; j < hp.indexer_head_size; ++j) {
-                    dot += query[j]*key[j];
-                }
-                sum += dsv41_bf16(std::max(dsv41_bf16(dot), 0.0f)*dsv41_frow(weights, it)[ih]);
-            }
-            scores[ik] = dsv41_bf16(sum);
-        }
-        if (candidate_source && visible > 0) {
-            std::vector<float> blocks((width + block_size - 1)/block_size, -INFINITY);
-            for (int ik = 0; ik < visible; ++ik) {
-                blocks[ik/block_size] = std::max(blocks[ik/block_size], scores[ik]);
-            }
-            blocks[(visible - 1)/block_size] = INFINITY;
-            const auto selected = dsv41_topk(blocks, hp.dsv41_candidate_topk_blocks);
-            int count = 0;
-            for (auto id : selected) {
-                if (blocks[id] > -INFINITY) { out[hp.indexer_top_k + count++] = id; }
-            }
-        }
-        auto selected = dsv41_topk(scores, hp.indexer_top_k);
-        selected.erase(std::remove_if(selected.begin(), selected.end(), [&](int32_t id) { return scores[id] == -INFINITY; }), selected.end());
-        std::sort(selected.begin(), selected.end());
-        std::copy(selected.begin(), selected.end(), out);
-    }
-}
-
-void dsv41_attention(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
-    GGML_UNUSED(nth);
-    const auto & op = *(const dsv41_op_data *) userdata;
-    const auto & hp = op.memory->hparams;
-    const auto * q = dst->src[0];
-    const auto * raw = dst->src[1];
-    const auto * sinks = (const float *) dst->src[2]->data;
-    const auto * pos = (const int32_t *) dst->src[3]->data;
-    const auto * index = dst->src[4];
-    const int dim = dst->ne[0], heads = dst->ne[1], nt = dst->ne[2];
-    const int window = pos[0] == 0 ? std::min<int>(nt, hp.n_swa) : hp.n_swa;
-    const int topk = index ? std::min<int>(hp.indexer_top_k, (pos[nt - 1] + 1)/hp.dsv4_compress_ratios[op.il]) : 0;
-    std::vector<float> kv((window + topk)*dim), accumulator(dim);
-    std::vector<bool> valid(window + topk);
-    for (int it = 0; it < nt; ++it) {
-        op.memory->write_raw(op.il, pos[it], dsv41_frow(raw, it));
-    }
-    const float scale = 1.0f/std::sqrt(float(dim));
-    for (int it = 0; it < nt; ++it) {
-        const int first = pos[it] - int(hp.n_swa) + 1;
-        for (int slot = 0; slot < window + topk; ++slot) {
-            auto * row = kv.data() + slot*dim;
-            if (slot < window) {
-                const int p = (pos[0] == 0 ? std::max(0, first) : first) + slot;
-                valid[slot] = p >= 0 && p <= pos[it];
-                if (valid[slot]) { op.memory->read_raw(op.il, p, row); }
-            } else {
-                const auto id = ((const int32_t *) ((const char *) index->data + it*index->nb[1]))[slot - window];
-                valid[slot] = id >= 0;
-                if (valid[slot]) { op.memory->read_kv(op.il, id, row); }
-            }
-            if (!valid[slot]) { std::fill_n(row, dim, 0.0f); }
-        }
-        for (int ih = 0; ih < heads; ++ih) {
-            const auto * query = (const float *) ((const char *) q->data + ih*q->nb[1] + it*q->nb[2]);
-            std::fill(accumulator.begin(), accumulator.end(), 0.0f);
-            float maximum = -1e30f, denominator = 0;
-            for (int start = 0; start < window + topk; start += 64) {
-                const int count = std::min(64, window + topk - start);
-                float scores[64], weights[64], next_maximum = maximum;
-                for (int slot = 0; slot < count; ++slot) {
-                    float dot = 0;
-                    for (int j = 0; j < dim; ++j) { dot += query[j]*kv[(start + slot)*dim + j]; }
-                    scores[slot] = valid[start + slot] ? dot*scale : -INFINITY;
-                    next_maximum = std::max(next_maximum, scores[slot]);
-                }
-                const float correction = std::exp(maximum - next_maximum);
-                float sum = 0;
-                for (int slot = 0; slot < count; ++slot) {
-                    const float probability = std::exp(scores[slot] - next_maximum);
-                    sum += probability;
-                    weights[slot] = dsv41_bf16(probability);
-                }
-                denominator = denominator*correction + sum;
-                for (int j = 0; j < dim; ++j) {
-                    float value = 0;
-                    for (int slot = 0; slot < count; ++slot) { value += weights[slot]*kv[(start + slot)*dim + j]; }
-                    accumulator[j] = accumulator[j]*correction + value;
-                }
-                maximum = next_maximum;
-            }
-            denominator += std::exp(sinks[ih] - maximum);
-            auto * out = (float *) ((char *) dst->data + ih*dst->nb[1] + it*dst->nb[2]);
-            for (int j = 0; j < dim; ++j) { out[j] = dsv41_bf16(accumulator[j]/denominator); }
-        }
-    }
-}
 
 struct dsv41_graph : public llm_graph_context {
     const llama_model_deepseek41 & model;
     llm_graph_input_dsv41 * input;
     ggml_tensor * positions;
-    std::vector<ggml_tensor *> published;
+    int64_t tokens;
+    bool replay = false;
+    std::vector<ggml_tensor *> cache_kv;
+    std::vector<ggml_tensor *> cache_index;
     std::vector<ggml_tensor *> indices;
     ggml_tensor * candidates = nullptr;
 
@@ -554,14 +366,14 @@ struct dsv41_graph : public llm_graph_context {
 
     hc_mixes mix(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * scale, ggml_tensor * base, int il, bool ffn) const {
         const int64_t hc = hparams.dsv4_hc_mult;
-        auto * flat = ggml_reshape_2d(ctx0, x, hc*n_embd, n_tokens);
+        auto * flat = ggml_reshape_2d(ctx0, x, hc*n_embd, tokens);
         auto * mixes = ggml_mul(ctx0, mm_f32(fn, flat), rstd(flat));
         cb(mixes, ffn ? "dsv41_ffn_mixes" : "dsv41_attn_mixes", il);
         auto * split = ggml_dsv41_hc_split(ctx0, mixes, scale, base, hparams.dsv4_hc_eps, hparams.dsv4_hc_sinkhorn_iters);
         hc_mixes result = {
-            ggml_view_2d(ctx0, split, hc, n_tokens, split->nb[1], 0),
-            ggml_view_2d(ctx0, split, hc, n_tokens, split->nb[1], hc*sizeof(float)),
-            ggml_view_3d(ctx0, split, hc, hc, n_tokens, hc*sizeof(float), split->nb[1], 2*hc*sizeof(float)),
+            ggml_view_2d(ctx0, split, hc, tokens, split->nb[1], 0),
+            ggml_view_2d(ctx0, split, hc, tokens, split->nb[1], hc*sizeof(float)),
+            ggml_view_3d(ctx0, split, hc, hc, tokens, hc*sizeof(float), split->nb[1], 2*hc*sizeof(float)),
         };
         cb(result.pre, ffn ? "dsv41_ffn_pre_mix" : "dsv41_attn_pre_mix", il);
         cb(result.post, ffn ? "dsv41_ffn_post_mix" : "dsv41_attn_post_mix", il);
@@ -573,7 +385,7 @@ struct dsv41_graph : public llm_graph_context {
         const int mode = grouped ? 2 : hparams.dsv4_compress_ratios[il] != 0;
         auto * & rotations = input->rotations[mode];
         if (!rotations) {
-            rotations = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_rot, n_tokens);
+            rotations = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_rot, tokens);
             ggml_set_input(rotations);
         }
         return ggml_dsv41_rope(ctx0, x, rotations, inverse);
@@ -585,22 +397,25 @@ struct dsv41_graph : public llm_graph_context {
         for (int64_t dst = 0; dst < hc; ++dst) {
             ggml_tensor * sum = nullptr;
             for (int64_t src = 0; src < hc; ++src) {
-                auto * row = ggml_view_2d(ctx0, residual, n_embd, n_tokens, residual->nb[2], src*residual->nb[1]);
-                auto * weight = ggml_view_2d(ctx0, mix.comb, 1, n_tokens, mix.comb->nb[2], dst*mix.comb->nb[0] + src*mix.comb->nb[1]);
+                auto * row = ggml_view_2d(ctx0, residual, n_embd, tokens, residual->nb[2], src*residual->nb[1]);
+                auto * weight = ggml_view_2d(ctx0, mix.comb, 1, tokens, mix.comb->nb[2], dst*mix.comb->nb[0] + src*mix.comb->nb[1]);
                 auto * term = ggml_mul(ctx0, row, weight);
                 sum = sum ? ggml_add(ctx0, sum, term) : term;
             }
-            auto * post = ggml_view_2d(ctx0, mix.post, 1, n_tokens, mix.post->nb[1], dst*mix.post->nb[0]);
-            auto * copy = ggml_reshape_3d(ctx0, ggml_add(ctx0, ggml_mul(ctx0, x, post), sum), n_embd, 1, n_tokens);
+            auto * post = ggml_view_2d(ctx0, mix.post, 1, tokens, mix.post->nb[1], dst*mix.post->nb[0]);
+            auto * copy = ggml_reshape_3d(ctx0, ggml_add(ctx0, ggml_mul(ctx0, x, post), sum), n_embd, 1, tokens);
             out = out ? ggml_concat(ctx0, out, copy, 1) : copy;
         }
         return bf16(out);
     }
 
-    ggml_tensor * custom(ggml_type type, int64_t n0, int64_t n1, int64_t n2,
-            std::initializer_list<ggml_tensor *> args, ggml_custom_op_t fn, int il) {
-        std::vector<ggml_tensor *> sources(args);
-        return ggml_custom_4d(ctx0, type, n0, n1, n2, 1, sources.data(), sources.size(), fn, 1, input->add_op(il));
+    ggml_tensor * write_cache(ggml_tensor * cache, ggml_tensor * x, int ratio, ggml_dsv41_quant_type type) const {
+        auto * & rows = input->cache_rows[ratio];
+        if (!rows) {
+            rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+            ggml_set_input(rows);
+        }
+        return ggml_dsv41_set_rows(ctx0, cache, x, rows, type);
     }
 
     ggml_tensor * engram(ggml_tensor * x, size_t ie) const {
@@ -611,17 +426,48 @@ struct dsv41_graph : public llm_graph_context {
         cb(embedding, "dsv41_engram_embedding", il);
         auto * kv = linear(layer.engram_kv, embedding, hparams.dsv41_dense_act_fp8);
         cb(kv, "dsv41_engram_kv", il);
-        auto * key = ggml_view_3d(ctx0, kv, n_embd, hc, n_tokens, n_embd*sizeof(float), kv->nb[1], 0);
-        auto * value = ggml_view_2d(ctx0, kv, n_embd, n_tokens, kv->nb[1], hc*n_embd*sizeof(float));
+        auto * key = ggml_view_3d(ctx0, kv, n_embd, hc, tokens, n_embd*sizeof(float), kv->nb[1], 0);
+        auto * value = ggml_view_2d(ctx0, kv, n_embd, tokens, kv->nb[1], hc*n_embd*sizeof(float));
         auto * weight = ggml_mul(ctx0, ggml_cast(ctx0, layer.engram_q_weight, GGML_TYPE_F32), ggml_cast(ctx0, layer.engram_k_weight, GGML_TYPE_F32));
         auto * out = bf16(ggml_dsv41_engram(ctx0, x, key, value, weight, norm_rms_eps, 1e-6f));
         cb(out, "dsv41_engram", il);
         return out;
     }
 
+    void publish_context(ggml_tensor * x, int il) {
+        const auto & layer = model.layers[il];
+        const auto & cache = input->memory->layers[il];
+        const int64_t dim = hparams.n_embd_head_k(il);
+        const int ratio = hparams.dsv4_compress_ratios[il];
+        ggml_tensor * latent;
+        if (ratio == 2) {
+            auto * kv = mm_f32(layer.attn_comp_wkv, x);
+            auto * score = mm_f32(layer.attn_comp_wgate, x);
+            kv = ggml_set_rows(ctx0, cache.comp_kv, kv, input->cache_rows[0]);
+            score = ggml_set_rows(ctx0, cache.comp_score, score, input->cache_rows[0]);
+            latent = ggml_dsv41_pool(ctx0, kv, score, positions);
+            if (ggml_backend_buffer_is_host(cache.comp_kv->buffer)) {
+                ggml_backend_sched_set_tensor_backend(sched, latent, backend_cpu);
+            }
+        } else {
+            latent = linear(layer.attn_comp_wkv, x, false);
+        }
+        latent = norm(latent, layer.attn_comp_norm);
+        cb(latent, "dsv41_latent", il);
+        auto * key = norm(linear(layer.indexer_attn_k, latent, false), layer.indexer_k_norm);
+        key = rope(ggml_reshape_3d(ctx0, key, hparams.indexer_head_size, 1, tokens), il, false, ratio == 2);
+        key = ggml_reshape_2d(ctx0, key, hparams.indexer_head_size, tokens);
+        cb(key, "dsv41_index_key", il);
+        auto * kv = rope(ggml_reshape_3d(ctx0, latent, dim, 1, tokens), il, false, ratio == 2);
+        kv = ggml_reshape_2d(ctx0, kv, dim, tokens);
+        cache_kv[il] = write_cache(cache.kv, kv, ratio, GGML_DSV41_QUANT_NVFP4);
+        cache_index[il] = write_cache(cache.index, key, ratio, GGML_DSV41_QUANT_MXFP4);
+    }
+
     ggml_tensor * attention(ggml_tensor * x, int il) {
         const auto & layer = model.layers[il];
         const bool fp8 = hparams.dsv41_dense_act_fp8;
+        const auto & cache = input->memory->layers[il];
         const int64_t dim = hparams.n_embd_head_k(il), heads = hparams.n_head(il);
         const int ratio = hparams.dsv4_compress_ratios[il];
         auto * qa = linear(layer.wq_a, x, fp8);
@@ -630,58 +476,58 @@ struct dsv41_graph : public llm_graph_context {
         cb(qr, "dsv41_q_norm", il);
         auto * q = linear(layer.wq_b, qr, fp8);
         cb(q, "dsv41_q_b", il);
-        q = rope(ggml_reshape_3d(ctx0, q, dim, heads, n_tokens), il);
+        q = rope(ggml_reshape_3d(ctx0, q, dim, heads, tokens), il);
         cb(q, "dsv41_q", il);
         auto * raw = norm(linear(layer.wkv, x, fp8), layer.attn_kv_norm);
-        raw = rope(ggml_reshape_3d(ctx0, raw, dim, 1, n_tokens), il);
-        raw = ggml_reshape_2d(ctx0, raw, dim, n_tokens);
+        raw = rope(ggml_reshape_3d(ctx0, raw, dim, 1, tokens), il);
+        raw = ggml_reshape_2d(ctx0, raw, dim, tokens);
         cb(raw, "dsv41_raw_kv", il);
-        if (hparams.dsv41_kv_source[il] == il) {
-            ggml_tensor * latent;
-            if (ratio == 2) {
-                auto * kv = mm_f32(layer.attn_comp_wkv, x);
-                auto * score = mm_f32(layer.attn_comp_wgate, x);
-                latent = custom(GGML_TYPE_F32, dim, n_tokens, 1, {kv, score, positions}, dsv41_pool, il);
-            } else {
-                latent = linear(layer.attn_comp_wkv, x, false);
-            }
-            latent = norm(latent, layer.attn_comp_norm);
-            cb(latent, "dsv41_latent", il);
-            auto * key = norm(linear(layer.indexer_attn_k, latent, false), layer.indexer_k_norm);
-            key = rope(ggml_reshape_3d(ctx0, key, hparams.indexer_head_size, 1, n_tokens), il, false, ratio == 2);
-            key = ggml_reshape_2d(ctx0, key, hparams.indexer_head_size, n_tokens);
-            cb(key, "dsv41_index_key", il);
-            auto * kv = rope(ggml_reshape_3d(ctx0, latent, dim, 1, n_tokens), il, false, ratio == 2);
-            kv = ggml_reshape_2d(ctx0, kv, dim, n_tokens);
-            published[il] = custom(GGML_TYPE_F32, 1, 1, 1, {kv, key, positions}, dsv41_publish, il);
-        }
+        raw = write_cache(cache.raw, raw, 0, GGML_DSV41_QUANT_MXFP8);
+        if (!replay && hparams.dsv41_kv_source[il] == il) { publish_context(x, il); }
         ggml_tensor * selected = nullptr;
         if (ratio) {
             if (hparams.dsv41_index_source[il] == il) {
                 auto * qi = linear(layer.indexer_attn_q_b, qr, fp8);
-                qi = rope(ggml_reshape_3d(ctx0, qi, hparams.indexer_head_size, hparams.indexer_n_head, n_tokens), il);
+                qi = rope(ggml_reshape_3d(ctx0, qi, hparams.indexer_head_size, hparams.indexer_n_head, tokens), il);
                 qi = ggml_dsv41_act_quant(ctx0, qi, GGML_DSV41_QUANT_MXFP4);
                 cb(qi, "dsv41_index_query", il);
                 auto * weights = linear(layer.indexer_proj, x, false);
                 weights = bf16(ggml_scale(ctx0, weights, 1.0f/std::sqrt(float(hparams.indexer_head_size*hparams.indexer_n_head))));
                 cb(weights, "dsv41_index_weights", il);
-                auto * pub = published[hparams.dsv41_kv_source[il]];
-                indices[il] = custom(GGML_TYPE_I32, hparams.indexer_top_k + hparams.dsv41_candidate_topk_blocks, n_tokens, 1,
-                        {qi, weights, positions, pub, candidates}, dsv41_index, il);
+                auto * keys = cache_index[hparams.dsv41_kv_source[il]];
+                ggml_tensor * blocks = candidates ? ggml_view_2d(ctx0, candidates, hparams.dsv41_candidate_topk_blocks, tokens, candidates->nb[1], hparams.indexer_top_k*sizeof(int32_t)) : nullptr;
+                auto * scores = ggml_dsv41_index_scores(ctx0, qi, keys, weights, positions, blocks, ratio, hparams.dsv41_candidate_block_size);
+                const bool on_cpu = ggml_backend_buffer_is_host(input->memory->layers[hparams.dsv41_kv_source[il]].index->buffer);
+                if (on_cpu) {
+                    ggml_backend_sched_set_tensor_backend(sched, scores, backend_cpu);
+                }
+                cb(scores, "dsv41_index_scores", il);
+                const bool source = il == hparams.dsv41_candidate_source_layer;
+                indices[il] = ggml_dsv41_select(ctx0, scores, positions, hparams.indexer_top_k, ratio,
+                        source ? hparams.dsv41_candidate_topk_blocks : 0, hparams.dsv41_candidate_block_size, source);
+                if (on_cpu) { ggml_backend_sched_set_tensor_backend(sched, indices[il], backend_cpu); }
                 cb(indices[il], "dsv41_index_selected", il);
-                if (il == hparams.dsv41_candidate_source_layer) { candidates = indices[il]; }
+                if (source) {
+                    candidates = indices[il];
+                    indices[il] = ggml_cont(ctx0, ggml_view_2d(ctx0, candidates, hparams.indexer_top_k, tokens, candidates->nb[1], 0));
+                }
             }
             selected = indices[hparams.dsv41_index_source[il]];
         }
-        auto * out = custom(GGML_TYPE_F32, dim, heads, n_tokens, {q, raw, layer.attn_sinks, positions, selected}, dsv41_attention, il);
+        auto * kv = ratio ? cache_kv[hparams.dsv41_kv_source[il]] : nullptr;
+        auto * out = ggml_dsv41_attn(ctx0, q, raw, layer.attn_sinks, positions, selected, kv, hparams.n_swa, ratio);
+        if (il >= n_layer/2) { input->decoder_attention.push_back(out); }
+        if (ggml_backend_buffer_is_host(cache.raw->buffer) || (kv && ggml_backend_buffer_is_host(input->memory->layers[hparams.dsv41_kv_source[il]].kv->buffer))) {
+            ggml_backend_sched_set_tensor_backend(sched, out, backend_cpu);
+        }
         cb(out, "dsv41_sparse_attention", il);
         out = rope(out, il, true);
         cb(out, "dsv41_derope", il);
         const int64_t groups = hparams.dsv4_o_group_count, rank = hparams.dsv4_o_lora_rank;
-        out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, heads*dim/groups, groups, n_tokens), 0, 2, 1, 3);
+        out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, heads*dim/groups, groups, tokens), 0, 2, 1, 3);
         auto * wa = ggml_reshape_3d(ctx0, layer.wo_a, heads*dim/groups, rank, groups);
         auto * oa = bf16(mm_f32(wa, out));
-        oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), rank*groups, n_tokens);
+        oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), rank*groups, tokens);
         cb(oa, "dsv41_o_a", il);
         out = linear(layer.wo_b, oa, fp8);
         cb(out, "dsv41_attention", il);
@@ -694,16 +540,16 @@ struct dsv41_graph : public llm_graph_context {
         auto * scores = ggml_sqrt(ctx0, ggml_softplus(ctx0, mm_f32(layer.ffn_gate_inp, x)));
         auto * ids = ggml_top_k(ctx0, ggml_add(ctx0, scores, layer.ffn_exp_probs_b), used);
         cb(ids, "dsv41_expert_ids", il);
-        auto * weights = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_expert, n_tokens), ids);
-        weights = ggml_reshape_2d(ctx0, weights, used, n_tokens);
+        auto * weights = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_expert, tokens), ids);
+        weights = ggml_reshape_2d(ctx0, weights, used, tokens);
         if (used > 1) {
             weights = ggml_div(ctx0, weights, ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, weights), 1.0f, 1e-20f));
         }
         weights = ggml_scale(ctx0, weights, hparams.expert_weights_scale);
         cb(weights, "dsv41_expert_weights", il);
-        weights = ggml_reshape_3d(ctx0, weights, 1, used, n_tokens);
+        weights = ggml_reshape_3d(ctx0, weights, 1, used, tokens);
         auto * cur = hparams.dsv41_expert_act_fp8 ? ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8) : x;
-        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, tokens);
         auto * gate = bf16(build_lora_mm_id(layer.ffn_gate_exps, cur, ids));
         auto * up = bf16(build_lora_mm_id(layer.ffn_up_exps, cur, ids));
         cb(gate, "dsv41_expert_gate", il);
@@ -716,7 +562,7 @@ struct dsv41_graph : public llm_graph_context {
         cb(experts, "dsv41_expert_output", il);
         ggml_tensor * sum = nullptr;
         for (int64_t i = 0; i < used; ++i) {
-            auto * expert = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            auto * expert = ggml_view_2d(ctx0, experts, n_embd, tokens, experts->nb[2], i*experts->nb[1]);
             sum = sum ? ggml_add(ctx0, sum, expert) : expert;
         }
         const bool fp8 = hparams.dsv41_dense_act_fp8;
@@ -731,32 +577,71 @@ struct dsv41_graph : public llm_graph_context {
     }
 
     dsv41_graph(const llama_model_deepseek41 & model, const llm_graph_params & params) :
-        llm_graph_context(params), model(model), published(n_layer), indices(n_layer) {
+        llm_graph_context(params), model(model), tokens(n_tokens), cache_kv(n_layer), cache_index(n_layer), indices(n_layer) {
         const auto * memory_context = dynamic_cast<const llama_memory_dsv41_context *>(mctx);
         dsv41_require(memory_context != nullptr, "missing compact state context");
-        auto owner = std::make_unique<llm_graph_input_dsv41>(model, memory_context->memory);
-        input = owner.get();
-        input->n_tokens = n_tokens;
-        input->init_rope(n_rot, freq_base, hparams.dsv4_compress_rope_base, freq_scale, ext_factor, n_ctx_orig, beta_fast, beta_slow);
+        auto * memory = memory_context->memory;
+        const bool ced = params.gtype == LLM_GRAPH_TYPE_CED_PREFILL;
+        const int split = n_layer/2;
         const auto & e = model.engram;
+        if (ced) {
+            dsv41_require(n_layer % 2 == 0 && n_outputs <= 1, "invalid CED layer or output count");
+            for (int il = split; il < n_layer; ++il) {
+                dsv41_require(hparams.dsv4_compress_ratios[il] == 1 && hparams.dsv41_kv_source[il] == split, "CED requires one shared decoder global cache");
+            }
+            for (auto il : e.layers) { dsv41_require(il < (uint32_t) split, "CED requires encoder-only Engram layers"); }
+        }
+        const auto add_input = [&]() {
+            auto owner = std::make_unique<llm_graph_input_dsv41>(model, memory);
+            input = owner.get();
+            input->n_tokens = tokens;
+            input->replay = replay;
+            input->init_rope(n_rot, freq_base, hparams.dsv4_compress_rope_base, freq_scale, ext_factor, n_ctx_orig, beta_fast, beta_slow);
+            res->add_input(std::move(owner));
+        };
+        add_input();
         for (size_t ie = 0; ie < e.layers.size(); ++ie) {
             auto * rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (e.ngram_size - 1)*e.n_heads*e.head_dim, n_tokens);
             ggml_set_input(rows);
             input->engram.push_back(rows);
         }
-        res->add_input(std::move(owner));
         positions = build_inp_pos();
-        auto * out_ids = build_inp_out_ids();
+        auto * out_ids = ced ? nullptr : build_inp_out_ids();
         const int64_t hc = hparams.dsv4_hc_mult;
         auto * x = build_inp_embd(model.tok_embd);
         x = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, x, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
         ggml_tensor * pre = nullptr;
         size_t ie = 0;
         for (int il = 0; il < n_layer; ++il) {
+            if (il == split) {
+                auto * hidden = ggml_set_rows(ctx0, memory->encoder_hidden, ggml_reshape_2d(ctx0, x, hc*n_embd, tokens), input->cache_rows[0]);
+                auto * mixes = ggml_set_rows(ctx0, memory->encoder_pre, pre, input->cache_rows[0]);
+                ggml_build_forward_expand(gf, hidden);
+                ggml_build_forward_expand(gf, mixes);
+                if (ced) {
+                    auto * boundary = norm(bf16(ggml_dsv4_hc_pre(ctx0, x, pre)), model.layers[split].attn_norm);
+                    cb(boundary, "dsv41_decoder_global_input", split);
+                    publish_context(boundary, split);
+                    ggml_build_forward_expand(gf, cache_kv[split]);
+                    ggml_build_forward_expand(gf, cache_index[split]);
+                    if (n_outputs == 0) { return; }
+                    tokens = memory_context->get_replay_tokens();
+                    replay = true;
+                    add_input();
+                    positions = input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+                    ggml_set_input(positions);
+                    auto * rows = input->cache_rows[0] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+                    ggml_set_input(rows);
+                    x = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, hidden, rows), n_embd, hc, tokens);
+                    pre = ggml_get_rows(ctx0, mixes, rows);
+                    cb(x, "dsv41_encoder_tail", split);
+                    cb(pre, "dsv41_encoder_tail_pre", split);
+                }
+            }
             const auto & layer = model.layers[il];
             if (ie < e.layers.size() && e.layers[ie] == (uint32_t) il) { x = engram(x, ie++); }
             const auto attn_mix = mix(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il, false);
-            auto * collapsed = pre ? bf16(ggml_dsv4_hc_pre(ctx0, x, pre)) : ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, n_tokens, x->nb[2], 0));
+            auto * collapsed = pre ? bf16(ggml_dsv4_hc_pre(ctx0, x, pre)) : ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, tokens, x->nb[2], 0));
             auto * cur = norm(collapsed, layer.attn_norm);
             cb(cur, "dsv41_attn_norm", il);
             cur = attention(cur, il);
@@ -772,6 +657,7 @@ struct dsv41_graph : public llm_graph_context {
         }
         x = bf16(ggml_dsv4_hc_pre(ctx0, x, pre));
         x = norm(x, model.output_norm);
+        if (ced) { x = ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, 1, x->nb[1], (tokens - 1)*x->nb[1])); }
         if (out_ids) { x = ggml_get_rows(ctx0, x, out_ids); }
         cb(x, "result_norm", -1);
         res->t_embd = x;

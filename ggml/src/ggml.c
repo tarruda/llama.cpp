@@ -1094,6 +1094,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV41_HC_SPLIT",
     "DSV41_SWIGLU",
     "DSV41_SET_ROWS",
+    "DSV41_INDEX_SCORES",
+    "DSV41_SELECT",
+    "DSV41_ATTN",
+    "DSV41_POOL",
     "QWEN4EXP_HC_REDUCE",
     "QWEN4EXP_HC_COMBINE",
     "QSA_BLOCK_SCORE",
@@ -1114,7 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,6 +1226,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv41_hc_split(x,s,b)",
     "dsv41_swiglu(g,u,w)",
     "dsv41_set_rows(c,x,i)",
+    "dsv41_index_scores(q,k,w,p,c)",
+    "dsv41_select(s,p)",
+    "dsv41_attn(q,r,s,p,i,k)",
+    "dsv41_pool(k,s,p)",
     "qwen4exp_hc_reduce(x, gate)",
     "qwen4exp_hc_combine(residual, x, injection)",
     "qsa_block_score(q, k, cells, mask)",
@@ -1242,7 +1250,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6917,6 +6925,108 @@ struct ggml_tensor * ggml_dsv41_set_rows(
     result->src[1] = rows;
     result->src[2] = cache;
     ggml_set_op_params_i32(result, 0, type);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_index_scores(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * keys,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * positions,
+        struct ggml_tensor  * candidates,
+        int32_t ratio, int32_t block_size) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && keys->type == GGML_TYPE_I8 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[3] == 1 && q->ne[0] % 32 == 0 && ggml_is_matrix(keys) && ggml_is_matrix(weights));
+    GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(keys) && ggml_is_contiguous_rows(weights));
+    GGML_ASSERT(keys->ne[0] == (int64_t) ggml_row_size(GGML_TYPE_MXFP4, q->ne[0]));
+    GGML_ASSERT(weights->ne[0] == q->ne[1] && weights->ne[1] == q->ne[2]);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == q->ne[2]);
+    GGML_ASSERT(ratio == 1 || ratio == 2);
+    if (candidates) {
+        GGML_ASSERT(candidates->type == GGML_TYPE_I32 && ggml_is_matrix(candidates) && candidates->ne[0] > 0 && candidates->ne[1] == q->ne[2] && block_size > 0);
+    }
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, keys->ne[1], q->ne[2]);
+    result->op = GGML_OP_DSV41_INDEX_SCORES;
+    result->src[0] = q;
+    result->src[1] = keys;
+    result->src[2] = weights;
+    result->src[3] = positions;
+    result->src[4] = candidates;
+    ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, block_size);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * positions,
+        int32_t top_k, int32_t ratio, int32_t top_k_blocks, int32_t block_size, bool candidate_source) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && ggml_is_matrix(scores) && ggml_is_contiguous_rows(scores));
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == scores->ne[1]);
+    GGML_ASSERT(top_k > 0 && top_k_blocks >= 0 && (ratio == 1 || ratio == 2));
+    GGML_ASSERT(!candidate_source || (top_k_blocks > 0 && block_size > 0));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (int64_t) top_k + top_k_blocks, scores->ne[1]);
+    result->op = GGML_OP_DSV41_SELECT;
+    result->src[0] = scores;
+    result->src[1] = positions;
+    ggml_set_op_params_i32(result, 0, top_k);
+    ggml_set_op_params_i32(result, 1, ratio);
+    ggml_set_op_params_i32(result, 2, top_k_blocks);
+    ggml_set_op_params_i32(result, 3, block_size);
+    ggml_set_op_params_i32(result, 4, candidate_source);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q, struct ggml_tensor * raw, struct ggml_tensor * sinks,
+        struct ggml_tensor * positions, struct ggml_tensor * indices, struct ggml_tensor * kv,
+        int32_t window, int32_t ratio) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[3] == 1 && q->ne[0] % 64 == 0 && ggml_is_contiguous_rows(q));
+    GGML_ASSERT(raw->type == GGML_TYPE_I8 && ggml_is_matrix(raw) && ggml_is_contiguous_rows(raw));
+    GGML_ASSERT(raw->ne[0] == q->ne[0]/32*33 && window > 0 && raw->ne[1] >= window);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_vector(sinks) && sinks->ne[0] == q->ne[1]);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == q->ne[2]);
+    GGML_ASSERT((indices && kv && (ratio == 1 || ratio == 2)) || (!indices && !kv && ratio == 0));
+    if (kv) {
+        GGML_ASSERT(kv->type == GGML_TYPE_I8 && ggml_is_matrix(kv) && ggml_is_contiguous_rows(kv));
+        GGML_ASSERT(kv->ne[0] == (int64_t) ggml_row_size(GGML_TYPE_NVFP4, q->ne[0]));
+        GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_matrix(indices) && ggml_is_contiguous_rows(indices) && indices->ne[1] == q->ne[2]);
+    }
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, q);
+    result->op = GGML_OP_DSV41_ATTN;
+    result->src[0] = q;
+    result->src[1] = raw;
+    result->src[2] = sinks;
+    result->src[3] = positions;
+    result->src[4] = indices;
+    result->src[5] = kv;
+    ggml_set_op_params_i32(result, 0, window);
+    ggml_set_op_params_i32(result, 1, ratio);
+    ggml_set_op_params_i32(result, 2, 0);
+    return result;
+}
+
+void ggml_dsv41_attn_set_window_start(struct ggml_tensor * a, int32_t window_start) {
+    GGML_ASSERT(a->op == GGML_OP_DSV41_ATTN && window_start >= 0);
+    ggml_set_op_params_i32(a, 2, window_start);
+}
+
+struct ggml_tensor * ggml_dsv41_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor * kv,
+        struct ggml_tensor * scores,
+        struct ggml_tensor * positions) {
+    GGML_ASSERT(kv->type == GGML_TYPE_F32 && scores->type == GGML_TYPE_F32 && ggml_are_same_shape(kv, scores));
+    GGML_ASSERT(ggml_is_matrix(kv) && ggml_is_contiguous_rows(kv) && ggml_is_contiguous_rows(scores) && kv->ne[1] >= 2);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv->ne[0], positions->ne[0]);
+    result->op = GGML_OP_DSV41_POOL;
+    result->src[0] = kv;
+    result->src[1] = scores;
+    result->src[2] = positions;
     return result;
 }
 

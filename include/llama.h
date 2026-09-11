@@ -991,6 +991,14 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Process prompt tokens with model-specific prefill optimizations; other models use llama_decode().
+    // DeepSeek-V4.1 uses approximate decoder replay. Request either no output or only the final token's logits.
+    // Finish prefill with an output request before generation. Use llama_decode() for calibration and verification.
+    // After an interrupted CED replay, retry prefill or restore a snapshot before generation.
+    LLAMA_API int32_t llama_prefill(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

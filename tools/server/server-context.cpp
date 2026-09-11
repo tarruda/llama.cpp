@@ -117,7 +117,7 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
-        bool is_prompt; // for stats tracking
+        bool is_prompt;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -1021,6 +1021,14 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        if (params_base.prefill_mode == COMMON_PREFILL_MODE_CED &&
+                (params_base.n_parallel != 1 || params_base.embedding || has_mmproj || has_spec ||
+                 params_base.speculative.has_synth() || std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                         [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; }))) {
+            SRV_ERR("%s\n", "--prefill-mode ced requires -np 1, text generation, and no speculative decoding");
+            return false;
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -3671,15 +3679,18 @@ private:
         }
 
         bool has_output = false;
+        bool prefill = params_base.prefill_mode == COMMON_PREFILL_MODE_CED && !batch.has_embd && !batch.slot_batched->need_embd();
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            prefill = prefill && batch.tokens[i].is_prompt;
+            prefill = prefill && (!batch.tokens[i].output || i == off + batch_view.n_tokens - 1);
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            ret = prefill ? llama_prefill(ctx_tgt, batch_view) : llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
