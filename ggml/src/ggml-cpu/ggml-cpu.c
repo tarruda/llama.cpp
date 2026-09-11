@@ -2121,6 +2121,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv41_act_quant(params, tensor);
             } break;
+        case GGML_OP_DSV41_ENGRAM:
+            {
+                ggml_compute_forward_dsv41_engram(params, tensor);
+            } break;
+        case GGML_OP_DSV41_ROPE:
+            {
+                ggml_compute_forward_dsv41_rope(params, tensor);
+            } break;
+        case GGML_OP_DSV41_HC_SPLIT:
+            {
+                ggml_compute_forward_dsv41_hc_split(params, tensor);
+            } break;
+        case GGML_OP_DSV41_SWIGLU:
+            {
+                ggml_compute_forward_dsv41_swiglu(params, tensor);
+            } break;
+        case GGML_OP_DSV41_SET_ROWS:
+            {
+                ggml_compute_forward_dsv41_set_rows(params, tensor);
+            } break;
         case GGML_OP_QWEN4EXP_HC_REDUCE:
             {
                 ggml_compute_forward_qwen4exp_hc_reduce(params, tensor);
@@ -2320,6 +2340,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_DSV41_ACT_QUANT:
+        case GGML_OP_DSV41_ENGRAM:
+        case GGML_OP_DSV41_ROPE:
+        case GGML_OP_DSV41_HC_SPLIT:
+        case GGML_OP_DSV41_SWIGLU:
+        case GGML_OP_DSV41_SET_ROWS:
         case GGML_OP_QWEN4EXP_HC_REDUCE:
         case GGML_OP_QWEN4EXP_HC_COMBINE:
         case GGML_OP_QSA_BLOCK_SCORE:

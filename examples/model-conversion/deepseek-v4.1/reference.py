@@ -199,6 +199,16 @@ def run(args):
     config = fixture_args(official, args.prompt_length + args.decode_tokens + 16, args.dense_type, args.expert_type)
     model = official.Transformer(config, FixtureTokenizer(config.vocab_size)).eval()
     initialize(model, official, args.seed)
+    owner_hooks = []
+    if args.bind_index_cache_owner:
+        def bind_owner(module, inputs):
+            del inputs
+            official.shared_attn.index_k = module.k_cache
+
+        for layer in model.layers:
+            indexer = layer.attn.indexer
+            if indexer is not None and indexer.owns_k:
+                owner_hooks.append(indexer.register_forward_pre_hook(bind_owner))
     args.output.mkdir(parents=True, exist_ok=True)
     save_weights(model, args.output)
     generator = torch.Generator().manual_seed(args.seed + 1)
@@ -226,7 +236,7 @@ def run(args):
         filename = f'stages-{start:05d}.npz'
         np.savez(args.output / filename, **arrays)
         run_reports.append(dict(start=start, end=end, arrays=len(arrays), selected_token=int(selected.item()), file=filename))
-    for handle in handles:
+    for handle in handles + owner_hooks:
         handle.remove()
     references = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in ('model.py', 'kernel.py', 'engram.py')}
     report = dict(
@@ -235,6 +245,7 @@ def run(args):
         torch_version=torch.__version__, numpy_version=np.__version__, threads=args.threads,
         execution='official Python model with CPU replacements for six TileLang kernels',
         limitation='CPU reductions are not CUDA instruction emulation; CUDA reference parity remains unverified.',
+        errata=['Bind each index-key owner even when its compressor returns no new latent.'] if args.bind_index_cache_owner else [],
         runs=run_reports,
     )
     (args.output / 'reference.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -251,6 +262,7 @@ if __name__ == '__main__':
     parser.add_argument('--expert-type', choices=('bf16', 'fp4'), default='fp4')
     parser.add_argument('--seed', type=int, default=41)
     parser.add_argument('--threads', type=int, default=1)
+    parser.add_argument('--bind-index-cache-owner', action='store_true', help='Apply the recorded incomplete-group cache-owner correction through a forward hook')
     arguments = parser.parse_args()
     if arguments.prompt_length < 1 or arguments.decode_tokens < 0 or arguments.threads < 1:
         parser.error('prompt length and threads must be positive; decode tokens must be nonnegative')

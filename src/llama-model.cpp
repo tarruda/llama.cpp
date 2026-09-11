@@ -14,6 +14,7 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-memory-dsv41.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
@@ -2438,7 +2439,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK41:
-            throw std::runtime_error("DeepSeek-V4.1 context support is not implemented yet");
+            res = new llama_memory_dsv41(*this, cparams.n_ctx_seq, cparams.n_seq_max, cparams.n_ubatch);
+            break;
         case LLM_ARCH_DEEPSEEK4:
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);

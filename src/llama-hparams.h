@@ -299,6 +299,8 @@ struct llama_hparams {
     int32_t  dsv41_candidate_source_layer = -1;
     uint32_t dsv41_candidate_topk_blocks  = 0;
     uint32_t dsv41_candidate_block_size   = 0;
+    bool     dsv41_dense_act_fp8          = true;
+    bool     dsv41_expert_act_fp8         = true;
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;

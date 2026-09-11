@@ -610,9 +610,8 @@ static float dsv41_scale_pow2(float x, int shift) {
     return as_type<float>(sign | rounded);
 }
 
-static float dsv41_e2m1_value(float x) {
+static uchar dsv41_e2m1_code(float x) {
     constexpr float midpoints[] = { 0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f };
-    constexpr float values[] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
     const float a = abs(x);
     uint code = 0;
     FOR_UNROLL (uint i = 0; i < 7; ++i) {
@@ -622,7 +621,12 @@ static float dsv41_e2m1_value(float x) {
             break;
         }
     }
-    return copysign(values[code], x);
+    return uchar(code | ((as_type<uint>(x) >> 28) & 8));
+}
+
+static float dsv41_e2m1_value(float x) {
+    constexpr float values[] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    return copysign(values[dsv41_e2m1_code(x) & 7], x);
 }
 
 kernel void kernel_dsv41_act_quant(
@@ -666,6 +670,168 @@ kernel void kernel_dsv41_act_quant(
     if (i0 < args.ne0) {
         dst[row*args.ne0 + i0] = result;
     }
+}
+
+kernel void kernel_dsv41_set_rows(
+        constant ggml_metal_kargs_dsv41_set_rows & args,
+        device const char * src,
+        device const char * indices,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int block = tgpig.x*ntg.y + sgitg, row = tgpig.y;
+    const int id = *(device const int *) (indices + row*args.nb_i0);
+    if (id < 0 || id >= args.n_rows || block*32 >= args.dim) { return; }
+    const float x = *((device const float *) (src + row*args.nb_x1) + block*32 + tiisg);
+    float amax = abs(x), scale;
+    if (args.block_size == 16) {
+        FOR_UNROLL (ushort offset = 1; offset < 16; offset *= 2) {
+            amax = max(amax, simd_shuffle_xor(amax, offset));
+        }
+        scale = dsv41_e4m3_value(dsv41_e4m3_rne(precise::divide(max(amax, 6.0f*0x1p-9f), 6.0f)));
+    } else {
+        amax = simd_max(amax);
+        const float unrounded = args.n_bits == 4 ? max(amax, 6.0f*0x1p-126f)*(1.0f/6.0f) : max(amax, 1e-4f)*(1.0f/448.0f);
+        scale = dsv41_e8m0_scale(unrounded);
+    }
+    const uint exponent = as_type<uint>(scale) >> 23;
+    const float value = args.block_size == 32 ? dsv41_scale_pow2(x, 127 - int(exponent)) : precise::divide(x, scale);
+    device uchar * out = (device uchar *) (dst + id*args.nb_d1);
+    if (args.n_bits == 8) {
+        if (tiisg == 0) { out[block*33] = uchar(exponent); }
+        out[block*33 + 1 + tiisg] = dsv41_e4m3_rne(value);
+    } else {
+        const uint code = dsv41_e2m1_code(value);
+        const ushort offset = args.block_size/2;
+        const uint other = simd_shuffle_xor(code, offset);
+        if (args.block_size == 16) {
+            const int sub = 2*(block % 2) + tiisg/16;
+            out += (block/2)*36;
+            if (tiisg % 16 == 0) { out[sub] = dsv41_e4m3_rne(scale); }
+            if (tiisg % 16 < 8) { out[4 + sub*8 + tiisg % 16] = uchar(code | (other << 4)); }
+        } else {
+            if (tiisg == 0) { out[block*17] = uchar(exponent); }
+            if (tiisg < 16) { out[block*17 + 1 + tiisg] = uchar(code | (other << 4)); }
+        }
+    }
+}
+
+kernel void kernel_dsv41_engram(
+        constant ggml_metal_kargs_dsv41_engram & args,
+        device const char * x,
+        device const char * key,
+        device const char * value,
+        device const char * weight,
+        device      float * dst,
+        uint3    tgpig[[threadgroup_position_in_grid]],
+        ushort   tiisg[[thread_index_in_simdgroup]],
+        ushort   sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3    ntg[[threads_per_threadgroup]]) {
+    const int row = tgpig.x*ntg.y + sgitg;
+    if (row >= args.n_rows) { return; }
+    const int ih = row % args.hc, it = row / args.hc;
+    device const float * h = (device const float *) (x + ih*args.nb_x1 + it*args.nb_x2);
+    device const float * k = (device const float *) (key + ih*args.nb_k1 + it*args.nb_k2);
+    device const float * v = (device const float *) (value + it*args.nb_v1);
+    device const float * w = (device const float *) (weight + ih*args.nb_w1);
+    float h2 = 0, k2 = 0, dot = 0;
+    for (int i = tiisg; i < args.dim; i += 32) {
+        h2 += h[i]*h[i];
+        k2 += k[i]*k[i];
+        dot += (h[i]*w[i])*k[i];
+    }
+    h2 = simd_sum(h2);
+    k2 = simd_sum(k2);
+    dot = simd_sum(dot);
+    const float rstd = rsqrt(h2/args.dim + args.eps)*rsqrt(k2/args.dim + args.eps);
+    dot = (dot*rstd)*rsqrt(float(args.dim));
+    const float gate = 1.0f/(1.0f + exp(-copysign(sqrt(max(abs(dot), args.clamp)), dot)));
+    for (int i = tiisg; i < args.dim; i += 32) { dst[row*args.dim + i] = h[i] + gate*v[i]; }
+}
+
+kernel void kernel_dsv41_swiglu(
+        constant ggml_metal_kargs_dsv41_swiglu & args,
+        device const char * gate,
+        device const char * up,
+        device const char * weights,
+        device      float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const int i = 128*tgpig.x + tiitg, row = tgpig.y;
+    if (i >= args.ne0) { return; }
+    const int i1 = row % args.ne1, i2 = row / args.ne1 % args.ne2, i3 = row / (args.ne1*args.ne2);
+    device const float * g = (device const float *) (gate + i1*args.nb_g1 + i2*args.nb_g2 + i3*args.nb_g3);
+    device const float * u = (device const float *) (up + i1*args.nb_u1 + i2*args.nb_u2 + i3*args.nb_u3);
+    const float w = args.weighted ? *(device const float *) (weights + i1*args.nb_w1 + i2*args.nb_w2 + i3*args.nb_w3) : 1.0f;
+    const float a = args.limit > 0 ? min(g[i], args.limit) : g[i];
+    const float b = args.limit > 0 ? clamp(u[i], -args.limit, args.limit) : u[i];
+    const float silu = precise::divide(a, 1.0f + precise::exp(-a));
+    uint bits = as_type<uint>((silu*b)*w);
+    bits = (bits & 0x7fffffff) > 0x7f800000 ? bits | 0x400000 : bits + 0x7fff + ((bits >> 16) & 1);
+    dst[row*args.ne0 + i] = as_type<float>(bits & 0xffff0000);
+}
+
+kernel void kernel_dsv41_rope(
+        constant ggml_metal_kargs_dsv41_rope & args,
+        device const char * x,
+        device const char * rotations,
+        device      float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    const int i = 2*(128*tgpig.x + tiitg), row = tgpig.y;
+    if (i >= args.dim) { return; }
+    const int ih = row % args.heads, it = row / args.heads;
+    device const float * src = (device const float *) (x + ih*args.nb_x1 + it*args.nb_x2);
+    float a = src[i], b = src[i + 1];
+    if (i >= args.offset) {
+        device const float * cs = (device const float *) (rotations + it*args.nb_r1);
+        const float c = cs[i - args.offset], s = args.sign*cs[i - args.offset + 1];
+        a = fma(src[i], c, -src[i + 1]*s);
+        b = fma(src[i + 1], c, src[i]*s);
+    }
+    uint2 bits = as_type<uint2>(float2(a, b));
+    bits = select(bits + 0x7fff + ((bits >> 16) & 1), bits | 0x400000, (bits & 0x7fffffff) > 0x7f800000);
+    *(device float2 *) (dst + row*args.dim + i) = as_type<float2>(bits & 0xffff0000);
+}
+
+kernel void kernel_dsv41_hc_split(
+        constant ggml_metal_kargs_dsv41_hc_split & args,
+        device const char  * mixes,
+        device const float * scale,
+        device const float * base,
+        device       float * dst,
+        uint3    tgpig[[threadgroup_position_in_grid]],
+        ushort   tiisg[[thread_index_in_simdgroup]],
+        ushort   sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3    ntg[[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+    const int it = tgpig.x*ntg.y + sgitg;
+    if (it >= args.n_tokens) { return; }
+    device const float * x = (device const float *) (mixes + it*args.nb_m1);
+    float v = tiisg < 24 ? x[tiisg]*scale[tiisg < 4 ? 0 : tiisg < 8 ? 1 : 2] + base[tiisg] : 0.0f;
+    if (tiisg < 8) {
+        const float p = precise::divide(1.0f, 1.0f + precise::exp(-v));
+        dst[24*it + tiisg] = tiisg < 4 ? p + args.eps : 2*p;
+    }
+    const ushort first = tiisg & ~3;
+    const ushort column = 8 + tiisg % 4;
+    const float maximum = max(max(simd_shuffle(v, first), simd_shuffle(v, first + 1)), max(simd_shuffle(v, first + 2), simd_shuffle(v, first + 3)));
+    v = precise::exp(v - maximum);
+    float sum = ((simd_shuffle(v, first) + simd_shuffle(v, first + 1)) + simd_shuffle(v, first + 2)) + simd_shuffle(v, first + 3);
+    v = precise::divide(v, sum) + args.eps;
+    for (int iteration = 0; iteration < args.n_iter; ++iteration) {
+        if (iteration) {
+            sum = ((simd_shuffle(v, first) + simd_shuffle(v, first + 1)) + simd_shuffle(v, first + 2)) + simd_shuffle(v, first + 3);
+            v = precise::divide(v, sum + args.eps);
+        }
+        sum = ((simd_shuffle(v, column) + simd_shuffle(v, column + 4)) + simd_shuffle(v, column + 8)) + simd_shuffle(v, column + 12);
+        v = precise::divide(v, sum + args.eps);
+    }
+    if (tiisg >= 8 && tiisg < 24) { dst[24*it + tiisg] = v; }
 }
 
 kernel void kernel_dsv4_hc_pre_f32(

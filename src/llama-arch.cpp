@@ -316,6 +316,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PLE_IMAGE_TOKEN_ID,                     "%s.ple.image_token_id"                     },
 
     { LLM_KV_HASH_LAYER_COUNT,                       "%s.hash_layer_count"                       },
+    { LLM_KV_DENSE_ACTIVATION_DTYPE,                 "%s.dense_activation_dtype"                 },
+    { LLM_KV_EXPERT_ACTIVATION_DTYPE,                "%s.expert_activation_dtype"                },
 
     { LLM_KV_ENGRAM_LAYERS,                          "%s.engram.layers"                          },
     { LLM_KV_ENGRAM_NGRAM_SIZE,                      "%s.engram.ngram_size"                      },

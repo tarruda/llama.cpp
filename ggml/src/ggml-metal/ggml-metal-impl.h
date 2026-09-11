@@ -1380,6 +1380,65 @@ typedef struct {
 } ggml_metal_kargs_dsv41_act_quant;
 
 typedef struct {
+    int32_t  dim;
+    int32_t  hc;
+    int32_t  n_rows;
+    float    eps;
+    float    clamp;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_k1;
+    uint64_t nb_k2;
+    uint64_t nb_v1;
+    uint64_t nb_w1;
+} ggml_metal_kargs_dsv41_engram;
+
+typedef struct {
+    int32_t  dim;
+    int32_t  heads;
+    int32_t  n_rows;
+    int32_t  offset;
+    float    sign;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_r1;
+} ggml_metal_kargs_dsv41_rope;
+
+typedef struct {
+    int32_t  n_tokens;
+    int32_t  n_iter;
+    float    eps;
+    uint64_t nb_m1;
+} ggml_metal_kargs_dsv41_hc_split;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  weighted;
+    float    limit;
+    uint64_t nb_g1;
+    uint64_t nb_g2;
+    uint64_t nb_g3;
+    uint64_t nb_u1;
+    uint64_t nb_u2;
+    uint64_t nb_u3;
+    uint64_t nb_w1;
+    uint64_t nb_w2;
+    uint64_t nb_w3;
+} ggml_metal_kargs_dsv41_swiglu;
+
+typedef struct {
+    int32_t  dim;
+    int32_t  n_rows;
+    int32_t  n_bits;
+    int32_t  block_size;
+    uint64_t nb_x1;
+    uint64_t nb_i0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv41_set_rows;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;

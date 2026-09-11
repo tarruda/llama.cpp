@@ -590,6 +590,11 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_DSV41_ACT_QUANT,
+        GGML_OP_DSV41_ENGRAM,
+        GGML_OP_DSV41_ROPE,
+        GGML_OP_DSV41_HC_SPLIT,
+        GGML_OP_DSV41_SWIGLU,
+        GGML_OP_DSV41_SET_ROWS,
         GGML_OP_QWEN4EXP_HC_REDUCE,
         GGML_OP_QWEN4EXP_HC_COMBINE,
         GGML_OP_QSA_BLOCK_SCORE,
@@ -1470,6 +1475,8 @@ extern "C" {
     //  - GGML_PREC_F16  - GGML_TYPE_F16,
     //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
     //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //
+    // MUL_MAT accepts sources 0 and 1; MUL_MAT_ID accepts source 1.
     //
     // for example:
     //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
@@ -2800,6 +2807,48 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dsv41_act_quant(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
+            enum ggml_dsv41_quant_type type);
+
+    // Engram gate and residual addition, in F32. x and key: [dim, hc, tokens], value: [dim, tokens], weight: [dim, hc].
+    GGML_API struct ggml_tensor * ggml_dsv41_engram(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * key,
+            struct ggml_tensor  * value,
+            struct ggml_tensor  * weight,
+            float                 eps,
+            float                 clamp);
+
+    // Rotate the tail of F32 x [dim, heads, tokens] with interleaved cosine/sine rows [rotary_dim, tokens], then round to BF16 values in F32.
+    GGML_API struct ggml_tensor * ggml_dsv41_rope(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * rotations,
+            bool                  inverse);
+
+    // HC affine, sigmoid and Sinkhorn normalization. Returns packed pre[4], post[4], comb[16] rows.
+    GGML_API struct ggml_tensor * ggml_dsv41_hc_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // Clamped SwiGLU with optional per-row weights, rounded to BF16 values in F32. Weight rows have width 1.
+    GGML_API struct ggml_tensor * ggml_dsv41_swiglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * weights,
+            float                 limit);
+
+    // Pack F32 rows into an I8 cache matrix. Distinct nonnegative row IDs are required; -1 skips a row. The result aliases cache.
+    GGML_API struct ggml_tensor * ggml_dsv41_set_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * rows,
             enum ggml_dsv41_quant_type type);
 
     // Qwen4-Exp hyper-connection reduction

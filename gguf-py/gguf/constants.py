@@ -150,6 +150,8 @@ class Keys:
         NUM_LOOPS                         = "{arch}.num_loops"
         SKIP_LOOP_FINAL_NORM              = "{arch}.skip_loop_final_norm"
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
+        DENSE_ACTIVATION_DTYPE             = "{arch}.dense_activation_dtype"
+        EXPERT_ACTIVATION_DTYPE            = "{arch}.expert_activation_dtype"
         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
         ALTUP_ACTIVE_IDX                  = "{arch}.altup.active_idx"
         ALTUP_NUM_INPUTS                  = "{arch}.altup.num_inputs"

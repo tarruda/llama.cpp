@@ -4476,6 +4476,143 @@ struct test_dsv41_act_quant : public test_case {
     }
 };
 
+struct test_dsv41_set_rows : public test_case {
+    const ggml_dsv41_quant_type type;
+    const int64_t tokens;
+    const bool strided;
+
+    test_dsv41_set_rows(ggml_dsv41_quant_type type, int64_t tokens, bool strided) : type(type), tokens(tokens), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR3(type, tokens, strided); }
+    double max_nmse_err() override { return 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t dim = type == GGML_DSV41_QUANT_MXFP4 ? 128 : 512;
+        const int64_t bytes = type == GGML_DSV41_QUANT_MXFP8 ? dim/32*33 : ggml_row_size(type == GGML_DSV41_QUANT_MXFP4 ? GGML_TYPE_MXFP4 : GGML_TYPE_NVFP4, dim);
+        auto * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, strided ? bytes + 11 : bytes, tokens + 7);
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? dim + 32 : dim, tokens);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
+        if (strided) {
+            cache = ggml_view_2d(ctx, cache, bytes, tokens + 7, cache->nb[1], 5);
+            x = ggml_view_2d(ctx, x, dim, tokens, x->nb[1], 32*sizeof(float));
+            ids = ggml_view_2d(ctx, ids, 1, tokens, ids->nb[1], sizeof(int32_t));
+        }
+        ids = ggml_transpose(ctx, ids);
+        ggml_set_name(ids, "dsv41_rows");
+        return ggml_dsv41_set_rows(ctx, cache, x, ids, type);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * ids = ggml_get_tensor(ctx, "dsv41_rows");
+        for (int64_t i = 0; i < tokens; ++i) {
+            const int32_t id = tokens > 1 && i % 2 == 0 ? -1 : (7*i + 3) % (tokens + 7);
+            ggml_backend_tensor_set(ids, &id, i*ids->nb[0], sizeof(id));
+        }
+    }
+};
+
+struct test_dsv41_engram : public test_case {
+    const int64_t dim;
+    const int64_t tokens;
+    const bool strided;
+
+    test_dsv41_engram(int64_t dim, int64_t tokens, bool strided) : dim(dim), tokens(tokens), strided(strided) {}
+
+    std::string vars() override { return VARS_TO_STR3(dim, tokens, strided); }
+    double max_nmse_err() override { return 1e-11; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, strided ? 2*dim : dim, 4, tokens);
+        ggml_set_name(x, "engram_x");
+        if (strided) { x = ggml_view_3d(ctx, x, dim, 4, tokens, x->nb[1], x->nb[2], dim*sizeof(float)); }
+        auto * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5*dim, tokens);
+        auto * key = ggml_view_3d(ctx, kv, dim, 4, tokens, dim*sizeof(float), kv->nb[1], 0);
+        auto * value = ggml_view_2d(ctx, kv, dim, tokens, kv->nb[1], 4*dim*sizeof(float));
+        auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, 4);
+        return ggml_dsv41_engram(ctx, x, key, value, weight, 1e-20f, 1e-6f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * x = ggml_get_tensor(ctx, "engram_x");
+        std::vector<float> zeros(x->ne[0], 0.0f);
+        ggml_backend_tensor_set(x, zeros.data(), 0, zeros.size()*sizeof(float));
+    }
+};
+
+struct test_dsv41_rope : public test_case {
+    const int64_t dim;
+    const int64_t heads;
+    const int64_t tokens;
+    const bool strided;
+    const bool inverse;
+
+    test_dsv41_rope(int64_t dim, int64_t heads, int64_t tokens, bool strided, bool inverse) :
+        dim(dim), heads(heads), tokens(tokens), strided(strided), inverse(inverse) {}
+
+    std::string vars() override { return VARS_TO_STR5(dim, heads, tokens, strided, inverse); }
+    double max_nmse_err() override { return 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, strided ? 2*dim : dim, heads, tokens);
+        if (strided) { x = ggml_view_3d(ctx, x, dim, heads, tokens, x->nb[1], x->nb[2], dim*sizeof(float)); }
+        auto * cs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+        return ggml_dsv41_rope(ctx, x, cs, inverse);
+    }
+};
+
+struct test_dsv41_hc_split : public test_case {
+    const int64_t tokens;
+    const int iterations;
+    const bool strided;
+
+    test_dsv41_hc_split(int64_t tokens, int iterations, bool strided) : tokens(tokens), iterations(iterations), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR3(tokens, iterations, strided); }
+    double max_nmse_err() override { return 1e-12; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 48 : 24, tokens);
+        if (strided) { mixes = ggml_view_2d(ctx, mixes, 24, tokens, mixes->nb[1], 24*sizeof(float)); }
+        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        auto * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+        return ggml_dsv41_hc_split(ctx, mixes, scale, base, 1e-6f, iterations);
+    }
+};
+
+struct test_dsv41_swiglu : public test_case {
+    const float limit;
+    const bool weighted;
+    const bool strided;
+
+    test_dsv41_swiglu(float limit, bool weighted, bool strided) : limit(limit), weighted(weighted), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR3(limit, weighted, strided); }
+    double max_nmse_err() override { return 1e-9; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = limit > 0 ? 2304 : 63, tokens = strided ? 5 : 1;
+        const auto branch = [&]() {
+            auto * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, strided ? 2*width : width, 6, tokens, 2);
+            x = ggml_dsv41_act_quant(ctx, ggml_scale(ctx, x, 12.0f), GGML_DSV41_QUANT_BF16);
+            if (strided) {
+                x = ggml_view_4d(ctx, x, width, 6, tokens, 2, x->nb[1], x->nb[2], x->nb[3], width*sizeof(float));
+                x = ggml_permute(ctx, x, 0, 2, 1, 3);
+            }
+            return x;
+        };
+        auto * gate = branch();
+        auto * up = branch();
+        ggml_tensor * weights = nullptr;
+        if (weighted) {
+            weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, strided ? 2 : 1, 6, tokens, 2);
+            if (strided) {
+                weights = ggml_view_4d(ctx, weights, 1, 6, tokens, 2, weights->nb[1], weights->nb[2], weights->nb[3], sizeof(float));
+                weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
+            }
+        }
+        return ggml_dsv41_swiglu(ctx, gate, up, weights, limit);
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -5586,6 +5723,21 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+struct test_mul_mat_f32_inputs : public test_mul_mat {
+    test_mul_mat_f32_inputs(int64_t m, int64_t n, int64_t k, std::array<int64_t, 2> bs = {1, 1}, std::array<int64_t, 2> nr = {1, 1}) :
+        test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, bs, nr) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",f32_inputs=1"; }
+    double max_nmse_err() override { return 1e-11; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_mul_mat::build_graph(ctx);
+        GGML_ASSERT(ggml_prec_set_src(out, GGML_PREC_F32, 0));
+        GGML_ASSERT(ggml_prec_set_src(out, GGML_PREC_F32, 1));
+        return out;
     }
 };
 
@@ -9815,6 +9967,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_BF16, 31, true));
     test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_MXFP4, 96, true));
     test_cases.emplace_back(new test_dsv41_act_quant(GGML_DSV41_QUANT_MXFP8, 96, true));
+    for (auto type : { GGML_DSV41_QUANT_MXFP8, GGML_DSV41_QUANT_MXFP4, GGML_DSV41_QUANT_NVFP4 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_set_rows(type, 1, strided));
+            test_cases.emplace_back(new test_dsv41_set_rows(type, 33, strided));
+        }
+    }
+    for (int64_t dim : { 63, 64, 5120 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_engram(dim, 1, strided));
+            test_cases.emplace_back(new test_dsv41_engram(dim, 5, strided));
+        }
+    }
+    for (int64_t dim : { 64, 128, 512 }) {
+        for (bool inverse : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_rope(dim, 1, 1, false, inverse));
+            test_cases.emplace_back(new test_dsv41_rope(dim, 4, 33, true, inverse));
+        }
+    }
+    for (int iterations : { 1, 20 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_dsv41_hc_split(1, iterations, strided));
+            test_cases.emplace_back(new test_dsv41_hc_split(33, iterations, strided));
+        }
+    }
+
+    for (float limit : { 0.0f, 10.0f }) {
+        for (bool weighted : { false, true }) {
+            for (bool strided : { false, true }) {
+                test_cases.emplace_back(new test_dsv41_swiglu(limit, weighted, strided));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
@@ -10696,6 +10880,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 6, true, 2048, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 6, false, 4096, 1, 2048));
+
+    test_cases.emplace_back(new test_mul_mat_f32_inputs(64, 32, 64));
+    test_cases.emplace_back(new test_mul_mat_f32_inputs(65, 33, 65, {2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat_f32_inputs(24, 33, 256));
+    test_cases.emplace_back(new test_mul_mat_f32_inputs(64, 1, 64));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

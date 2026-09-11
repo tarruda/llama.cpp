@@ -70,6 +70,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
         case GGML_OP_DSV4_COMPRESS:   op_str = "dsv4_compress";   break;
         case GGML_OP_DSV4_TOP_K_MASK: op_str = "dsv4_top_k_mask"; break;
         case GGML_OP_DSV41_ACT_QUANT: op_str = "dsv41_act_quant"; break;
+        case GGML_OP_DSV41_ENGRAM:    op_str = "dsv41_engram";    break;
+        case GGML_OP_DSV41_ROPE:      op_str = "dsv41_rope";      break;
+        case GGML_OP_DSV41_HC_SPLIT:  op_str = "dsv41_hc_split";  break;
+        case GGML_OP_DSV41_SWIGLU:    op_str = "dsv41_swiglu";    break;
+        case GGML_OP_DSV41_SET_ROWS:  op_str = "dsv41_set_rows";  break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -920,6 +925,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
+    const bool f32_inputs = (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_BF16) && tsrc1 == GGML_TYPE_F32 &&
+        (ggml_get_op_params_i32(op, 2) == GGML_PREC_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32);
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
@@ -940,7 +947,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), f32_inputs ? "_f32_inputs" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_tall=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3, tall);
 
@@ -965,13 +972,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = NRA;
         res.nr1 = NRB;
 
-        const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+        const size_t smem_a = NRA * N_MM_NK_TOTAL * (f32_inputs ? sizeof(float) : sizeof(ggml_fp16_t));
         res.smem = smem_a;
     } else {
         res.nr0 = nr0;
         res.nr1 = 32;
 
-        res.smem = bc_out ? nr0*32*sizeof(float) : (nr0 + 32)*32*sizeof(ggml_fp16_t);
+        const size_t smem_inputs = (nr0 + 32)*32*(f32_inputs ? sizeof(float) : sizeof(ggml_fp16_t));
+        res.smem = bc_out ? std::max<size_t>(nr0*32*sizeof(float), smem_inputs) : smem_inputs;
     }
 
     res.nsg = tall ? 8 : N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;

@@ -1089,6 +1089,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "DSV41_ACT_QUANT",
+    "DSV41_ENGRAM",
+    "DSV41_ROPE",
+    "DSV41_HC_SPLIT",
+    "DSV41_SWIGLU",
+    "DSV41_SET_ROWS",
     "QWEN4EXP_HC_REDUCE",
     "QWEN4EXP_HC_COMBINE",
     "QSA_BLOCK_SCORE",
@@ -1109,7 +1114,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1212,6 +1217,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv41_act_quant(x)",
+    "dsv41_engram(x,k,v,w)",
+    "dsv41_rope(x,r)",
+    "dsv41_hc_split(x,s,b)",
+    "dsv41_swiglu(g,u,w)",
+    "dsv41_set_rows(c,x,i)",
     "qwen4exp_hc_reduce(x, gate)",
     "qwen4exp_hc_combine(residual, x, injection)",
     "qsa_block_score(q, k, cells, mask)",
@@ -1232,7 +1242,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3329,7 +3339,7 @@ bool ggml_prec_set_src(
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-                if (idx != 1) {
+                if (idx != 1 && (idx != 0 || a->op != GGML_OP_MUL_MAT)) {
                     return false;
                 }
 
@@ -6795,6 +6805,117 @@ struct ggml_tensor * ggml_dsv41_act_quant(
     struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
     result->op = GGML_OP_DSV41_ACT_QUANT;
     result->src[0] = x;
+    ggml_set_op_params_i32(result, 0, type);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_engram(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * key,
+        struct ggml_tensor  * value,
+        struct ggml_tensor  * weight,
+        float                 eps,
+        float                 clamp) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && key->type == GGML_TYPE_F32 && value->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(key) && ggml_is_contiguous_rows(value) && ggml_is_contiguous_rows(weight));
+    GGML_ASSERT(ggml_are_same_shape(x, key) && x->ne[3] == 1);
+    GGML_ASSERT(value->ne[0] == x->ne[0] && value->ne[1] == x->ne[2] && ggml_is_matrix(value));
+    GGML_ASSERT(weight->ne[0] == x->ne[0] && weight->ne[1] == x->ne[1] && ggml_is_matrix(weight));
+    GGML_ASSERT(eps > 0 && clamp > 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->op = GGML_OP_DSV41_ENGRAM;
+    result->src[0] = x;
+    result->src[1] = key;
+    result->src[2] = value;
+    result->src[3] = weight;
+    const float params[] = { eps, clamp };
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_rope(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * rotations,
+        bool                  inverse) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && rotations->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(rotations));
+    GGML_ASSERT(x->ne[0] % 2 == 0 && x->ne[3] == 1);
+    GGML_ASSERT(rotations->ne[0] % 2 == 0 && rotations->ne[0] <= x->ne[0]);
+    GGML_ASSERT(rotations->ne[1] == x->ne[2] && ggml_is_matrix(rotations));
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->op = GGML_OP_DSV41_ROPE;
+    result->src[0] = x;
+    result->src[1] = rotations;
+    ggml_set_op_params_i32(result, 0, inverse);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_hc_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes) && ggml_is_contiguous(scale) && ggml_is_contiguous(base));
+    GGML_ASSERT(mixes->ne[0] == 24 && ggml_is_matrix(mixes));
+    GGML_ASSERT(ggml_nelements(scale) == 3 && ggml_nelements(base) == 24 && eps > 0 && n_iter > 0);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+    result->op = GGML_OP_DSV41_HC_SPLIT;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * weights,
+        float                 limit) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(gate) && ggml_is_contiguous_rows(up) && ggml_are_same_shape(gate, up));
+    GGML_ASSERT(isfinite(limit) && limit >= 0);
+    if (weights) {
+        GGML_ASSERT(weights->type == GGML_TYPE_F32 && weights->ne[0] == 1);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) { GGML_ASSERT(weights->ne[i] == gate->ne[i]); }
+    }
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, gate);
+    result->op = GGML_OP_DSV41_SWIGLU;
+    result->src[0] = gate;
+    result->src[1] = up;
+    result->src[2] = weights;
+    ggml_set_op_params_f32(result, 0, limit);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_set_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cache,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * rows,
+        enum ggml_dsv41_quant_type type) {
+    GGML_ASSERT(cache->type == GGML_TYPE_I8 && x->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(cache) && ggml_is_matrix(x) && ggml_is_vector(rows));
+    GGML_ASSERT(ggml_is_contiguous_rows(cache) && ggml_is_contiguous_rows(x));
+    GGML_ASSERT(rows->ne[0] == x->ne[1]);
+    GGML_ASSERT(type >= GGML_DSV41_QUANT_MXFP8 && type <= GGML_DSV41_QUANT_NVFP4);
+    const int block = type == GGML_DSV41_QUANT_NVFP4 ? 64 : 32;
+    GGML_ASSERT(x->ne[0] % block == 0);
+    const size_t row_size = type == GGML_DSV41_QUANT_MXFP8 ? x->ne[0]/32*33 : ggml_row_size(type == GGML_DSV41_QUANT_MXFP4 ? GGML_TYPE_MXFP4 : GGML_TYPE_NVFP4, x->ne[0]);
+    GGML_ASSERT((size_t) cache->ne[0] == row_size);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, cache);
+    result->op = GGML_OP_DSV41_SET_ROWS;
+    result->src[0] = x;
+    result->src[1] = rows;
+    result->src[2] = cache;
     ggml_set_op_params_i32(result, 0, type);
     return result;
 }
