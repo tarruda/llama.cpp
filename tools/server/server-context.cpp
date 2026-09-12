@@ -1022,10 +1022,13 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
-        if (params_base.prefill_mode == COMMON_PREFILL_MODE_CED &&
-                (params_base.n_parallel != 1 || params_base.embedding || has_mmproj || has_spec ||
+        const bool can_prefill_ced = !(params_base.n_parallel != 1 || params_base.embedding || has_mmproj || has_spec ||
                  params_base.speculative.has_synth() || std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                         [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; }))) {
+                         [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; }));
+        if (params_base.prefill_mode == COMMON_PREFILL_MODE_AUTO) {
+            params_base.prefill_mode = can_prefill_ced ? COMMON_PREFILL_MODE_CED : COMMON_PREFILL_MODE_FULL;
+        }
+        if (params_base.prefill_mode == COMMON_PREFILL_MODE_CED && !can_prefill_ced) {
             SRV_ERR("%s\n", "--prefill-mode ced requires -np 1, text generation, and no speculative decoding");
             return false;
         }

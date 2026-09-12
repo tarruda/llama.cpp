@@ -1677,11 +1677,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
-        {"--prefill-mode"}, "full|ced",
-        "prompt processing mode: full = all layers, ced = context encoder/decoder (default: full)\n"
+        {"--prefill-mode"}, "auto|full|ced",
+        "prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)\n"
         "ced currently requires one text-generation slot without speculative decoding; models without CED use full processing",
         [](common_params & params, const std::string & value) {
-            if (value == "full") {
+            if (value == "auto") {
+                params.prefill_mode = COMMON_PREFILL_MODE_AUTO;
+            } else if (value == "full") {
                 params.prefill_mode = COMMON_PREFILL_MODE_FULL;
             } else if (value == "ced") {
                 params.prefill_mode = COMMON_PREFILL_MODE_CED;
