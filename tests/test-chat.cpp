@@ -7090,6 +7090,16 @@ static void test_deepseek_v4_tool_result_ordering() {
 static void test_deepseek_v41_dsml() {
     auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
 
+    test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+        tc.params.enable_thinking = true;
+        tc.params.chat_template_kwargs["thinking"] = "false";
+        tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        tc.params.add_generation_prompt = true;
+        tc.input = "The capital of France is Paris.";
+        tc.expect.role = "assistant";
+        tc.expect.content = tc.input;
+    }, false);
+
     const std::string dsml = "\uff5cDSML\uff5c";
     const std::string call = "<" + dsml + " invoke name=\"special_function\">\n<" + dsml +
         " parameter name=\"arg1\" string=\"false\">1</" + dsml + " parameter>\n</" + dsml + " invoke>\n";
