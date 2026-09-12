@@ -5,7 +5,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
+
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
 
 static void dsv41_require(bool valid, const char * message) {
     if (!valid) {
@@ -212,6 +217,43 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
 namespace {
 
+struct dsv41_engram_request {
+    uint64_t row;
+    size_t output;
+};
+
+struct dsv41_engram_gather {
+    const ggml_tensor * weights;
+    const ggml_tensor * scales;
+    const std::vector<dsv41_engram_request> & requests;
+    const std::vector<size_t> & groups;
+    float * values;
+    uint8_t * scratch;
+    size_t n_workers;
+
+    static void run(void * context, size_t worker) {
+        const auto & g = *static_cast<dsv41_engram_gather *>(context);
+        const size_t dim = g.weights->ne[0];
+        const size_t n_groups = g.groups.size() - 1;
+        auto * bytes = g.scratch + worker*(dim + dim/32);
+        for (size_t i = n_groups*worker/g.n_workers; i < n_groups*(worker + 1)/g.n_workers; ++i) {
+            const auto & first = g.requests[g.groups[i]];
+            auto * dst = g.values + first.output*dim;
+            ggml_backend_tensor_get(g.weights, bytes, first.row*g.weights->nb[1], dim);
+            ggml_backend_tensor_get(g.scales, bytes + dim, first.row*g.scales->nb[1], dim/32);
+            for (size_t block = 0; block < dim/32; ++block) {
+                uint8_t packed[33];
+                packed[0] = bytes[dim + block];
+                std::memcpy(packed + 1, bytes + block*32, 32);
+                dequantize_row_mxfp8_act(packed, dst + block*32, 32);
+            }
+            for (size_t j = g.groups[i] + 1; j < g.groups[i + 1]; ++j) {
+                std::memcpy(g.values + g.requests[j].output*dim, dst, dim*sizeof(float));
+            }
+        }
+    }
+};
+
 class llm_graph_input_dsv41 : public llm_graph_input_i {
 public:
     llm_graph_input_dsv41(const llama_model_deepseek41 & model, llama_memory_dsv41 * memory) : model(model), memory(memory) {}
@@ -271,7 +313,9 @@ public:
             ggml_backend_tensor_set(rotations[mode], cs.data(), 0, cs.size()*sizeof(float));
         }
         std::vector<float> values(engram.empty() ? 0 : n_tokens*heads*e.head_dim);
+        std::vector<dsv41_engram_request> requests(engram.empty() ? 0 : n_tokens*heads);
         for (size_t ie = 0; ie < engram.size(); ++ie) {
+            const int64_t gather_start = ggml_time_us();
             const auto & layer = model.layers[e.layers[ie]];
             for (int64_t it = 0; it < n_tokens; ++it) {
                 uint64_t hash = 0;
@@ -286,16 +330,39 @@ public:
                         const auto col = (shift - 1)*e.n_heads + ih;
                         const auto bucket = ie*heads + col;
                         const auto row = hash % e.bucket_sizes[bucket] + e.offsets[bucket];
-                        uint8_t packed[33];
-                        for (uint32_t block = 0; block < e.head_dim/32; ++block) {
-                            ggml_backend_tensor_get(layer.engram_embd_scale, packed, row*layer.engram_embd_scale->nb[1] + block, 1);
-                            ggml_backend_tensor_get(layer.engram_embd, packed + 1, row*layer.engram_embd->nb[1] + block*32, 32);
-                            dequantize_row_mxfp8_act(packed, values.data() + (it*heads + col)*e.head_dim + block*32, 32);
-                        }
+                        const size_t output = it*heads + col;
+                        requests[output] = { row, output };
                     }
                 }
             }
+            std::sort(requests.begin(), requests.end(), [](const auto & a, const auto & b) { return a.row < b.row; });
+            std::vector<size_t> groups;
+            groups.reserve(requests.size() + 1);
+            for (size_t i = 0; i < requests.size(); ++i) {
+                if (i == 0 || requests[i].row != requests[i - 1].row) { groups.push_back(i); }
+            }
+            groups.push_back(requests.size());
+            size_t n_workers = 1;
+#if defined(__APPLE__)
+            // Concurrent reads are limited to the lazy CPU buffers.
+            if (groups.size() > 256 && ggml_backend_buffer_is_host(layer.engram_embd->buffer) && ggml_backend_buffer_is_host(layer.engram_embd_scale->buffer)) {
+                n_workers = std::min<size_t>(n_readers, (groups.size() - 1)/64);
+            }
+#endif
+            std::vector<uint8_t> scratch(n_workers*(e.head_dim + e.head_dim/32));
+            dsv41_engram_gather gather = { layer.engram_embd, layer.engram_embd_scale, requests, groups, values.data(), scratch.data(), n_workers };
+#if defined(__APPLE__)
+            if (n_workers > 1) {
+                dispatch_apply_f(n_workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &gather, dsv41_engram_gather::run);
+            } else
+#endif
+            {
+                dsv41_engram_gather::run(&gather, 0);
+            }
             ggml_backend_tensor_set(engram[ie], values.data(), 0, values.size()*sizeof(float));
+            if (n_tokens > 1) {
+                LLAMA_LOG_DEBUG("dsv41: Engram layer %u: %zu rows, %zu unique, %zu readers, %.3f ms\n", e.layers[ie], requests.size(), groups.size() - 1, n_workers, (ggml_time_us() - gather_start)/1000.0);
+            }
         }
         LLAMA_LOG_DEBUG("dsv41: prepared inputs for %lld tokens in %.3f ms\n", (long long) n_tokens, (ggml_time_us() - start)/1000.0);
     }
@@ -303,12 +370,14 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         const auto * mctx = static_cast<const llama_memory_dsv41_context *>(params.mctx);
         const int64_t count = replay ? std::min<size_t>(memory->tokens.size(), model.hparams.n_swa) : params.ubatch.n_tokens;
+        n_readers = std::clamp(count > 1 ? params.cparams.n_threads_batch : params.cparams.n_threads, 1, 16);
         return mctx && mctx->memory == memory && n_tokens == count;
     }
 
     const llama_model_deepseek41 & model;
     llama_memory_dsv41 * memory;
     int64_t n_tokens = 0;
+    int n_readers = 1;
     bool replay = false;
     ggml_tensor * positions = nullptr;
     std::vector<ggml_tensor *> decoder_attention;
@@ -601,6 +670,7 @@ struct dsv41_graph : public llm_graph_context {
             auto owner = std::make_unique<llm_graph_input_dsv41>(model, memory);
             input = owner.get();
             input->n_tokens = tokens;
+            input->n_readers = std::clamp(tokens > 1 ? cparams.n_threads_batch : cparams.n_threads, 1, 16);
             input->replay = replay;
             input->init_rope(n_rot, freq_base, hparams.dsv4_compress_rope_base, freq_scale, ext_factor, n_ctx_orig, beta_fast, beta_slow);
             res->add_input(std::move(owner));
