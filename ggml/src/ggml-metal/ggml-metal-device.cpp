@@ -93,6 +93,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn(ggml_metal_library_t lib, bool unpack) {
+    const char * name = unpack ? "kernel_dsv41_attn_unpack" : "kernel_dsv41_attn_unpacked";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
     char base[256];
     char name[256];

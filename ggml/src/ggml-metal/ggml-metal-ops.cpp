@@ -1895,6 +1895,12 @@ int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+size_t ggml_metal_op_dsv41_attn_extra_cache(const ggml_tensor * op) {
+    if (getenv("GGML_METAL_DSV41_ATTN_UNPACK_DISABLE")) { return 0; }
+    const size_t rows = op->src[1]->ne[1] + (op->src[5] ? op->src[5]->ne[1] : 0);
+    return rows*op->src[0]->ne[0]*sizeof(float);
+}
+
 int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     const auto * q = op->src[0], * indices = op->src[4], * kv = op->src[5];
@@ -1918,11 +1924,32 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
         /*.nb_k1  =*/ kv ? kv->nb[1] : 0,
     };
     auto enc = ctx->enc;
-    auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+    const bool unpacked = ggml_metal_op_dsv41_attn_extra_cache(op) > 0;
+    auto raw_buffer = ggml_metal_get_buffer_id(op->src[1]);
+    auto kv_buffer = ggml_metal_get_buffer_id(kv ? kv : op->src[3]);
+    if (unpacked) {
+        auto scratch = ggml_metal_get_buffer_id(op);
+        scratch.offs += ggml_nbytes(op);
+        auto unpack = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, true);
+        ggml_metal_encoder_set_pipeline(enc, unpack);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, raw_buffer, 1);
+        ggml_metal_encoder_set_buffer(enc, kv_buffer, 2);
+        ggml_metal_encoder_set_buffer(enc, scratch, 3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+        const size_t values = ggml_metal_op_dsv41_attn_extra_cache(op)/sizeof(float);
+        ggml_metal_encoder_dispatch_threadgroups(enc, std::min<size_t>((values + 255)/256, 256), 1, 1, 256, 1, 1);
+        ggml_metal_op_concurrency_reset(ctx);
+        raw_buffer = kv_buffer = scratch;
+        if (kv) { kv_buffer.offs += size_t(args.n_ring)*args.dim*sizeof(float); }
+        args.nb_r1 = args.nb_k1 = args.dim*sizeof(float);
+    }
+    auto pipeline = unpacked ? ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false) : ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
     for (int i = 0; i < 6; ++i) {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i] ? op->src[i] : op->src[3]), i + 1);
+        const auto buffer = i == 1 ? raw_buffer : i == 5 ? kv_buffer : ggml_metal_get_buffer_id(op->src[i] ? op->src[i] : op->src[3]);
+        ggml_metal_encoder_set_buffer(enc, buffer, i + 1);
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
     ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, args.tokens, 1, 64, 1, 1);

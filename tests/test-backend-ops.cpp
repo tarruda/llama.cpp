@@ -10228,6 +10228,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int ratio : { 0, 1, 2 }) {
         for (bool strided : { false, true }) {
             test_cases.emplace_back(new test_dsv41_attn(64, 33, 0, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(64, 128, 0, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(512, 128, 1285, ratio, strided, 1286));
             test_cases.emplace_back(new test_dsv41_attn(64, 1, 3, ratio, strided));
             test_cases.emplace_back(new test_dsv41_attn(64, 5, 61, ratio, strided));
             test_cases.emplace_back(new test_dsv41_attn(512, 1, 1285, ratio, strided));

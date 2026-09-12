@@ -996,7 +996,32 @@ static float dsv41_attn_value(device const uchar * row, int j, bool raw) {
     return kvalues_mxfp4_f[code]*dsv41_e4m3_value(row[sub]);
 }
 
-kernel void kernel_dsv41_attn(
+kernel void kernel_dsv41_attn_unpack(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const uchar * raw,
+        device const uchar * kv,
+        device float * dst,
+        device const char * positions,
+        uint tid [[thread_position_in_grid]],
+        uint groups [[threadgroups_per_grid]]) {
+    const int last = *(device const int *) (positions + (args.tokens - 1)*args.nb_p0);
+    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.n_kv) : 0;
+    const uint values = uint(args.n_ring + visible)*args.dim;
+    for (uint i = tid; i < values; i += groups*256) {
+        const uint row = i/args.dim, j = i%args.dim;
+        const bool is_raw = row < uint(args.n_ring);
+        device const uchar * input = is_raw ? raw + row*args.nb_r1 : kv + (row - args.n_ring)*args.nb_k1;
+        dst[i] = dsv41_attn_value(input, j, is_raw);
+    }
+}
+
+template <bool unpacked>
+static float dsv41_attn_read(device const uchar * row, int j, bool raw) {
+    return unpacked ? ((device const float *) row)[j] : dsv41_attn_value(row, j, raw);
+}
+
+template <bool unpacked>
+kernel void kernel_dsv41_attn_impl(
         constant ggml_metal_kargs_dsv41_attn & args,
         device const char * q,
         device const char * raw,
@@ -1040,7 +1065,7 @@ kernel void kernel_dsv41_attn(
         float dot = 0;
         if (id >= 0) {
             device const uchar * row = (device const uchar *) ((is_raw ? raw : kv) + id*(is_raw ? args.nb_r1 : args.nb_k1));
-            for (int j = 0; j < args.dim; ++j) { dot += query[j]*dsv41_attn_value(row, j, is_raw); }
+            for (int j = 0; j < args.dim; ++j) { dot += query[j]*dsv41_attn_read<unpacked>(row, j, is_raw); }
         }
         scores[tid] = id >= 0 ? dot*args.scale : -INFINITY;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1067,7 +1092,7 @@ kernel void kernel_dsv41_attn(
                 if (row_id >= 0) {
                     const bool window_row = start + slot < window;
                     device const uchar * row = (device const uchar *) ((window_row ? raw : kv) + row_id*(window_row ? args.nb_r1 : args.nb_k1));
-                    value += weights[slot]*dsv41_attn_value(row, j, window_row);
+                    value += weights[slot]*dsv41_attn_read<unpacked>(row, j, window_row);
                 }
             }
             accumulator[j/64] = accumulator[j/64]*stats[2] + value;
@@ -1083,6 +1108,10 @@ kernel void kernel_dsv41_attn(
         dst[(it*args.heads + ih)*args.dim + j] = dsv41_round_bf16(precise::divide(accumulator[j/64], stats[1]));
     }
 }
+
+typedef decltype(kernel_dsv41_attn_impl<false>) kernel_dsv41_attn_t;
+template [[host_name("kernel_dsv41_attn")]] kernel kernel_dsv41_attn_t kernel_dsv41_attn_impl<false>;
+template [[host_name("kernel_dsv41_attn_unpacked")]] kernel kernel_dsv41_attn_t kernel_dsv41_attn_impl<true>;
 
 kernel void kernel_dsv41_engram(
         constant ggml_metal_kargs_dsv41_engram & args,
