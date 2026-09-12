@@ -131,18 +131,19 @@ struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
 
 // ref: inference/image_processor.py in the HF repo (DeepSeek-V4-Flash-Vision)
 struct mtmd_image_preprocessor_deepseek4v : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx, bool row_major = false) : mtmd_image_preprocessor(ctx), row_major(row_major) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 
 private:
+    bool row_major;
     struct grid_info {
         int n_llm_h;
         int n_llm_w;
         int n_tokens; // token count of the block (incl. newline/pad rows and start/end, excl. lead pads)
     };
-    static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r);
-    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
-    static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
+    static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r, bool row_major = false);
+    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width, bool row_major = false);
+    static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token, bool row_major = false);
 };
 
 // custom llava-uhd slicing logic for MiniCPM-V

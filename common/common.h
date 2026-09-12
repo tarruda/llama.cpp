@@ -497,6 +497,7 @@ struct common_params {
     uint64_t moe_cache_bytes = 0;
     int32_t moe_pin_count = 0;
     int32_t moe_read_threads = 4;
+    llama_moe_cache_policy moe_cache_policy = LLAMA_MOE_CACHE_LRU;
     std::string moe_profile;
     std::string moe_profile_output;
     int32_t moe_profile_generate = 0;

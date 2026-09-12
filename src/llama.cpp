@@ -316,7 +316,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        if (!params.stream_moe && (params.moe_cache_bytes || params.moe_pin_count || params.moe_pin_encoder ||
+        if (!params.stream_moe && (params.moe_cache_bytes || params.moe_pin_count || params.moe_pin_encoder || params.moe_cache_policy != LLAMA_MOE_CACHE_LRU ||
                 (params.moe_profile && params.moe_profile[0]))) {
             throw std::invalid_argument("MoE cache and pin settings require routed expert streaming");
         }

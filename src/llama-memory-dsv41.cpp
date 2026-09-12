@@ -97,12 +97,12 @@ llama_memory_context_ptr llama_memory_dsv41::init_batch(llama_batch_allocr & bal
         if (ubatch.n_tokens == 0) {
             break;
         }
-        bool valid = ubatch.token && position + ubatch.n_tokens <= n_ctx;
+        bool valid = (ubatch.token || ubatch.embd) && position + ubatch.n_tokens <= n_ctx;
         for (uint32_t i = 0; valid && i < ubatch.n_tokens; ++i) {
             valid = ubatch.pos[i] == (llama_pos) (position + i) && ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == 0;
         }
         if (!valid) {
-            LLAMA_LOG_ERROR("%s: expected contiguous token IDs for sequence 0 within the configured context\n", __func__);
+            LLAMA_LOG_ERROR("%s: expected contiguous positions for sequence 0 within the configured context\n", __func__);
             return std::make_unique<llama_memory_dsv41_context>(this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
         position += ubatch.n_tokens;
@@ -123,10 +123,14 @@ llama_memory_context_ptr llama_memory_dsv41::init_update(llama_context * lctx, b
 }
 
 bool llama_memory_dsv41::apply(const llama_ubatch & ubatch) {
-    if (!ubatch.n_tokens || !ubatch.token || !ubatch.pos || ubatch.pos[0] != (llama_pos) tokens.size() || tokens.size() + ubatch.n_tokens > n_ctx) {
+    if (!ubatch.n_tokens || (!ubatch.token && !ubatch.embd) || !ubatch.pos || ubatch.pos[0] != (llama_pos) tokens.size() || tokens.size() + ubatch.n_tokens > n_ctx) {
         return false;
     }
-    tokens.insert(tokens.end(), ubatch.token, ubatch.token + ubatch.n_tokens);
+    if (ubatch.embd) {
+        tokens.insert(tokens.end(), ubatch.n_tokens, LLAMA_TOKEN_NULL);
+    } else {
+        tokens.insert(tokens.end(), ubatch.token, ubatch.token + ubatch.n_tokens);
+    }
     ring_end = std::max<uint32_t>(ring_end, tokens.size());
     decoder_ready = false;
     return true;
@@ -301,7 +305,7 @@ void llama_memory_dsv41::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
         std::vector<llama_token> restored(header[5]);
         io.read(restored.data(), restored.size()*sizeof(llama_token));
         for (auto token : restored) {
-            if (token < 0 || (uint32_t) token >= n_vocab) {
+            if (token != LLAMA_TOKEN_NULL && (token < 0 || (uint32_t) token >= n_vocab)) {
                 throw std::runtime_error("invalid token in DeepSeek-V4.1 state");
             }
         }

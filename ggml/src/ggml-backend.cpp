@@ -1463,7 +1463,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
 
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        // Handlers may read or write external storage that is absent from tensor dependencies.
+        int start = 0;
+        for (int j = 0; sched->node_supported && j < split->graph.n_nodes; ++j) {
+            if (sched->node_supported(split->graph.nodes[j], sched->node_user_data)) {
+                if (start < j) {
+                    auto part = ggml_graph_view(&split->graph, start, j);
+                    ggml_backend_graph_optimize(sched->backends[split->backend_id], &part, &opt_params);
+                }
+                start = j + 1;
+            }
+        }
+        if (start < split->graph.n_nodes) {
+            auto part = ggml_graph_view(&split->graph, start, split->graph.n_nodes);
+            ggml_backend_graph_optimize(sched->backends[split->backend_id], &part, &opt_params);
+        }
     }
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs

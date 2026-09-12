@@ -22,8 +22,9 @@ public:
     bool load(llama_files & files);
     void set_phase(llama_moe_phase phase);
     llama_moe_cache_stats stats(llama_moe_phase phase) const;
-    ggml_tensor * build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_tensor * ids, int layer) const;
+    ggml_tensor * build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_tensor * ids, ggml_tensor * shared, int layer) const;
     std::unique_lock<std::mutex> lock_graph();
+    bool synchronize();
 
     static bool handles(const ggml_tensor * node, void * data);
     static ggml_status compute(ggml_backend_t backend, ggml_tensor * node, void * data);

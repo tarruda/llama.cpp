@@ -112,6 +112,8 @@ struct llama_moe_stream::impl {
         std::vector<int32_t> slot_to_expert;
         std::vector<uint8_t> valid_projections;
         std::vector<uint64_t> age;
+        std::array<std::vector<float>, 3> frequency;
+        std::array<uint64_t, 3> observations = {};
         size_t expert_bytes = 0;
         int64_t n_slots = 0;
         bool fully_resident = false;
@@ -120,6 +122,7 @@ struct llama_moe_stream::impl {
     std::vector<layer> layers;
     std::unordered_map<std::string, std::pair<int, int>> names;
     std::unordered_map<std::string, int> id_names;
+    std::unordered_map<std::string, int> prefetch_names;
     llama_files files;
     std::mutex mutex;
     std::mutex graph_mutex;
@@ -133,8 +136,13 @@ struct llama_moe_stream::impl {
     uint64_t evictions = 0;
     uint64_t bytes_read = 0;
     int64_t read_us = 0;
+    int64_t read_span_us = 0;
     std::array<llama_moe_cache_stats, 3> phase_stats = {};
     bool check_tensors = false;
+    bool adaptive = false;
+    bool overlap = true;
+    int prefill_hot_percent = 0;
+    std::ofstream trace;
     llama_moe_phase phase = LLAMA_MOE_PHASE_PREFILL;
     llama_progress_callback progress = nullptr;
     void * progress_data = nullptr;
@@ -160,6 +168,21 @@ struct llama_moe_stream::impl {
             throw std::runtime_error("MoE pin count exceeds the model expert count");
         }
         n_readers = params.moe_read_threads;
+        if (params.moe_cache_policy != LLAMA_MOE_CACHE_LRU && params.moe_cache_policy != LLAMA_MOE_CACHE_ADAPTIVE) {
+            throw std::runtime_error("invalid MoE cache policy");
+        }
+        adaptive = params.moe_cache_policy == LLAMA_MOE_CACHE_ADAPTIVE;
+        if (const char * value = std::getenv("LLAMA_MOE_OVERLAP")) { overlap = std::strcmp(value, "0") != 0; }
+        if (const char * value = std::getenv("LLAMA_MOE_PREFILL_HOT")) {
+            size_t end;
+            prefill_hot_percent = std::stoi(value, &end);
+            if (value[end] || prefill_hot_percent < 0 || prefill_hot_percent > 75) {
+                throw std::runtime_error("LLAMA_MOE_PREFILL_HOT must be between 0 and 75");
+            }
+        }
+        if (adaptive && (params.moe_pin_count > 0 || (params.moe_profile && params.moe_profile[0]))) {
+            throw std::runtime_error("adaptive MoE caching excludes --moe-profile and positive --moe-pin-count");
+        }
         check_tensors = params.check_tensors;
         progress = params.progress_callback;
         progress_data = params.progress_callback_user_data;
@@ -169,6 +192,7 @@ struct llama_moe_stream::impl {
         for (size_t il = 0; il < layers.size(); ++il) {
             auto & l = layers[il];
             id_names.emplace("moe_stream_ids." + std::to_string(il), il);
+            prefetch_names.emplace("moe_stream_prefetch." + std::to_string(il), il);
             l.pinned.assign(n_expert, params.moe_pin_encoder && il < layers.size()/2);
             l.phase_pins.fill(l.pinned);
             for (size_t p = 0; p < kinds.size(); ++p) {
@@ -284,7 +308,9 @@ struct llama_moe_stream::impl {
             l.slot_to_expert.assign(l.n_slots, -1);
             l.valid_projections.assign(l.n_slots, 0);
             l.age.assign(l.n_slots, 0);
+            if (adaptive) { for (auto & counts : l.frequency) { counts.assign(n_expert, 0); } }
         }
+        LLAMA_LOG_INFO("moe_stream: %s cache policy\n", adaptive ? "adaptive" : "lru");
         LLAMA_LOG_INFO("moe_stream: %zu pins (%d encoder preset), %.2f MiB pinned, %.2f MiB dynamic, %.2f MiB total routed cache, %d read threads\n",
                 total_pins, encoder_pins, pinned_bytes/1048576.0, (allocated - pinned_bytes)/1048576.0, allocated/1048576.0, n_readers);
     }
@@ -295,20 +321,114 @@ struct llama_moe_stream::impl {
         uint8_t projections;
     };
 
-    void fill(layer & l, const std::vector<expert_load> & loads) {
-        if (loads.empty()) { return; }
-        std::vector<std::future<void>> pending;
-        pending.reserve(loads.size()*l.projections.size());
-        const int64_t start = ggml_time_us();
+    struct read_batch {
+        layer * target = nullptr;
+        std::vector<expert_load> loads;
+        std::vector<std::future<void>> tasks;
+        llama_moe_phase phase;
         uint64_t bytes = 0;
-        std::exception_ptr failure;
+        int64_t start = 0;
+        bool prefetch = false;
+    } pending;
+
+    void observe(int il, const std::vector<int32_t> & original, int used) {
+        auto & l = layers[il];
+        if (trace.is_open()) {
+            trace << nlohmann::json({{"layer", il}, {"phase", phase}, {"used", used}, {"ids", original}}).dump() << '\n';
+            if (!trace) { throw std::runtime_error("cannot write MoE route trace"); }
+        }
+        if (!adaptive) { return; }
+        auto & counts = l.frequency[phase];
+        for (size_t i = 0; i < original.size(); ++i) {
+            counts[original[i]] += 1.0f;
+            if ((i + 1) % used == 0 && ++l.observations[phase] % 16 == 0) {
+                for (auto & count : counts) { count *= 0.5f; }
+            }
+        }
+    }
+
+    void select_phase_pins(layer & l) {
+        l.pinned = l.phase_pins[phase];
+        if (!adaptive || phase == LLAMA_MOE_PHASE_DECODE || l.fully_resident) { return; }
+        std::vector<int> hot;
+        for (int e = 0; e < n_expert; ++e) {
+            if (!l.pinned[e] && l.expert_to_slot[e] >= 0 && l.frequency[LLAMA_MOE_PHASE_DECODE][e] > 0) { hot.push_back(e); }
+        }
+        std::sort(hot.begin(), hot.end(), [&](int a, int b) {
+            const auto & counts = l.frequency[LLAMA_MOE_PHASE_DECODE];
+            if (counts[a] != counts[b]) { return counts[a] > counts[b]; }
+            return l.age[l.expert_to_slot[a]] > l.age[l.expert_to_slot[b]];
+        });
+        // Keep a quarter of the dynamic slots available for prompt work.
+        const size_t dynamic = l.n_slots - std::count(l.pinned.begin(), l.pinned.end(), true);
+        const size_t keep = std::min(hot.size(), dynamic - (dynamic + 3)/4);
+        for (size_t i = 0; i < keep; ++i) { l.pinned[hot[i]] = true; }
+    }
+
+    void fit_small_group(layer & l, const std::vector<int32_t> & experts) {
+        if (!adaptive || phase == LLAMA_MOE_PHASE_DECODE) { return; }
+        const auto & permanent = l.phase_pins[phase];
+        const int available = l.n_slots - std::count(permanent.begin(), permanent.end(), true);
+        if ((int) experts.size() > available) { return; }
+        std::vector<bool> required(n_expert, false);
+        int needed = 0;
+        for (int e : experts) { required[e] = true; needed += !l.pinned[e]; }
+        int capacity = l.n_slots - std::count(l.pinned.begin(), l.pinned.end(), true);
+        if (capacity >= needed) { return; }
+        std::vector<int> candidates;
+        for (int e = 0; e < n_expert; ++e) {
+            if (l.pinned[e] && !permanent[e] && !required[e]) { candidates.push_back(e); }
+        }
+        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+            const auto & counts = l.frequency[LLAMA_MOE_PHASE_DECODE];
+            if (counts[a] != counts[b]) { return counts[a] < counts[b]; }
+            return l.age[l.expert_to_slot[a]] < l.age[l.expert_to_slot[b]];
+        });
+        // A small append can fit as one group by releasing the least useful temporary protections.
+        for (int e : candidates) {
+            if (capacity >= needed) { break; }
+            l.pinned[e] = false;
+            ++capacity;
+        }
+    }
+
+    void select_prompt_pins(layer & l, const std::vector<int32_t> & experts) {
+        if (!adaptive || !prefill_hot_percent || phase == LLAMA_MOE_PHASE_DECODE || l.fully_resident) { return; }
+        const int permanent = std::count(l.phase_pins[phase].begin(), l.phase_pins[phase].end(), true);
+        if ((int) experts.size() <= l.n_slots - permanent) { return; }
+        select_phase_pins(l);
+        const int limit = permanent + (l.n_slots - permanent)*prefill_hot_percent/100;
+        const int count = std::count(l.pinned.begin(), l.pinned.end(), true);
+        if (count >= limit) { return; }
+        std::vector<int> hot;
+        for (int e : experts) { if (!l.pinned[e]) { hot.push_back(e); } }
+        std::sort(hot.begin(), hot.end(), [&](int a, int b) {
+            const auto & counts = l.frequency[phase];
+            if (counts[a] != counts[b]) { return counts[a] > counts[b]; }
+            const auto age_a = l.expert_to_slot[a] < 0 ? 0 : l.age[l.expert_to_slot[a]];
+            const auto age_b = l.expert_to_slot[b] < 0 ? 0 : l.age[l.expert_to_slot[b]];
+            return age_a != age_b ? age_a > age_b : a < b;
+        });
+        // Retain complete prompt bundles across projections and leave room for streaming.
+        for (size_t i = 0; i < hot.size() && (int) i < limit - count; ++i) { l.pinned[hot[i]] = true; }
+    }
+
+    void begin_fill(layer & l, const std::vector<expert_load> & loads, bool prefetch) {
+        GGML_ASSERT(!pending.target);
+        if (loads.empty()) { return; }
+        pending.loads = loads;
+        pending.tasks.reserve(loads.size()*l.projections.size());
+        pending.target = &l;
+        pending.phase = phase;
+        pending.start = ggml_time_us();
+        pending.prefetch = prefetch;
         try {
             for (const auto & load : loads) {
                 for (size_t index = 0; index < l.projections.size(); ++index) {
                     if (!(load.projections & (1 << index))) { continue; }
                     auto * p = &l.projections[index];
-                    bytes += p->original.nb[2];
-                    pending.push_back(readers->submit([this, p, load] {
+                    pending.bytes += p->original.nb[2];
+                    pending.tasks.push_back(readers->submit([this, p, load] {
                         const size_t size = p->original.nb[2];
                         if (p->direct_read) {
                             auto * target = (uint8_t *) p->cache->data + load.slot*size;
@@ -329,26 +449,38 @@ struct llama_moe_stream::impl {
                 }
             }
         } catch (...) {
-            failure = std::current_exception();
+            finish_fill(std::current_exception());
         }
-        for (auto & result : pending) {
+    }
+
+    void finish_fill(std::exception_ptr failure = nullptr) {
+        if (!pending.target) { return; }
+        auto batch = std::move(pending);
+        pending = {};
+        const int64_t wait_start = ggml_time_us();
+        for (auto & result : batch.tasks) {
             try { result.get(); } catch (...) { if (!failure) { failure = std::current_exception(); } }
         }
-        const auto elapsed = ggml_time_us() - start;
-        read_us += elapsed;
-        phase_stats[phase].read_ms += elapsed/1000.0;
+        const auto now = ggml_time_us();
+        const auto wait = now - wait_start;
+        read_us += wait;
+        read_span_us += now - batch.start;
+        phase_stats[batch.phase].read_ms += wait/1000.0;
         if (failure) { std::rethrow_exception(failure); }
-        bytes_read += bytes;
-        phase_stats[phase].bytes_read += bytes;
-        for (const auto & load : loads) {
-            l.expert_to_slot[load.expert] = load.slot;
-            l.slot_to_expert[load.slot] = load.expert;
+        bytes_read += batch.bytes;
+        phase_stats[batch.phase].bytes_read += batch.bytes;
+        auto & l = *batch.target;
+        if (trace.is_open()) {
+            trace << nlohmann::json({{"event", "read"}, {"layer", &l - layers.data()}, {"phase", batch.phase},
+                    {"bytes", batch.bytes}, {"span_us", now - batch.start}, {"wait_us", wait}, {"prefetch", batch.prefetch}}).dump() << '\n';
+        }
+        for (const auto & load : batch.loads) {
             l.valid_projections[load.slot] |= load.projections;
             l.age[load.slot] = ++tick;
         }
     }
 
-    void acquire(layer & l, const std::vector<int32_t> & experts, uint8_t projections = 7) {
+    void acquire(layer & l, const std::vector<int32_t> & experts, uint8_t projections = 7, bool prefetch = false) {
         std::vector<bool> protect(n_expert, false);
         for (int32_t e : experts) { protect[e] = true; }
         std::vector<expert_load> loads;
@@ -373,7 +505,12 @@ struct llama_moe_stream::impl {
             for (int slot = 0; slot < l.n_slots; ++slot) {
                 const int old = l.slot_to_expert[slot];
                 if (reserved[slot] || (old >= 0 && (l.pinned[old] || protect[old]))) { continue; }
-                if (victim < 0 || l.age[slot] < l.age[victim]) { victim = slot; }
+                const int previous = victim < 0 ? -1 : l.slot_to_expert[victim];
+                if (victim < 0 || old < 0 || (previous >= 0 && (
+                        adaptive && l.frequency[phase][old] != l.frequency[phase][previous] ?
+                        l.frequency[phase][old] < l.frequency[phase][previous] : l.age[slot] < l.age[victim]))) {
+                    victim = slot;
+                }
                 if (old < 0) { break; }
             }
             if (victim < 0) { throw std::runtime_error("MoE expert group exceeds available cache slots"); }
@@ -386,13 +523,25 @@ struct llama_moe_stream::impl {
             ++phase_stats[phase].misses;
             loads.push_back({e, victim, wanted});
         }
-        fill(l, loads);
+        for (const auto & load : loads) {
+            l.expert_to_slot[load.expert] = load.slot;
+            l.slot_to_expert[load.slot] = load.expert;
+        }
+        begin_fill(l, loads, prefetch);
+        if (!prefetch) { finish_fill(); }
     }
 
     ggml_status execute(ggml_backend_t backend, ggml_tensor * node) {
         std::lock_guard<std::mutex> lock(mutex);
+        if (node->op == GGML_OP_VIEW) {
+            GGML_ASSERT(!pending.target || pending.target == &layers[id_names.at(node->name)]);
+            finish_fill();
+            return GGML_STATUS_SUCCESS;
+        }
         if (node->op == GGML_OP_DUP) {
-            auto & l = layers[id_names.at(node->name)];
+            const bool prefetch = prefetch_names.count(node->name);
+            const int il = prefetch ? prefetch_names.at(node->name) : id_names.at(node->name);
+            auto & l = layers[il];
             ggml_backend_synchronize(backend);
             const auto * ids = node->src[0];
             std::vector<uint8_t> raw(ggml_nbytes(ids));
@@ -406,10 +555,12 @@ struct llama_moe_stream::impl {
                     original.push_back(e);
                 }
             }
+            observe(il, original, ids->ne[0]);
             auto required = original;
             std::sort(required.begin(), required.end());
             required.erase(std::unique(required.begin(), required.end()), required.end());
-            acquire(l, required);
+            fit_small_group(l, required);
+            acquire(l, required, 7, prefetch);
             for (auto & e : original) { e = l.expert_to_slot[e]; }
             ggml_backend_tensor_set(node, original.data(), 0, original.size()*sizeof(int32_t));
             return GGML_STATUS_SUCCESS;
@@ -441,7 +592,10 @@ struct llama_moe_stream::impl {
             }
         }
         std::vector<int32_t> required;
+        if (location.second == 0) { observe(location.first, original, used); }
         for (int e = 0; e < n_expert; ++e) { if (!rows[e].empty()) { required.push_back(e); } }
+        if (location.second == 0) { select_prompt_pins(l, required); }
+        fit_small_group(l, required);
         const int pins = std::count(l.pinned.begin(), l.pinned.end(), true);
         const int capacity = l.n_slots - pins;
         std::vector<std::vector<int32_t>> groups(1);
@@ -513,7 +667,7 @@ struct llama_moe_stream::impl {
 llama_moe_stream::llama_moe_stream(llama_model_loader & loader, const llama_hparams & hparams, const llama_model_params & params) :
     pimpl(std::make_unique<impl>(loader, hparams, params)) {}
 
-llama_moe_stream::~llama_moe_stream() { print_stats(); }
+llama_moe_stream::~llama_moe_stream() { synchronize(); print_stats(); }
 
 int64_t llama_moe_stream::slots(const char * name) const {
     const auto it = pimpl->names.find(name);
@@ -533,6 +687,15 @@ const ggml_tensor * llama_moe_stream::source(const ggml_tensor * tensor) const {
 bool llama_moe_stream::load(llama_files & files) {
     pimpl->files = std::move(files);
     pimpl->readers = std::make_unique<moe_read_pool>(pimpl->n_readers);
+    if (const char * path = std::getenv("LLAMA_MOE_TRACE")) {
+        pimpl->trace.open(path);
+        if (!pimpl->trace) { throw std::runtime_error("cannot open MoE route trace"); }
+        nlohmann::json layout = nlohmann::json::array();
+        for (const auto & l : pimpl->layers) {
+            layout.push_back({{"slots", l.n_slots}, {"expert_bytes", l.expert_bytes}, {"phase_pins", l.phase_pins}, {"fully_resident", l.fully_resident}});
+        }
+        pimpl->trace << nlohmann::json({{"format", "llama-moe-trace"}, {"version", 1}, {"experts", pimpl->n_expert}, {"layers", layout}}).dump() << '\n';
+    }
     for (auto & l : pimpl->layers) {
         for (auto & p : l.projections) {
             auto * buffer = p.cache->buffer;
@@ -559,7 +722,8 @@ bool llama_moe_stream::load(llama_files & files) {
 
 bool llama_moe_stream::handles(const ggml_tensor * node, void * data) {
     const auto & self = *static_cast<llama_moe_stream *>(data);
-    if (node->op == GGML_OP_DUP && self.pimpl->id_names.count(node->name)) { return true; }
+    if ((node->op == GGML_OP_DUP || node->op == GGML_OP_VIEW) && self.pimpl->id_names.count(node->name)) { return true; }
+    if (node->op == GGML_OP_DUP && self.pimpl->prefetch_names.count(node->name)) { return true; }
     if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0]) { return false; }
     if (self.pimpl->id_names.count(node->src[2]->name)) { return false; }
     const auto it = self.pimpl->names.find(node->src[0]->name);
@@ -571,9 +735,10 @@ void llama_moe_stream::set_phase(llama_moe_phase phase) {
         throw std::invalid_argument("invalid MoE execution phase");
     }
     std::lock_guard<std::mutex> lock(pimpl->mutex);
+    pimpl->finish_fill();
     if (pimpl->phase == phase) { return; }
-    for (auto & l : pimpl->layers) { l.pinned = l.phase_pins[phase]; }
     pimpl->phase = phase;
+    for (auto & l : pimpl->layers) { pimpl->select_phase_pins(l); }
 }
 
 ggml_status llama_moe_stream::compute(ggml_backend_t backend, ggml_tensor * node, void * data) {
@@ -587,9 +752,9 @@ ggml_status llama_moe_stream::compute(ggml_backend_t backend, ggml_tensor * node
 
 void llama_moe_stream::print_stats() const {
     if (!pimpl->readers) { return; }
-    LLAMA_LOG_INFO("moe_stream: %llu hits, %llu misses, %llu evictions, %.3f GiB read in %.3f s\n",
+    LLAMA_LOG_INFO("moe_stream: %llu hits, %llu misses, %llu evictions, %.3f GiB read, %.3f s waiting (%.3f s load intervals)\n",
             (unsigned long long) pimpl->hits, (unsigned long long) pimpl->misses, (unsigned long long) pimpl->evictions,
-            pimpl->bytes_read/1073741824.0, pimpl->read_us/1e6);
+            pimpl->bytes_read/1073741824.0, pimpl->read_us/1e6, pimpl->read_span_us/1e6);
 }
 
 llama_moe_cache_stats llama_moe_stream::stats(llama_moe_phase phase) const {
@@ -601,7 +766,18 @@ std::unique_lock<std::mutex> llama_moe_stream::lock_graph() {
     return std::unique_lock<std::mutex>(pimpl->graph_mutex);
 }
 
-ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_tensor * ids, int il) const {
+bool llama_moe_stream::synchronize() {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    try {
+        pimpl->finish_fill();
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("moe_stream: %s\n", error.what());
+        return false;
+    }
+}
+
+ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_tensor * ids, ggml_tensor * shared, int il) const {
     const auto & l = pimpl->layers.at(il);
     if (l.fully_resident) { return ids; }
     int capacity = l.n_slots;
@@ -618,9 +794,19 @@ ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         auto * backend = ggml_backend_sched_get_backend(sched, i);
         if (ggml_backend_get_device(backend) != dev) { continue; }
+        const bool prefetch = pimpl->overlap && std::all_of(l.projections.begin(), l.projections.end(), [](const auto & p) { return p.direct_read; });
         auto * mapped = ggml_dup(ctx, ids);
-        ggml_set_name(mapped, ("moe_stream_ids." + std::to_string(il)).c_str());
+        ggml_set_name(mapped, ((prefetch ? "moe_stream_prefetch." : "moe_stream_ids.") + std::to_string(il)).c_str());
         ggml_backend_sched_set_tensor_backend(sched, mapped, backend);
+        if (prefetch) {
+            ggml_build_forward_expand(graph, mapped);
+            ggml_build_forward_expand(graph, shared);
+            // The readiness marker aliases the IDs; it must not overwrite live GPU scratch.
+            auto * ready = ggml_view_2d(ctx, mapped, mapped->ne[0], mapped->ne[1], mapped->nb[1], 0);
+            ggml_set_name(ready, ("moe_stream_ids." + std::to_string(il)).c_str());
+            ggml_backend_sched_set_tensor_backend(sched, ready, backend);
+            return ready;
+        }
         return mapped;
     }
     return ids;

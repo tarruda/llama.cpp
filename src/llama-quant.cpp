@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -280,6 +281,24 @@ static void llama_tensor_dequantize_impl(
     workers.clear();
 }
 
+static void llama_engram_dequantize(const uint8_t * data, const uint8_t * scales, float * output, size_t nelements, std::vector<std::thread> & workers, int nthread) {
+    GGML_ASSERT(nelements % 32 == 0);
+    const size_t nblocks = nelements/32;
+    const size_t nworkers = std::min<size_t>(std::max(nthread, 1), nblocks);
+    const auto convert = [&](size_t worker) {
+        for (size_t i = nblocks*worker/nworkers; i < nblocks*(worker + 1)/nworkers; ++i) {
+            uint8_t packed[33];
+            packed[0] = scales[i];
+            std::memcpy(packed + 1, data + i*32, 32);
+            dequantize_row_mxfp8_act(packed, output + i*32, 32);
+        }
+    };
+    for (size_t i = 1; i < nworkers; ++i) { workers.emplace_back(convert, i); }
+    convert(0);
+    for (auto & worker : workers) { worker.join(); }
+    workers.clear();
+}
+
 //
 // do we allow this tensor to be quantized?
 //
@@ -308,9 +327,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
 
-    // Preserve FP8 Engram tables and their elementwise weights.
+    // Engram scales and elementwise weights do not use matrix quantization.
     if (arch == LLM_ARCH_DEEPSEEK41) {
-        quantize &= name.find(".engram_embd") == std::string::npos;
+        quantize &= name.find(".engram_embd_scale.weight") == std::string::npos;
         quantize &= name.find(".engram_k_weight.weight") == std::string::npos;
         quantize &= name.find(".engram_q_weight.weight") == std::string::npos;
     }
@@ -689,6 +708,17 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+        return tensor->type;
+    }
+    if (qs.model.arch == LLM_ARCH_DEEPSEEK41 && tm.name.find(".engram_embd.weight") != std::string::npos) {
+        // Preserve the lookup tables unless the recipe names them explicitly.
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (!std::regex_search(tm.name, pattern)) { continue; }
+            if (qtype != tensor->type && (!ggml_get_type_traits(qtype)->to_float || tensor->ne[0] % ggml_blck_size(qtype))) {
+                throw std::runtime_error(format("unsupported Engram target type %s for %s", ggml_type_name(qtype), tensor->name));
+            }
+            return qtype;
+        }
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
@@ -1134,6 +1164,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     workers.reserve(nthread);
 
     std::vector<no_init<uint8_t>> read_data;
+    std::vector<no_init<uint8_t>> read_scales;
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
@@ -1205,6 +1236,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         const ggml_type cur_type = tensor->type;
         const ggml_type new_type = tm.target_type;
+        const bool fp8_engram = model->arch == LLM_ARCH_DEEPSEEK41 && cur_type == GGML_TYPE_I8 && tm.name.find(".engram_embd.weight") != std::string::npos;
+        const llama_model_loader::llama_tensor_weight * scale_weight = nullptr;
+        if (fp8_engram && cur_type != new_type) {
+            const auto source_name = remap_imatrix(tm.name, mapped);
+            const auto scale_name = source_name.substr(0, source_name.size() - 7) + "_scale.weight";
+            scale_weight = &ml.require_weight(scale_name.c_str());
+            if (scale_weight->tensor->type != GGML_TYPE_I8 || scale_weight->tensor->ne[0]*32 != tensor->ne[0] || ggml_nrows(scale_weight->tensor) != ggml_nrows(tensor)) {
+                throw std::runtime_error(format("invalid FP8 scales for %s", tensor->name));
+            }
+        }
 
         // If we've decided to quantize to the same type the tensor is already
         // in then there's nothing to do.
@@ -1276,7 +1317,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
                 }
 
-                if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
+                if ((ggml_is_quantized(tensor->type) || fp8_engram) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 }
 
@@ -1291,7 +1332,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
                 // process the rows in slabs, so that the buffers stay below max_buf_size
-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
+                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float)) + (fp8_engram ? n_per_row/32 : 0);
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
@@ -1312,7 +1353,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         if (f32_conv_buf.size() < (size_t) nelements_cur) {
                             f32_conv_buf.resize(nelements_cur);
                         }
-                        llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                        if (fp8_engram) {
+                            const size_t scale_size = nelements_cur/32;
+                            if (read_scales.size() < scale_size) { read_scales.resize(scale_size); }
+                            const auto * scales = (const uint8_t *) ml.load_data_range(*scale_weight, ir*n_per_row/32, scale_size, read_scales.data());
+                            llama_engram_dequantize((const uint8_t *) src, scales, (float *) f32_conv_buf.data(), nelements_cur, workers, nthread);
+                        } else {
+                            llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                        }
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 

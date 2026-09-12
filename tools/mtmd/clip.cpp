@@ -1037,6 +1037,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_kimik25>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
                 builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);
@@ -1589,6 +1590,7 @@ struct clip_model_loader {
                             hparams.set_limit_image_tokens(2, 4096);
                         }
                     } break;
+                case PROJECTOR_TYPE_DEEPSEEK41V:
                 case PROJECTOR_TYPE_DEEPSEEK4V:
                     {
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
@@ -1596,8 +1598,8 @@ struct clip_model_loader {
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
                         get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
-                        hparams.dsv4_max_n_token  = 384;
-                        hparams.dsv4_max_wh_ratio = 8;
+                        hparams.dsv4_max_n_token  = model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V ? 1024 : 384;
+                        hparams.dsv4_max_wh_ratio = model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V ? 0 : 8;
                         const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
                         // handle min/max token counts from CLI
                         if (hparams.custom_image_min_tokens > 0) {
@@ -2742,6 +2744,7 @@ struct clip_model_loader {
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
             case PROJECTOR_TYPE_DEEPSEEK4V:
                 {
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
@@ -2752,7 +2755,7 @@ struct clip_model_loader {
                     model.image_newline        = get_tensor(TN_IMAGE_NEWLINE);
                     model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
-                    model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                    model.token_embd_img_pad   = model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V ? nullptr : get_tensor(TN_TOK_IMG_PAD);
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
@@ -4190,12 +4193,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 int y_patch = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
                 const int out_patch_size = params.patch_size * params.n_merge;
                 const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
-                n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+                n_patches = ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK41V ? n_llm_h*(n_llm_w + 1) + 2 : dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
@@ -5068,6 +5072,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
                 set_input_i32("pos_w", pos_data);
             } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
                 // set the 2D positions (mrope layout, only the first 2 channels are used)
@@ -5089,6 +5094,17 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 const int idx_end     = n_grid + 1;
                 const int idx_newline = n_grid + 2;
                 const int idx_pad     = n_grid + 3;
+
+                if (ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK41V) {
+                    std::vector<int32_t> idx = {idx_start};
+                    for (int row = 0; row < n_llm_h; ++row) {
+                        for (int col = 0; col < n_llm_w; ++col) { idx.push_back(row*n_llm_w + col); }
+                        idx.push_back(idx_newline);
+                    }
+                    idx.push_back(idx_end);
+                    set_input_i32("layout_idx", idx);
+                    break;
+                }
 
                 const int lead_pad = imgs.entries[0].lead_pad;
                 const auto bl = dsv4_get_block_layout(n_llm_w, n_llm_h, lead_pad);
@@ -5978,6 +5994,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_KIMIK25:
         case PROJECTOR_TYPE_YASA2:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
         case PROJECTOR_TYPE_DEEPSEEK4V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_HUNYUANVL:

@@ -1184,6 +1184,27 @@ struct llama_model_deepseek41 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model), tokens(n_tokens) {}
+        const llama_model & model;
+        int64_t tokens;
+
+        struct hc_mixes {
+            ggml_tensor * pre;
+            ggml_tensor * post;
+            ggml_tensor * comb;
+        };
+
+        ggml_tensor * bf16(ggml_tensor * x) const;
+        ggml_tensor * linear(ggml_tensor * w, ggml_tensor * x, bool fp8) const;
+        ggml_tensor * norm(ggml_tensor * x, ggml_tensor * weight) const;
+        ggml_tensor * rstd(ggml_tensor * x) const;
+        ggml_tensor * mm_f32(ggml_tensor * weight, ggml_tensor * x) const;
+        hc_mixes mix(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * scale, ggml_tensor * base, int il, bool ffn) const;
+        ggml_tensor * hc_post(ggml_tensor * x, ggml_tensor * residual, const hc_mixes & mix) const;
+        ggml_tensor * moe(ggml_tensor * x, int il) const;
+    };
+
     struct {
         uint32_t ngram_size = 0;
         uint32_t n_heads = 0;
@@ -1392,6 +1413,12 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
         graph_dsv4(const llama_model & model, const llm_graph_params & params);
+    };
+
+    bool is_dsv41 = false;
+
+    struct graph_dsv41 : public llama_model_deepseek41::graph {
+        graph_dsv41(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

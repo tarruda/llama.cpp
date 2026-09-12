@@ -2799,6 +2799,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_profile                 =*/ nullptr,
         /*.moe_pin_count               =*/ 0,
         /*.moe_read_threads            =*/ 4,
+        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_LRU,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

@@ -906,6 +906,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+static bool is_dspark41_model(const llama_model * model) {
+    char arch[32] = {};
+    return llama_model_meta_val_str(model, "dflash.target_model_architecture", arch, sizeof(arch)) >= 0 && std::strcmp(arch, "deepseek41") == 0;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -931,6 +936,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
+    bool is_dsv41 = false;
 
     // dspark speculators
     bool sample_from_anchor = true;
@@ -953,6 +959,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const llama_model * model_dft = llama_get_model(ctx_dft);
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        is_dsv41 = is_dspark41_model(model_dft);
+        char target_arch[32] = {};
+        llama_model_meta_val_str(model_tgt, "general.architecture", target_arch, sizeof(target_arch));
+        if ((std::strcmp(target_arch, "deepseek41") == 0) != is_dsv41) {
+            throw std::runtime_error("DeepSeek V4.1 requires a matching DSpark V4.1 draft");
+        }
+        if (is_dsv41 && (!is_dspark || n_seq != 1)) {
+            throw std::runtime_error("DSpark V4.1 requires --spec-type draft-dspark and -np 1");
+        }
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
@@ -1092,6 +1107,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
+        if (is_dsv41) {
+            const int32_t count = llama_get_embeddings_layer_inp_n_tokens(params.ctx_tgt, target_layer_ids[0]);
+            if (count == 0) { return true; }
+            const llama_seq_id seq_id = batch_in.seq_id[0][0];
+            const llama_pos start = batch_in.pos[batch_in.n_tokens - 1] + 1 - count;
+            auto memory = llama_get_memory(params.ctx_dft);
+            if (start > llama_memory_seq_pos_max(memory, seq_id) + 1) {
+                // The captured tail replaces a skipped part of a long prompt.
+                if (!llama_memory_seq_rm(memory, seq_id, 0, -1)) { return false; }
+            } else if (!llama_memory_seq_rm(memory, seq_id, start, -1)) {
+                return false;
+            }
+            const int32_t chunk_size = llama_n_ubatch(params.ctx_dft);
+            for (int32_t off = 0; off < count; off += chunk_size) {
+                batch_inject.n_tokens = std::min(count - off, chunk_size);
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    GGML_ASSERT(llama_get_embeddings_layer_inp_n_tokens(params.ctx_tgt, target_layer_ids[k]) == (uint32_t) count);
+                    const float * layer = llama_get_embeddings_layer_inp(params.ctx_tgt, target_layer_ids[k]);
+                    for (int32_t i = 0; i < batch_inject.n_tokens; ++i) {
+                        std::memcpy(batch_inject.embd + (size_t) i*n_embd_enc + k*n_embd_tgt, layer + (size_t) (off + i)*n_embd_tgt, n_embd_tgt*sizeof(float));
+                    }
+                }
+                for (int32_t i = 0; i < batch_inject.n_tokens; ++i) {
+                    batch_inject.pos[i] = start + off + i;
+                    batch_inject.n_seq_id[i] = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i] = false;
+                }
+                if (llama_decode(params.ctx_dft, batch_inject) != 0) { return false; }
+            }
+            return true;
+        }
+
         // Target prefill may contain token IDs or multimodal embeddings. Both
         // produce the target-layer features used to seed the draft KV cache, so
         // embeddings are injected too, except the pinned ones skipped below.
@@ -1201,7 +1249,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = is_dsv41 ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1268,7 +1316,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < n_block_tokens && (!is_dsv41 || i < params.n_max); ++i) {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -2477,6 +2525,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (!params_spec.devices.empty()) {
             result.devices           = params_spec.devices;
         }
+        result.stream_moe            = false;
+        result.moe_cache_bytes       = 0;
+        result.moe_pin_count         = 0;
+        result.moe_pin_encoder       = false;
+        result.moe_cache_policy       = LLAMA_MOE_CACHE_LRU;
+        result.moe_profile.clear();
+        result.moe_profile_output.clear();
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
@@ -2566,6 +2621,17 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+        if (is_dspark41_model(model_dft)) {
+            if (cparams.n_seq_max != 1) {
+                throw std::runtime_error("DSpark V4.1 requires -np 1");
+            }
+            char window[32] = {};
+            llama_model_meta_val_str(model_dft, "dflash.attention.sliding_window", window, sizeof(window));
+            cparams.n_batch = cparams.n_ubatch = std::max(128, std::atoi(window));
+            cparams.n_outputs_max = std::max<uint32_t>(5, cparams.n_outputs_max);
+            cparams.n_outputs_max_per_seq = std::max<uint32_t>(5, cparams.n_outputs_max_per_seq);
+            cparams.type_k = cparams.type_v = GGML_TYPE_F32;
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {

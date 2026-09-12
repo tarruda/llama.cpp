@@ -81,6 +81,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-smoe, --stream-moe` | stream routed experts through a resident cache; forces load-mode none and lazy-mode on (DeepSeek V4.1)<br/>(env: LLAMA_ARG_STREAM_MOE) |
 | `--moe-cache MiB` | total routed expert cache including pins, in MiB (default: 0 = automatic)<br/>(env: LLAMA_ARG_MOE_CACHE) |
+| `--moe-cache-policy lru\|adaptive` | expert eviction policy (default: lru); adaptive learns live routes and excludes profile input and positive pin counts<br/>(env: LLAMA_ARG_MOE_CACHE_POLICY) |
 | `--moe-profile FNAME` | routing frequency JSON produced by llama-imatrix, used to select expert pins<br/>(env: LLAMA_ARG_MOE_PROFILE) |
 | `--moe-pin-count N` | global number of expert bundles to pin; requires --moe-profile when positive (default: 0)<br/>(env: LLAMA_ARG_MOE_PIN_COUNT) |
 | `--moe-pin-encoder` | always pin all encoder experts; select max(0, pin-count - encoder-expert-count) decoder pins<br/>(env: LLAMA_ARG_MOE_PIN_ENCODER) |
@@ -168,7 +169,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcs, --lookup-cache-static FNAME` | path to static lookup cache to use for lookup decoding (not updated by generation) |
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
-| `--prefill-mode auto\|full\|ced` | prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)<br/>ced currently requires one text-generation slot without speculative decoding; models without CED use full processing<br/>(env: LLAMA_ARG_PREFILL_MODE) |
+| `--prefill-mode auto\|full\|ced` | prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)<br/>ced requires one text-generation slot and supports DSpark; models without CED use full processing<br/>(env: LLAMA_ARG_PREFILL_MODE) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |

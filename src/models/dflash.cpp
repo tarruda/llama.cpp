@@ -4,11 +4,21 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cmath>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     std::string target_arch;
     ml.get_key("dflash.target_model_architecture", target_arch, false);
-    if (target_arch == "deepseek41") {
-        throw std::runtime_error("DeepSeek-V4.1 DSpark conversion is supported, but its draft graph is not implemented yet");
+    is_dsv41 = target_arch == "deepseek41";
+    if (is_dsv41) {
+        std::string dense = "fp8", expert = "fp8";
+        ml.get_key(LLM_KV_DENSE_ACTIVATION_DTYPE, dense, false);
+        ml.get_key(LLM_KV_EXPERT_ACTIVATION_DTYPE, expert, false);
+        if ((dense != "fp8" && dense != "bf16") || (expert != "fp8" && expert != "bf16")) {
+            throw std::runtime_error("DSpark V4.1 activation dtype must be bf16 or fp8");
+        }
+        hparams.dsv41_dense_act_fp8 = dense == "fp8";
+        hparams.dsv41_expert_act_fp8 = expert == "fp8";
     }
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -72,6 +82,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
 
         GGML_ASSERT(hparams.n_swa > 0);
+        if (is_dsv41) {
+            if (hparams.dflash_block_size != 5 || hparams.n_layer_all != 3) {
+                throw std::runtime_error("DSpark V4.1 requires three stages and a five-token noise block");
+            }
+            hparams.n_swa += hparams.dflash_block_size;
+        }
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         hparams.set_swa_pattern(0);
         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
@@ -173,9 +189,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t hc_dim          = hc_mult * n_embd;
         const int64_t hc_mix_dim      = (2 + hc_mult) * hc_mult;
 
-        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
-        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
-        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+        if (!is_dsv41) {
+            hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
+            hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
+            hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+        }
 
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = layers[i];
@@ -251,6 +269,9 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
             return std::make_unique<graph<true>>(*this, params);
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
+            if (is_dsv41) {
+                return std::make_unique<graph_dsv41>(*this, params);
+            }
             if (hparams.dsv4_hc_mult > 0) {
                 return std::make_unique<graph_dsv4>(*this, params);
             }
@@ -304,6 +325,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     // confidence head is optional
     const bool has_conf = model.dspark_conf_proj != nullptr;
+    const bool is_dsv41 = static_cast<const llama_model_dflash &>(model).is_dsv41;
 
     ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
     const int64_t n_vocab = base->ne[0];
@@ -350,6 +372,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
         ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        if (is_dsv41) {
+            ggml_prec_set_src(bias, GGML_PREC_F32, 0);
+            ggml_prec_set_src(bias, GGML_PREC_F32, 1);
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -369,15 +395,20 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
             ggml_tensor * conf_inp   = res->t_embd; // [n_embd, n_tok]
-            // conf(i) = sigmoid(conf_proj . [conf_inp(i); markov_w1[prev(i)]] + b)  -- [1, n_blocks]
             ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
                                                     (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
             ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
             ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            if (is_dsv41) {
+                ggml_prec_set_src(conf, GGML_PREC_F32, 0);
+                ggml_prec_set_src(conf, GGML_PREC_F32, 1);
+            }
             if (model.dspark_conf_proj_b) {
                 conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
             }
-            conf = ggml_sigmoid(ctx0, conf);
+            if (!is_dsv41) {
+                conf = ggml_sigmoid(ctx0, conf);
+            }
 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
@@ -1003,4 +1034,162 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+}
+
+namespace {
+
+struct llm_graph_input_dspark41 : llm_graph_input_i {
+    const llama_kv_cache_context * mctx;
+    int32_t window;
+    int32_t n_rows;
+    std::vector<float> frequencies;
+    ggml_tensor * rotations;
+    ggml_tensor * rows = nullptr;
+    ggml_tensor * packed_rows = nullptr;
+    ggml_tensor * positions = nullptr;
+
+    llm_graph_input_dspark41(const llama_kv_cache_context * mctx, int32_t window, int32_t n_rot, float base) :
+        mctx(mctx), window(window), n_rows(0) {
+        for (int i = 0; i < n_rot/2; ++i) {
+            frequencies.push_back(1.0f/std::pow(base, float(2*i)/n_rot));
+        }
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        std::vector<float> cs(ubatch->n_tokens*frequencies.size()*2);
+        for (uint32_t it = 0; it < ubatch->n_tokens; ++it) {
+            for (size_t i = 0; i < frequencies.size(); ++i) {
+                const float angle = ubatch->pos[it]*frequencies[i];
+                cs[it*frequencies.size()*2 + 2*i] = std::cos(angle);
+                cs[it*frequencies.size()*2 + 2*i + 1] = std::sin(angle);
+            }
+        }
+        ggml_backend_tensor_set(rotations, cs.data(), 0, cs.size()*sizeof(float));
+        if (!rows) { return; }
+
+        GGML_ASSERT(ubatch->n_seqs_unq == 1);
+        const auto seq_id = ubatch->seq_id[0][0];
+        const auto & cells = mctx->get_cells(seq_id);
+        const int32_t prefix = ubatch->pos[0];
+        const int32_t kept = std::min(window, prefix);
+        std::vector<int32_t> ids(n_rows, -1), indices(n_rows), pos(ubatch->n_tokens, n_rows - 1);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.seq_has(i, seq_id)) { continue; }
+            const auto p = cells.pos_get(i);
+            if (p >= prefix - kept && p < prefix) {
+                ids[p % window] = i;
+            } else if (p >= prefix && p < prefix + (int32_t) ubatch->n_tokens) {
+                ids[kept + p - prefix] = i;
+            }
+        }
+        for (int32_t i = 0; i < n_rows; ++i) {
+            GGML_ASSERT(ids[i] >= 0 && "DSpark target window is incomplete");
+            indices[i] = i;
+        }
+        ggml_backend_tensor_set(rows, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(packed_rows, indices.data(), 0, indices.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(positions, pos.data(), 0, pos.size()*sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * iswa = dynamic_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+        if (!iswa) { return false; }
+        mctx = iswa->get_swa();
+        return !rows || n_rows == std::min(window, params.ubatch.pos[0]) + (int32_t) params.ubatch.n_tokens;
+    }
+};
+
+} // namespace
+
+llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const llm_graph_params & params) :
+    llama_model_deepseek41::graph(model, params) {
+    const int64_t dim = hparams.n_embd_head_k(), heads = hparams.n_head();
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const bool fp8 = hparams.dsv41_dense_act_fp8;
+    auto * attn = build_attn_inp_k_iswa();
+    auto owner = std::make_unique<llm_graph_input_dspark41>(attn->mctx->get_swa(), hparams.n_swa - hparams.dflash_block_size, n_rot, freq_base);
+    auto * input = owner.get();
+    input->rotations = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_rot, tokens);
+    ggml_set_input(input->rotations);
+    res->add_input(std::move(owner));
+    const auto rope = [&](ggml_tensor * x, bool inverse = false) {
+        return ggml_dsv41_rope(ctx0, x, input->rotations, inverse);
+    };
+    const auto store_kv = [&](ggml_tensor * x, int il) {
+        const auto & layer = model.layers[il];
+        auto * kv = norm(linear(layer.wkv, x, fp8), layer.attn_kv_norm);
+        kv = rope(ggml_reshape_3d(ctx0, kv, dim, 1, tokens));
+        kv = ggml_dsv41_act_quant(ctx0, kv, GGML_DSV41_QUANT_MXFP8);
+        cb(kv, "dspark_kv", il);
+        ggml_build_forward_expand(gf, attn->mctx->get_swa()->cpy_k(ctx0, kv, attn->get_k_idxs_swa(), il));
+    };
+
+    if (ubatch.embd) {
+        auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), tokens);
+        ggml_set_input(inp->embd);
+        auto * x = norm(linear(model.fc, inp->embd, fp8), model.output_norm_enc);
+        res->add_input(std::move(inp));
+        cb(x, "dspark_main", -1);
+        for (int il = 0; il < n_layer; ++il) { store_kv(x, il); }
+        res->t_embd = x;
+        ggml_build_forward_expand(gf, x);
+        return;
+    }
+
+    input->n_rows = std::min(input->window, ubatch.pos[0]) + tokens;
+    input->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, input->n_rows);
+    input->packed_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, input->n_rows);
+    input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+    ggml_set_input(input->rows);
+    ggml_set_input(input->packed_rows);
+    ggml_set_input(input->positions);
+    const auto * target = cparams.ctx_other ? llama_get_model(cparams.ctx_other) : nullptr;
+    auto * embedding = model.tok_embd ? model.tok_embd : target ? target->tok_embd : nullptr;
+    auto * output = model.output ? model.output : target ? target->output : nullptr;
+    GGML_ASSERT(embedding && output);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+    ggml_set_input(inp->tokens);
+    auto * input_tokens = inp->tokens;
+    auto * x = ggml_get_rows(ctx0, embedding, input_tokens);
+    res->add_input(std::move(inp));
+    x = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, x, n_embd, 1, tokens), n_embd, hc, tokens, 1);
+    ggml_tensor * pre = nullptr;
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        const auto attn_mix = mix(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il, false);
+        auto * collapsed = pre ? bf16(ggml_dsv4_hc_pre(ctx0, x, pre)) : ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, tokens, x->nb[2], 0));
+        auto * cur = norm(collapsed, layer.attn_norm);
+        cb(cur, "dsv41_attn_norm", il);
+        auto * q = linear(layer.wq_b, norm(linear(layer.wq_a, cur, fp8), layer.attn_q_a_norm), fp8);
+        q = rope(ggml_reshape_3d(ctx0, q, dim, heads, tokens));
+        cb(q, "dspark_q", il);
+        store_kv(cur, il);
+        auto * cached = attn->mctx->get_swa()->get_k(ctx0, il);
+        cached = ggml_cont_2d(ctx0, cached, dim, ggml_nelements(cached)/dim);
+        auto * keys = ggml_get_rows(ctx0, cached, input->rows);
+        auto * packed = ggml_new_tensor_2d(ctx0, GGML_TYPE_I8, dim/32*33, input->n_rows);
+        packed = ggml_dsv41_set_rows(ctx0, packed, keys, input->packed_rows, GGML_DSV41_QUANT_MXFP8);
+        cur = ggml_dsv41_attn(ctx0, q, packed, layer.attn_sinks, input->positions, nullptr, nullptr, input->n_rows, 0);
+        cb(cur, "dsv41_sparse_attention", il);
+        cur = rope(cur, true);
+        const int64_t groups = hparams.dsv4_o_group_count, rank = hparams.dsv4_o_lora_rank;
+        cur = ggml_permute(ctx0, ggml_reshape_3d(ctx0, cur, heads*dim/groups, groups, tokens), 0, 2, 1, 3);
+        auto * wa = ggml_reshape_3d(ctx0, layer.wo_a, heads*dim/groups, rank, groups);
+        cur = bf16(mm_f32(wa, cur));
+        cur = ggml_cont_2d(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3), rank*groups, tokens);
+        cur = linear(layer.wo_b, cur, fp8);
+        x = hc_post(cur, x, attn_mix);
+        const auto ffn_mix = mix(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il, true);
+        cur = norm(bf16(ggml_dsv4_hc_pre(ctx0, x, attn_mix.pre)), layer.ffn_norm);
+        x = hc_post(moe(cur, il), x, ffn_mix);
+        cb(x, "dsv41_layer", il);
+        pre = ffn_mix.pre;
+    }
+    res->t_embd = bf16(ggml_dsv4_hc_pre(ctx0, x, pre));
+    res->t_logits = mm_f32(output, norm(res->t_embd, model.output_norm));
+    cb(res->t_logits, "dspark_base_logits", -1);
+    ggml_build_forward_expand(gf, res->t_logits);
+    build_dspark_markov_head(*this, model, input_tokens);
 }

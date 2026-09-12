@@ -2738,6 +2738,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
+const llama_kv_cells & llama_kv_cache_context::get_cells(llama_seq_id seq_id) const {
+    return kv->get_cells(seq_id);
+}
+
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }

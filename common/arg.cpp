@@ -1679,7 +1679,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--prefill-mode"}, "auto|full|ced",
         "prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)\n"
-        "ced currently requires one text-generation slot without speculative decoding; models without CED use full processing",
+        "ced requires one text-generation slot and supports DSpark; models without CED use full processing",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.prefill_mode = COMMON_PREFILL_MODE_AUTO;
@@ -2812,6 +2812,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_bytes = uint64_t(value)*1024*1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "lru|adaptive",
+        "expert cache eviction (default: lru); adaptive learns live routes and excludes --moe-profile and positive --moe-pin-count",
+        [](common_params & params, const std::string & value) {
+            if (value == "lru") { params.moe_cache_policy = LLAMA_MOE_CACHE_LRU; }
+            else if (value == "adaptive") { params.moe_cache_policy = LLAMA_MOE_CACHE_ADAPTIVE; }
+            else { throw std::invalid_argument("invalid MoE cache policy: " + value); }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
     add_opt(common_arg(
         {"--moe-profile"}, "FNAME",
         "routing frequency JSON produced by llama-imatrix, used to select expert pins",

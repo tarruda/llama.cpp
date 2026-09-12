@@ -80,12 +80,13 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
             model.token_embd_img_pad,
         };
         for (ggml_tensor * tok : sentinels) {
+            if (!tok) { continue; }
             cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
         }
 
         const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
         const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
-        const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
+        const int n_out   = model.token_embd_img_pad ? dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out : n_llm_h*(n_llm_w + 1) + 2;
         GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
 
         ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);

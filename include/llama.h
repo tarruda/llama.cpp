@@ -217,6 +217,11 @@ extern "C" {
         LLAMA_MOE_PHASE_DECODE = 2,
     };
 
+    enum llama_moe_cache_policy {
+        LLAMA_MOE_CACHE_LRU = 0,
+        LLAMA_MOE_CACHE_ADAPTIVE = 1,
+    };
+
     struct llama_moe_cache_stats {
         uint64_t hits;
         uint64_t misses;
@@ -341,6 +346,7 @@ extern "C" {
         const char * moe_profile;   // routing frequency JSON; required for a positive pin count
         int32_t moe_pin_count;      // global expert bundle count, including encoder pins
         int32_t moe_read_threads;   // concurrent positioned reads
+        enum llama_moe_cache_policy moe_cache_policy;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

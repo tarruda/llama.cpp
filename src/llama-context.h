@@ -89,6 +89,7 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    uint32_t get_embeddings_layer_inp_n_tokens(uint32_t lid) const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -303,6 +304,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<uint32_t> embd_layer_inp_n_tokens;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

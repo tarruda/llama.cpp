@@ -114,6 +114,9 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// V4.1 captures the final attention window; other models capture the full batch.
+LLAMA_API uint32_t llama_get_embeddings_layer_inp_n_tokens(struct llama_context * ctx, uint32_t lid);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

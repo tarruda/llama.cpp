@@ -1030,14 +1030,15 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
-        const bool can_prefill_ced = !(params_base.n_parallel != 1 || params_base.embedding || has_mmproj || has_spec ||
+        const bool has_block_draft = has_draft && std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+        const bool can_prefill_ced = !(params_base.n_parallel != 1 || params_base.embedding || has_mmproj || (has_spec && !has_block_draft) ||
                  params_base.speculative.has_synth() || std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                         [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; }));
+                         [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; }));
         if (params_base.prefill_mode == COMMON_PREFILL_MODE_AUTO) {
             params_base.prefill_mode = can_prefill_ced ? COMMON_PREFILL_MODE_CED : COMMON_PREFILL_MODE_FULL;
         }
         if (params_base.prefill_mode == COMMON_PREFILL_MODE_CED && !can_prefill_ced) {
-            SRV_ERR("%s\n", "--prefill-mode ced requires -np 1, text generation, and no speculative decoding");
+            SRV_ERR("%s\n", "--prefill-mode ced requires -np 1 and text generation; only DSpark supports speculative decoding");
             return false;
         }
 
