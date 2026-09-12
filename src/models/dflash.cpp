@@ -5,6 +5,11 @@
 #include "llama-kv-cache-iswa.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+    std::string target_arch;
+    ml.get_key("dflash.target_model_architecture", target_arch, false);
+    if (target_arch == "deepseek41") {
+        throw std::runtime_error("DeepSeek-V4.1 DSpark conversion is supported, but its draft graph is not implemented yet");
+    }
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale, false);

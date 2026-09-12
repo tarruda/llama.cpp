@@ -1,10 +1,28 @@
-DeepSeek V4.1 numerical reference
+DeepSeek V4.1 conversion and numerical reference
+
+The production converter accepts the released `DeepseekV41ForCausalLM` checkpoint. The backbone export excludes the separate DSpark and vision tensors. Dense FP8 weights use the checkpoint's 32 x 32 scale blocks and are stored as BF16 by default. `--fp8-as-q8` explicitly opts into lossy Q8_0 storage for those weights. The V4 converter retains its existing 128 x 128 behavior.
+
+Routed MXFP4 experts are repacked without changing values, one expert at a time. Engram values and E8M0 scales are stored separately as raw I8 tensors and written in bounded row chunks. Neither the expert collection nor the large Engram tables need to become fully resident during conversion. The converter writes the Engram hash constants and installs this branch's V4.1 text template.
+
+```sh
+python convert_hf_to_gguf.py /path/to/DeepSeek-V4.1-Flash \
+    --outtype bf16 --split-max-size 105G --no-tensor-first-split \
+    --outfile DeepSeek-V4.1-Flash-MXFP4.gguf
+python convert_hf_to_gguf.py /path/to/DeepSeek-V4.1-Flash \
+    --dspark --outtype bf16 --outfile DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+python convert_hf_to_gguf.py /path/to/DeepSeek-V4.1-Flash \
+    --mmproj --outtype bf16 --outfile DeepSeek-V4.1-Flash-mmproj-BF16.gguf
+```
+
+DSpark exports three stages with 128 experts each, the target projection, Markov head and F32 confidence projection. Target embeddings and the output matrix are shared rather than duplicated. Its `dflash.target_model_architecture = deepseek41` metadata distinguishes V4.1's carried hyper-connections and target attention input features from the V4 draft. Export does not yet enable speculative inference: the runtime rejects this draft until the V4.1 draft graph is implemented. Vision export likewise does not enable a V4.1 vision runtime.
+
+The following tools validate the numerical implementation with small synthetic weights.
 
 `reference.py` imports the released `inference/model.py` and `engram.py` without changing them. `cpu_kernel.py` supplies CPU implementations of the six imported TileLang kernel functions. This allows the official Python layer, routing, RoPE, compression, shared-cache, and Engram logic to run on a small CPU fixture. It is not CUDA instruction emulation: reduction order and elementary-function approximations can differ from the GPU kernels.
 
 The fixture keeps all 40 backbone layers and the released KV/index source topology. Widths, expert counts, Engram tables, sliding window, and index/candidate limits are reduced. Its default 33-token prompt crosses the 16-token window, ratio-2 compression boundaries, top-8 indexing threshold, and four candidate blocks of four positions. Four subsequent decode steps exercise incomplete and completed compressor groups. Weights are deterministic and nonuniform; all residual copies, output groups, and routed experts have distinct parameters. The synthetic tokenizer has 128 unique entries and exercises the official hash implementation, but does not replace real-tokenizer validation.
 
-For text chat with the existing converted GGUF, override its older embedded template with `--jinja --chat-template-file models/templates/deepseek-ai-DeepSeek-V4.1.jinja`. The override preserves reminders, applies the official reasoning-history policy and joins typed text blocks with two newlines. It accepts reasoning effort `low`, `high`, `max`, or an integer from 1 to 100; decimal strings are also accepted for CLI settings. Thinking mode defaults to effort 75. Native DeepSeek preprocessing orders tool results, and the parser recognizes V4.1's spaced DSML tags. Reminder text stays in the model prompt and is excluded from parsed assistant output and grammar prefill. This template is for the native text chat path; it does not implement the official encoder's vision or auxiliary task interfaces.
+For text chat with a GGUF carrying an older embedded template, override it with `--jinja --chat-template-file models/templates/deepseek-ai-DeepSeek-V4.1.jinja`. The override preserves reminders, applies the official reasoning-history policy and joins typed text blocks with two newlines. It accepts reasoning effort `low`, `high`, `max`, or an integer from 1 to 100; decimal strings are also accepted for CLI settings. Thinking mode defaults to effort 75. Native DeepSeek preprocessing orders tool results, and the parser recognizes V4.1's spaced DSML tags. Reminder text stays in the model prompt and is excluded from parsed assistant output and grammar prefill. This template is for the native text chat path; it does not implement the official encoder's vision or auxiliary task interfaces.
 
 From the repository root, using an environment with PyTorch 2.11, NumPy, SymPy, tokenizers, and Pillow:
 

@@ -682,7 +682,8 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
         self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
-        self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
+        if "num_hash_layers" in hparams:
+            self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
         if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4:
             self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
         if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
@@ -691,12 +692,13 @@ class DeepseekV4Model(TextModel):
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
         tensors_to_remove: list[str] = []
+        block = self.fp8_weight_block_size()
 
         def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
             out_features, in_features = weight.shape
             scale_f = self._e8m0_to_float(scale)
-            scale_f = scale_f.repeat_interleave(128, 0)[:out_features]
-            scale_f = scale_f.repeat_interleave(128, 1)[:, :in_features]
+            scale_f = scale_f.repeat_interleave(block, 0)[:out_features]
+            scale_f = scale_f.repeat_interleave(block, 1)[:, :in_features]
             return weight.float() * scale_f
 
         for name in list(self.model_tensors.keys()):
@@ -717,6 +719,9 @@ class DeepseekV4Model(TextModel):
 
         for name in tensors_to_remove:
             del self.model_tensors[name]
+
+    def fp8_weight_block_size(self) -> int:
+        return 128
 
     def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
         n_experts = self.hparams["n_routed_experts"]

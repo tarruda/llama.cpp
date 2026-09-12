@@ -1049,6 +1049,54 @@ class GGUFWriter:
     def add_attention_compress_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), value)
 
+    def add_attention_kv_source_layers(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.KV_SOURCE_LAYERS.format(arch=self.arch), value)
+
+    def add_attention_index_source_layers(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.INDEX_SOURCE_LAYERS.format(arch=self.arch), value)
+
+    def add_indexer_candidate_source_layer(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_SOURCE_LAYER.format(arch=self.arch), value)
+
+    def add_indexer_candidate_topk_blocks(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_TOPK_BLOCKS.format(arch=self.arch), value)
+
+    def add_indexer_candidate_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_engram_layers(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.LAYERS.format(arch=self.arch), value)
+
+    def add_engram_ngram_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.NGRAM_SIZE.format(arch=self.arch), value)
+
+    def add_engram_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_COUNT.format(arch=self.arch), value)
+
+    def add_engram_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_DIM.format(arch=self.arch), value)
+
+    def add_engram_embedding_counts(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.EMBEDDING_COUNTS.format(arch=self.arch), value)
+
+    def add_engram_compressed_vocab_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.COMPRESSED_VOCAB_SIZE.format(arch=self.arch), value)
+
+    def add_engram_pad_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.PAD_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_engram_head_bucket_sizes(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.HEAD_BUCKET_SIZES.format(arch=self.arch), value)
+
+    def add_engram_head_offsets(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.HEAD_OFFSETS.format(arch=self.arch), value)
+
+    def add_engram_multipliers(self, value: Sequence[int]) -> None:
+        self._add_u64_array(Keys.Engram.MULTIPLIERS.format(arch=self.arch), value)
+
+    def add_engram_token_map(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.TOKEN_MAP.format(arch=self.arch), value)
+
     def add_hyper_connection_count(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.COUNT.format(arch=self.arch), count)
 
