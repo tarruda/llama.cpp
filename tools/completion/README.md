@@ -145,6 +145,12 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
 | `--list-devices` | print list of available devices and exit |
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
+| `-smoe, --stream-moe` | stream routed experts through a resident cache; forces load-mode none and lazy-mode on (DeepSeek V4.1)<br/>(env: LLAMA_ARG_STREAM_MOE) |
+| `--moe-cache MiB` | total routed expert cache including pins, in MiB (default: 0 = automatic)<br/>(env: LLAMA_ARG_MOE_CACHE) |
+| `--moe-profile FNAME` | routing frequency JSON produced by llama-imatrix, used to select expert pins<br/>(env: LLAMA_ARG_MOE_PROFILE) |
+| `--moe-pin-count N` | global number of expert bundles to pin; requires --moe-profile when positive (default: 0)<br/>(env: LLAMA_ARG_MOE_PIN_COUNT) |
+| `--moe-pin-encoder` | always pin all encoder experts; select max(0, pin-count - encoder-expert-count) decoder pins<br/>(env: LLAMA_ARG_MOE_PIN_ENCODER) |
+| `--moe-read-threads N` | concurrent expert disk reads (default: 4)<br/>(env: LLAMA_ARG_MOE_READ_THREADS) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |

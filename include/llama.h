@@ -211,6 +211,20 @@ extern "C" {
         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
     };
 
+    enum llama_moe_phase {
+        LLAMA_MOE_PHASE_CALIBRATION = 0,
+        LLAMA_MOE_PHASE_PREFILL = 1,
+        LLAMA_MOE_PHASE_DECODE = 2,
+    };
+
+    struct llama_moe_cache_stats {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t evictions;
+        uint64_t bytes_read;
+        double read_ms;
+    };
+
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
@@ -323,6 +337,11 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        uint64_t moe_cache_bytes;   // total routed expert cache, including pins; 0 = automatic
+        const char * moe_profile;   // routing frequency JSON; required for a positive pin count
+        int32_t moe_pin_count;      // global expert bundle count, including encoder pins
+        int32_t moe_read_threads;   // concurrent positioned reads
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -347,6 +366,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool stream_moe;      // force load-mode none and lazy-mode on
+        bool moe_pin_encoder; // always pin all routed encoder experts
     };
 
     struct llama_sampler_seq_config {
@@ -583,6 +604,13 @@ extern "C" {
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
+
+    // Return the canonical source shape for a cached execution tensor.
+    LLAMA_API const struct ggml_tensor * llama_model_tensor_source(const struct llama_model * model, const struct ggml_tensor * tensor);
+    LLAMA_API void llama_set_moe_phase(struct llama_context * ctx, enum llama_moe_phase phase);
+    // Cumulative model cache activity. A lookup serves a layer or one projection, depending on batch size.
+    LLAMA_API struct llama_moe_cache_stats llama_get_moe_cache_stats(const struct llama_context * ctx, enum llama_moe_phase phase);
+    LLAMA_API int32_t llama_model_n_expert(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);

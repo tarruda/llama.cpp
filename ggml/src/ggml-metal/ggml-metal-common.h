@@ -48,6 +48,8 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 void ggml_graph_optimize(struct ggml_cgraph * gf);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
+// Keep slots 0..3 for the ggml precision parameters.
+enum { GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS = 4 };
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 

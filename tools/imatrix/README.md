@@ -32,6 +32,26 @@ The parameters in square brackets are optional and have the following meaning:
 
 For faster computation, make sure to use GPU offloading via the `-ngl | --n-gpu-layers` argument.
 
+### Routed expert profiles
+
+`--moe-profile-output experts.json` records original expert IDs and selection counts per layer. These counts measure routing frequency, not the effect of removing an expert. They are separate from the activation importance values used by the quantizer.
+
+Calibration uses full causal evaluation so that both halves of DeepSeek V4.1 receive importance data for every calibration token. To also measure inference traffic, add `--moe-profile-generate 128 --moe-profile-prompts 8 --moe-profile-prompt-tokens 1024`. After calibration, the tool prefills evenly spaced excerpts from the same corpus and samples continuations with the configured sampler. These are raw text continuations, not chat-template prompts. The JSON records separate `calibration`, `prefill`, and `decode` counts, token observations, expert coverage, and sampling settings. Generation profiling does not change the imatrix.
+
+For DeepSeek V4.1, profiling uses CED prefill: encoder layers process the prompt, decoder layers replay its final window, and both halves process each generated token. Counts describe the work actually executed, including that replay. An early end-of-generation token can shorten a sample; inspect the recorded observations when assessing coverage. Use a representative corpus and enough sampled continuations before treating a frequency ranking as stable.
+
+```bash
+./build/bin/llama-imatrix -m model.gguf -f calibration.txt \
+    --stream-moe --moe-cache 81920 -ngl 99 -fa on \
+    -c 4096 -b 4096 -ub 4096 --process-output \
+    -o imatrix.gguf --moe-profile-output experts.json \
+    --moe-profile-generate 128 --moe-profile-prompts 8 --moe-profile-prompt-tokens 1024 --seed 41
+```
+
+Streaming forces `--load-mode none --lazy-mode on` and uses one calibration sequence. The cache budget is in MiB and excludes other weights, activations, output buffers, context state, and lazy row caches. Leave memory for these allocations, especially with large calibration batches. Only complete corpus chunks are calibrated; a trailing partial chunk is skipped. Checkpoints count completed corpus chunks and GGUF output is replaced atomically after a successful write.
+
+`--in-file` merges imatrix values and counts only. Routing JSON from earlier runs is not merged: a new JSON describes observations from the current invocation. Profiles are compatible across quantizations with the same architecture and expert topology, but changing quantization can change routing frequencies. See [routed expert streaming](../../docs/development/routed-expert-streaming.md) for residency and pin settings.
+
 Recent versions of `llama-imatrix` store data in GGUF format by default. For the legacy format, use an extension other than `.gguf` when saving the output file. More information is available in <https://github.com/ggml-org/llama.cpp/pull/9400>.
 
 ## Examples

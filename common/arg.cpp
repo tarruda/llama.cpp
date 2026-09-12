@@ -1846,6 +1846,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--moe-profile-generate"}, "N",
+        "generate N tokens per profiling prompt after calibration (default: 0; requires --moe-profile-output)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("negative profiling generation length"); }
+            params.moe_profile_generate = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--moe-profile-prompts"}, "N",
+        "number of corpus excerpts used for prefill/generation profiling (default: 8)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("profiling requires at least one prompt"); }
+            params.moe_profile_prompts = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--moe-profile-prompt-tokens"}, "N",
+        "tokens per corpus excerpt for prefill/generation profiling (default: 256)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("profiling requires a nonempty prompt"); }
+            params.moe_profile_prompt_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"-bf", "--binary-file"}, "FNAME",
         "binary file containing the prompt (default: none)",
         [](common_params & params, const std::string & value) {
@@ -2775,6 +2799,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"-smoe", "--stream-moe"},
+        "stream routed experts through a resident cache; forces load-mode none and lazy-mode on (DeepSeek V4.1)",
+        [](common_params & params) { params.stream_moe = true; }
+    ).set_env("LLAMA_ARG_STREAM_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache"}, "MiB",
+        "total routed expert cache including pins, in MiB (default: 0 = automatic)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("negative MoE cache size"); }
+            params.moe_cache_bytes = uint64_t(value)*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-profile"}, "FNAME",
+        "routing frequency JSON produced by llama-imatrix, used to select expert pins",
+        [](common_params & params, const std::string & value) { params.moe_profile = value; }
+    ).set_env("LLAMA_ARG_MOE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-pin-count"}, "N",
+        "global number of expert bundles to pin; requires --moe-profile when positive (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("negative MoE pin count"); }
+            params.moe_pin_count = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PIN_COUNT"));
+    add_opt(common_arg(
+        {"--moe-pin-encoder"},
+        "always pin all encoder experts; select max(0, pin-count - encoder-expert-count) decoder pins",
+        [](common_params & params) { params.moe_pin_encoder = true; }
+    ).set_env("LLAMA_ARG_MOE_PIN_ENCODER"));
+    add_opt(common_arg(
+        {"--moe-read-threads"}, "N",
+        "concurrent expert disk reads (default: 4)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) { throw std::invalid_argument("MoE read threads must be between 1 and 64"); }
+            params.moe_read_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_READ_THREADS"));
+    add_opt(common_arg(
+        {"--moe-profile-output"}, "FNAME",
+        "write original expert routing counts and coverage as JSON alongside the imatrix",
+        [](common_params & params, const std::string & value) { params.moe_profile_output = value; }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

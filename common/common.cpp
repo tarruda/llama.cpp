@@ -1689,9 +1689,22 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    mparams.stream_moe = params.stream_moe;
+    mparams.moe_cache_bytes = params.moe_cache_bytes;
+    mparams.moe_pin_count = params.moe_pin_count;
+    mparams.moe_pin_encoder = params.moe_pin_encoder;
+    mparams.moe_read_threads = params.moe_read_threads;
+    mparams.moe_profile = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
+    if (params.stream_moe) {
+        LOG_INF("%s: routed streaming uses load-mode none and lazy-mode on\n", __func__);
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.lazy_mode = LLAMA_LAZY_MODE_ON;
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        mparams.lazy_mode = LLAMA_LAZY_MODE_ON;
+    }
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
+    mparams.use_extra_bufts = !params.no_extra_bufts && !params.stream_moe;
     mparams.no_host         = params.no_host;
 
     if (params.kv_overrides.empty()) {

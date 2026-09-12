@@ -332,6 +332,20 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+struct moe_stream_params {
+    bool enabled = false;
+    uint64_t cache_bytes = 0;
+    std::string profile;
+    int32_t pin_count = 0;
+    int32_t read_threads = 4;
+    bool pin_encoder = false;
+
+    bool operator==(const moe_stream_params & other) const {
+        return enabled == other.enabled && cache_bytes == other.cache_bytes && profile == other.profile &&
+            pin_count == other.pin_count && read_threads == other.read_threads && pin_encoder == other.pin_encoder;
+    }
+};
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -375,6 +389,8 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    moe_stream_params                moe;
+    common_prefill_mode              prefill_mode = COMMON_PREFILL_MODE_AUTO;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -420,6 +436,8 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* moe                  */ {},
+    /* prefill_mode         */ COMMON_PREFILL_MODE_AUTO,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -437,6 +455,13 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  -smoe, --stream-moe                         stream routed experts; forces load-mode none and lazy-mode on\n");
+    printf("  --moe-cache <MiB>                           routed cache including pins (default: 0 = automatic)\n");
+    printf("  --moe-profile <file>                        expert frequency JSON from llama-imatrix\n");
+    printf("  --moe-pin-count <N>                         global pinned expert bundles (default: 0; positive requires profile)\n");
+    printf("  --moe-pin-encoder                           permanently pin the full encoder\n");
+    printf("  --moe-read-threads <N>                       parallel read workers (default: 4)\n");
+    printf("  --prefill-mode <auto|full|ced>               prompt execution (default: auto)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -550,6 +575,36 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             if (arg == "-h" || arg == "--help") {
                 print_usage(argc, argv);
                 exit(0);
+            } else if (arg == "-smoe" || arg == "--stream-moe") {
+                params.moe.enabled = true;
+            } else if (arg == "--moe-pin-encoder") {
+                params.moe.pin_encoder = true;
+            } else if (arg == "--moe-cache" || arg == "--moe-profile" || arg == "--moe-pin-count" ||
+                       arg == "--moe-read-threads" || arg == "--prefill-mode") {
+                if (++i >= argc) { invalid_param = true; break; }
+                const std::string value = argv[i];
+                if (arg == "--moe-profile") {
+                    params.moe.profile = value;
+                } else if (arg == "--prefill-mode") {
+                    if (value == "auto") { params.prefill_mode = COMMON_PREFILL_MODE_AUTO; }
+                    else if (value == "full") { params.prefill_mode = COMMON_PREFILL_MODE_FULL; }
+                    else if (value == "ced") { params.prefill_mode = COMMON_PREFILL_MODE_CED; }
+                    else { invalid_param = true; break; }
+                } else {
+                    size_t end = 0;
+                    const int64_t number = std::stoll(value, &end);
+                    if (number < 0 || end != value.size()) { invalid_param = true; break; }
+                    if (arg == "--moe-cache") {
+                        if (uint64_t(number) > UINT64_MAX/1048576) { invalid_param = true; break; }
+                        params.moe.cache_bytes = uint64_t(number)*1048576;
+                    } else if (arg == "--moe-pin-count") {
+                        if (number > INT32_MAX) { invalid_param = true; break; }
+                        params.moe.pin_count = number;
+                    } else {
+                        if (number < 1 || number > 64) { invalid_param = true; break; }
+                        params.moe.read_threads = number;
+                    }
+                }
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1220,6 +1275,8 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    moe_stream_params  moe;
+    common_prefill_mode prefill_mode = COMMON_PREFILL_MODE_AUTO;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1234,6 +1291,17 @@ struct cmd_params_instance {
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
+        mparams.stream_moe = moe.enabled;
+        mparams.moe_cache_bytes = moe.cache_bytes;
+        mparams.moe_profile = moe.profile.empty() ? nullptr : moe.profile.c_str();
+        mparams.moe_pin_count = moe.pin_count;
+        mparams.moe_read_threads = moe.read_threads;
+        mparams.moe_pin_encoder = moe.pin_encoder;
+        if (moe.enabled) {
+            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+            mparams.lazy_mode = LLAMA_LAZY_MODE_ON;
+            mparams.use_extra_bufts = false;
+        }
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1278,7 +1346,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode && moe == other.moe &&
                devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1365,7 +1433,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe                   = */ params.moe,
+                /* .prefill_mode          = */ params.prefill_mode,
             };
+            if (params.moe.enabled) {
+                instance.load_mode = LLAMA_LOAD_MODE_NONE;
+                instance.lazy_mode = LLAMA_LAZY_MODE_ON;
+            }
             instances.push_back(instance);
         }
 
@@ -1402,7 +1476,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe                   = */ params.moe,
+                /* .prefill_mode          = */ params.prefill_mode,
             };
+            if (params.moe.enabled) {
+                instance.load_mode = LLAMA_LOAD_MODE_NONE;
+                instance.lazy_mode = LLAMA_LAZY_MODE_ON;
+            }
             instances.push_back(instance);
         }
 
@@ -1439,7 +1519,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe                   = */ params.moe,
+                /* .prefill_mode          = */ params.prefill_mode,
             };
+            if (params.moe.enabled) {
+                instance.load_mode = LLAMA_LOAD_MODE_NONE;
+                instance.lazy_mode = LLAMA_LAZY_MODE_ON;
+            }
             instances.push_back(instance);
         }
     }
@@ -1486,6 +1572,8 @@ struct test {
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    moe_stream_params        moe;
+    common_prefill_mode      prefill_mode;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1524,6 +1612,8 @@ struct test {
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
+        moe            = inst.moe;
+        prefill_mode   = inst.prefill_mode;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
@@ -1581,6 +1671,7 @@ struct test {
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
+            "stream_moe", "moe_cache_bytes", "moe_profile", "moe_pin_count", "moe_read_threads", "moe_pin_encoder", "prefill_mode",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1593,11 +1684,12 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "moe_cache_bytes" || field == "moe_pin_count" || field == "moe_read_threads") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "stream_moe" || field == "moe_pin_encoder") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1682,6 +1774,13 @@ struct test {
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
+                                            std::to_string(moe.enabled),
+                                            std::to_string(moe.cache_bytes),
+                                            moe.profile,
+                                            std::to_string(moe.pin_count),
+                                            std::to_string(moe.read_threads),
+                                            std::to_string(moe.pin_encoder),
+                                            prefill_mode == COMMON_PREFILL_MODE_FULL ? "full" : prefill_mode == COMMON_PREFILL_MODE_CED ? "ced" : "auto",
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -2130,14 +2229,16 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads, bool use_ced) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+    llama_set_moe_phase(ctx, LLAMA_MOE_PHASE_PREFILL);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> tokens(n_batch);
+    std::vector<int8_t> outputs(n_batch, 0);
 
     int n_processed = 0;
 
@@ -2147,7 +2248,13 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        auto batch = llama_batch_get_one(tokens.data(), n_tokens);
+        if (use_ced) {
+            std::fill(outputs.begin(), outputs.end(), 0);
+            outputs[n_tokens - 1] = n_processed + n_tokens == n_prompt;
+            batch.logits = outputs.data();
+        }
+        int res = use_ced ? llama_prefill(ctx, batch) : llama_decode(ctx, batch);
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
@@ -2161,6 +2268,7 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+    llama_set_moe_phase(ctx, LLAMA_MOE_PHASE_DECODE);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -2375,7 +2483,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.prefill_mode != COMMON_PREFILL_MODE_FULL && !t.embeddings);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2417,7 +2525,7 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads, t.prefill_mode != COMMON_PREFILL_MODE_FULL && !t.embeddings);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2444,7 +2552,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.prefill_mode != COMMON_PREFILL_MODE_FULL && !t.embeddings);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);

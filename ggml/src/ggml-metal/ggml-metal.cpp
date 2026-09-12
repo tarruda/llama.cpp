@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
+#include "ggml-metal-common.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
@@ -939,7 +940,25 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+static void * ggml_backend_metal_buffer_get_host_ptr(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_metal(buffer)) { return nullptr; }
+    auto ctx = (ggml_metal_buffer_t) buffer->context;
+    return ggml_metal_buffer_is_shared(ctx) ? ggml_metal_buffer_get_base(ctx) : nullptr;
+}
+
+static void ggml_backend_metal_mul_mat_id_preserve_dispatch(ggml_tensor * dst, const ggml_tensor * src) {
+    GGML_ASSERT(dst->op == GGML_OP_MUL_MAT_ID && src->op == GGML_OP_MUL_MAT_ID);
+    const int32_t original = ggml_get_op_params_i32(src, GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS);
+    ggml_set_op_params_i32(dst, GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS, original > 0 ? original : src->src[2]->ne[1]);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_metal_mul_mat_id_preserve_dispatch") == 0) {
+        return (void *) ggml_backend_metal_mul_mat_id_preserve_dispatch;
+    }
+    if (strcmp(name, "ggml_backend_metal_buffer_get_host_ptr") == 0) {
+        return (void *) ggml_backend_metal_buffer_get_host_ptr;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }

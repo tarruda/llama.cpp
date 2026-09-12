@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <limits>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -426,6 +427,31 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+
+void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
+    if (offset > size() || len > size() - offset) {
+        throw std::runtime_error("file read exceeds source bounds");
+    }
+#if defined(_WIN32)
+    GGML_UNUSED(ptr);
+    throw std::runtime_error("positioned model reads require POSIX support");
+#else
+    if (offset > (size_t) std::numeric_limits<off_t>::max() || len > (size_t) std::numeric_limits<off_t>::max() - offset) {
+        throw std::runtime_error("file read offset is too large");
+    }
+    while (len > 0) {
+        const ssize_t n = pread(file_id(), ptr, std::min<size_t>(len, 64*1024*1024), offset);
+        if (n < 0) {
+            if (errno == EINTR) { continue; }
+            throw std::runtime_error(format("positioned read failed: %s", strerror(errno)));
+        }
+        if (n == 0) { throw std::runtime_error("unexpected end of model file"); }
+        ptr = (char *) ptr + n;
+        offset += n;
+        len -= n;
+    }
+#endif
+}
 #ifdef _WIN32
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else

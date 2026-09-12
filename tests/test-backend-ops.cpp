@@ -12970,6 +12970,88 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+static bool test_scheduler_node_handler(ggml_backend_t backend, ggml_backend_t cpu) {
+    struct handler_data {
+        ggml_tensor * first;
+        ggml_tensor * second;
+        int handled = 0;
+        int observed = 0;
+        bool fail = false;
+    };
+    for (bool use_handler : {false, true}) {
+        for (bool use_observer : {false, true}) {
+            for (bool fail : {false, true}) {
+                if (fail && !use_handler) { continue; }
+                ggml_context_ptr ctx(ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true}));
+                auto * x = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 16);
+                ggml_set_input(x);
+                auto * before = ggml_scale(ctx.get(), x, 2.0f);
+                auto * first = ggml_scale(ctx.get(), before, 3.0f);
+                auto * second = ggml_scale(ctx.get(), first, 4.0f);
+                auto * after = ggml_scale(ctx.get(), second, 0.5f);
+                auto * transfer = ggml_add(ctx.get(), after, x);
+                auto * output = ggml_scale(ctx.get(), transfer, 2.0f);
+                if (!ggml_backend_supports_op(backend, before)) { return true; }
+                ggml_set_output(output);
+                auto * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+                ggml_build_forward_expand(graph, output);
+                ggml_backend_t backends[] = {backend, cpu};
+                ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, 32, false, true));
+                for (auto * t : {before, first, second, after, output}) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), t, backend);
+                }
+                ggml_backend_sched_set_tensor_backend(sched.get(), transfer, cpu);
+                handler_data data{first, second, 0, 0, fail};
+                if (use_handler) {
+                    ggml_backend_sched_set_node_handler(sched.get(), [](const ggml_tensor * t, void * opaque) {
+                        auto & d = *static_cast<handler_data *>(opaque);
+                        return t == d.first || t == d.second;
+                    }, [](ggml_backend_t b, ggml_tensor * t, void * opaque) {
+                        auto & d = *static_cast<handler_data *>(opaque);
+                        if (d.fail) { return GGML_STATUS_FAILED; }
+                        ggml_backend_synchronize(b);
+                        float values[16];
+                        ggml_backend_tensor_get(t->src[0], values, 0, sizeof(values));
+                        for (float & v : values) { v *= t == d.first ? 5.0f : 7.0f; }
+                        ggml_backend_tensor_set(t, values, 0, sizeof(values));
+                        ++d.handled;
+                        return GGML_STATUS_SUCCESS;
+                    }, &data);
+                }
+                if (use_observer) {
+                    ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor * t, bool ask, void * opaque) {
+                        auto & d = *static_cast<handler_data *>(opaque);
+                        if (ask) { return t == d.first || t == d.second; }
+                        float values[16];
+                        ggml_backend_tensor_get(t, values, 0, sizeof(values));
+                        const float factor = d.handled ? (t == d.first ? 10.0f : 70.0f) : (t == d.first ? 6.0f : 24.0f);
+                        for (int i = 0; i < 16; ++i) { GGML_ASSERT(values[i] == (i + 1)*factor); }
+                        ++d.observed;
+                        return true;
+                    }, &data);
+                }
+                GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+                float values[16];
+                for (int i = 0; i < 16; ++i) { values[i] = i + 1; }
+                ggml_backend_tensor_set(x, values, 0, sizeof(values));
+                const auto status = ggml_backend_sched_graph_compute(sched.get(), graph);
+                if (fail) {
+                    GGML_ASSERT(status == GGML_STATUS_FAILED && data.observed == 0);
+                } else {
+                    GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+                    ggml_backend_tensor_get(output, values, 0, sizeof(values));
+                    for (int i = 0; i < 16; ++i) { GGML_ASSERT(values[i] == (i + 1)*(use_handler ? 72.0f : 26.0f)); }
+                    GGML_ASSERT(data.handled == (use_handler ? 2 : 0));
+                    GGML_ASSERT(data.observed == (use_observer ? 2 : 0));
+                }
+                ggml_backend_sched_set_node_handler(sched.get(), nullptr, nullptr, nullptr);
+            }
+        }
+    }
+    printf("  scheduler node handler: observer ordering, backend transfers and failures OK\n");
+    return true;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -13022,6 +13104,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         auto * set_use_ref = (ggml_backend_cpu_set_use_ref_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_use_ref");
         if (set_use_ref) {
             set_use_ref(backend_cpu.get(), true);
+        }
+
+        if (op_names_filter && strcmp(op_names_filter, "SCHEDULER") == 0) {
+            return test_scheduler_node_handler(backend, backend_cpu.get());
         }
 
         std::atomic<size_t> n_ok = 0;

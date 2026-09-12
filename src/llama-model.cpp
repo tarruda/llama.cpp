@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-stream.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1417,6 +1418,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    if (params.stream_moe) {
+        moe_stream = std::make_unique<llama_moe_stream>(ml, hparams, params);
+        ml.moe_stream = moe_stream.get();
+    }
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
@@ -1703,8 +1709,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
-            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            auto * source = moe_stream ? const_cast<ggml_tensor *>(moe_stream->source(cur)) : cur;
+            tensors_by_name.emplace_back(ggml_get_name(cur), source);
         }
+    }
+
+    if (moe_stream && !ml.no_alloc) {
+        size_t resident = 0;
+        for (const auto & entry : ml.ctx_map) {
+            if (!entry.first.lazy) {
+                resident += ggml_backend_alloc_ctx_tensors_from_buft_size(entry.second.get(), entry.first.buft);
+            }
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), &free, &total);
+        if (total && resident > total) {
+            throw std::runtime_error(format("resident model buffers require %.2f GiB, exceeding %.2f GiB of physical memory", resident/1073741824.0, total/1073741824.0));
+        }
+        LLAMA_LOG_INFO("%s: routed cache and always-used weights require %.2f GiB before context, work buffers and lazy rows\n", __func__, resident/1073741824.0);
     }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -1854,6 +1876,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    if (moe_stream && !moe_stream->load(ml.files)) { return false; }
 
     return true;
 }
@@ -2771,6 +2795,10 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.moe_cache_bytes             =*/ 0,
+        /*.moe_profile                 =*/ nullptr,
+        /*.moe_pin_count               =*/ 0,
+        /*.moe_read_threads            =*/ 4,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2782,6 +2810,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.stream_moe                  =*/ false,
+        /*.moe_pin_encoder             =*/ false,
     };
 
     return result;
@@ -2789,6 +2819,10 @@ llama_model_params llama_model_default_params() {
 
 const llama_vocab * llama_model_get_vocab(const llama_model * model) {
     return &model->vocab;
+}
+
+const ggml_tensor * llama_model_tensor_source(const llama_model * model, const ggml_tensor * tensor) {
+    return model->moe_stream ? model->moe_stream->source(tensor) : tensor;
 }
 
 void llama_free_model(llama_model * model) {

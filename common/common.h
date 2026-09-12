@@ -492,6 +492,17 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    bool stream_moe = false;
+    bool moe_pin_encoder = false;
+    uint64_t moe_cache_bytes = 0;
+    int32_t moe_pin_count = 0;
+    int32_t moe_read_threads = 4;
+    std::string moe_profile;
+    std::string moe_profile_output;
+    int32_t moe_profile_generate = 0;
+    int32_t moe_profile_prompts = 8;
+    int32_t moe_profile_prompt_tokens = 256;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

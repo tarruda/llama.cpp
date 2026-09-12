@@ -331,6 +331,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
+        if (!model_tensor->buffer) {
+            throw std::runtime_error("LoRA tensor '" + name + "' requires a resident base tensor");
+        }
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 

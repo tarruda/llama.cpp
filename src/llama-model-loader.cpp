@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-moe-stream.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1354,6 +1355,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
+    if (moe_stream) {
+        const int64_t slots = moe_stream->slots(t_meta.name);
+        if (slots) {
+            t_meta.ne[2] = slots;
+            t_meta.nb[3] = slots*t_meta.nb[2];
+        }
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
@@ -1373,6 +1382,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (moe_stream) { moe_stream->bind(tensor); }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1617,6 +1627,10 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur : tensors) {
+        if (moe_stream && moe_stream->slots(cur->name)) {
+            size_done += ggml_nbytes(moe_stream->source(cur));
+            continue;
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models

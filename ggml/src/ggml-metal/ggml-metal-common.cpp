@@ -20,7 +20,8 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
-    const int64_t ne21 = op->src[2]->ne[1];
+    const int32_t original_tokens = ggml_get_op_params_i32(op, GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS);
+    const int64_t ne21 = original_tokens > 0 ? original_tokens : op->src[2]->ne[1];
 
     return has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
 }

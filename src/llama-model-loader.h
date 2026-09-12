@@ -21,6 +21,8 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
+class llama_moe_stream;
+
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
     GGUF_FILE_VERSION_V2 = 2,
@@ -83,6 +85,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    llama_moe_stream * moe_stream = nullptr;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

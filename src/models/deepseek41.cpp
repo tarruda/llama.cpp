@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-dsv41.h"
+#include "llama-moe-stream.h"
 #include "../../ggml/src/ggml-quants.h"
 
 #include <algorithm>
@@ -237,6 +238,7 @@ public:
     }
 
     void set_input(const llama_ubatch * ubatch) override {
+        const int64_t start = ggml_time_us();
         const auto & e = model.engram;
         const uint32_t heads = (e.ngram_size - 1)*e.n_heads;
         std::vector<int32_t> pos(n_tokens);
@@ -295,6 +297,7 @@ public:
             }
             ggml_backend_tensor_set(engram[ie], values.data(), 0, values.size()*sizeof(float));
         }
+        LLAMA_LOG_DEBUG("dsv41: prepared inputs for %lld tokens in %.3f ms\n", (long long) n_tokens, (ggml_time_us() - start)/1000.0);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -548,6 +551,9 @@ struct dsv41_graph : public llm_graph_context {
         weights = ggml_scale(ctx0, weights, hparams.expert_weights_scale);
         cb(weights, "dsv41_expert_weights", il);
         weights = ggml_reshape_3d(ctx0, weights, 1, used, tokens);
+        if (model.moe_stream && !cparams.cb_eval) {
+            ids = model.moe_stream->build_ids(ctx0, sched, ids, il);
+        }
         auto * cur = hparams.dsv41_expert_act_fp8 ? ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8) : x;
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, tokens);
         auto * gate = bf16(build_lora_mm_id(layer.ffn_gate_exps, cur, ids));

@@ -655,6 +655,14 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        for (auto phase : {LLAMA_MOE_PHASE_PREFILL, LLAMA_MOE_PHASE_DECODE}) {
+            const auto cache = llama_get_moe_cache_stats(ctx_tgt, phase);
+            if (cache.hits + cache.misses == 0) { continue; }
+            SLT_INF(*this, "MoE %s cumulative: %.2f%% hits, %llu misses, %.3f GiB read, %.3f s waiting for reads\n",
+                    phase == LLAMA_MOE_PHASE_PREFILL ? "prefill" : "decode", 100.0*cache.hits/(cache.hits + cache.misses),
+                    (unsigned long long) cache.misses, cache.bytes_read/1073741824.0, cache.read_ms/1000.0);
+        }
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
@@ -3693,6 +3701,7 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            llama_set_moe_phase(ctx_tgt, batch.tokens[off].is_prompt ? LLAMA_MOE_PHASE_PREFILL : LLAMA_MOE_PHASE_DECODE);
             ret = prefill ? llama_prefill(ctx_tgt, batch_view) : llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

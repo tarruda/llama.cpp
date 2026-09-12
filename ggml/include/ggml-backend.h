@@ -315,6 +315,12 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Execute selected nodes outside the normal backend graph. The handler owns synchronization and must preserve source tensors.
+    typedef bool (*ggml_backend_sched_node_supported)(const struct ggml_tensor * t, void * user_data);
+    typedef enum ggml_status (*ggml_backend_sched_node_compute)(ggml_backend_t backend, struct ggml_tensor * t, void * user_data);
+
+    GGML_API void ggml_backend_sched_set_node_handler(ggml_backend_sched_t sched, ggml_backend_sched_node_supported supported, ggml_backend_sched_node_compute compute, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);

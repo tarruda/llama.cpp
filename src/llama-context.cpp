@@ -10,6 +10,7 @@
 #include "llama-memory-dsv41.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1463,6 +1464,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (model.moe_stream) {
+            ggml_backend_sched_set_node_handler(sched.get(), llama_moe_stream::handles, llama_moe_stream::compute, model.moe_stream.get());
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2626,7 +2630,9 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    auto cache_lock = model.moe_stream ? model.moe_stream->lock_graph() : std::unique_lock<std::mutex>();
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (model.moe_stream) { ggml_backend_sched_synchronize(sched.get()); }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -4381,6 +4387,16 @@ int32_t llama_prefill(
         LLAMA_LOG_ERROR("%s: failed to prefill, ret = %d\n", __func__, ret);
     }
     return ret;
+}
+
+void llama_set_moe_phase(llama_context * ctx, llama_moe_phase phase) {
+    const auto * model = llama_get_model(ctx);
+    if (model->moe_stream) { model->moe_stream->set_phase(phase); }
+}
+
+llama_moe_cache_stats llama_get_moe_cache_stats(const llama_context * ctx, llama_moe_phase phase) {
+    const auto * model = llama_get_model(ctx);
+    return model->moe_stream ? model->moe_stream->stats(phase) : llama_moe_cache_stats{};
 }
 
 //

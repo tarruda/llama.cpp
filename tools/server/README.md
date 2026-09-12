@@ -51,7 +51,6 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-n, --predict, --n-predict N` | number of tokens to predict (default: -1, -1 = infinity)<br/>(env: LLAMA_ARG_N_PREDICT) |
 | `-b, --batch-size N` | logical maximum batch size (default: 2048)<br/>(env: LLAMA_ARG_BATCH) |
 | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
-| `--prefill-mode auto\|full\|ced` | prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)<br/>ced currently requires one text-generation slot without speculative decoding; models without CED use full processing<br/>(env: LLAMA_ARG_PREFILL_MODE) |
 | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
 | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
@@ -80,6 +79,12 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--list-devices` | print list of available devices and exit |
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
+| `-smoe, --stream-moe` | stream routed experts through a resident cache; forces load-mode none and lazy-mode on (DeepSeek V4.1)<br/>(env: LLAMA_ARG_STREAM_MOE) |
+| `--moe-cache MiB` | total routed expert cache including pins, in MiB (default: 0 = automatic)<br/>(env: LLAMA_ARG_MOE_CACHE) |
+| `--moe-profile FNAME` | routing frequency JSON produced by llama-imatrix, used to select expert pins<br/>(env: LLAMA_ARG_MOE_PROFILE) |
+| `--moe-pin-count N` | global number of expert bundles to pin; requires --moe-profile when positive (default: 0)<br/>(env: LLAMA_ARG_MOE_PIN_COUNT) |
+| `--moe-pin-encoder` | always pin all encoder experts; select max(0, pin-count - encoder-expert-count) decoder pins<br/>(env: LLAMA_ARG_MOE_PIN_ENCODER) |
+| `--moe-read-threads N` | concurrent expert disk reads (default: 4)<br/>(env: LLAMA_ARG_MOE_READ_THREADS) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
@@ -163,6 +168,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcs, --lookup-cache-static FNAME` | path to static lookup cache to use for lookup decoding (not updated by generation) |
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
+| `--prefill-mode auto\|full\|ced` | prompt processing mode: auto = ced when supported, full = all layers, ced = context encoder/decoder (default: auto)<br/>ced currently requires one text-generation slot without speculative decoding; models without CED use full processing<br/>(env: LLAMA_ARG_PREFILL_MODE) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
