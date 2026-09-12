@@ -4656,10 +4656,11 @@ struct test_dsv41_attn : public test_case {
     const int ratio;
     const bool strided;
     const int window_start;
+    const int kv_rows;
 
-    test_dsv41_attn(int64_t dim, int64_t tokens, int start, int ratio, bool strided, int window_start = 0)
-        : dim(dim), tokens(tokens), start(start), ratio(ratio), strided(strided), window_start(window_start) {}
-    std::string vars() override { return VARS_TO_STR6(dim, tokens, start, ratio, strided, window_start); }
+    test_dsv41_attn(int64_t dim, int64_t tokens, int start, int ratio, bool strided, int window_start = 0, int kv_rows = 1024)
+        : dim(dim), tokens(tokens), start(start), ratio(ratio), strided(strided), window_start(window_start), kv_rows(kv_rows) {}
+    std::string vars() override { return VARS_TO_STR7(dim, tokens, start, ratio, strided, window_start, kv_rows); }
     // F32 exp differences can cross BF16 rounding boundaries.
     double max_nmse_err() override { return 1e-8; }
 
@@ -4674,7 +4675,7 @@ struct test_dsv41_attn : public test_case {
             return ggml_dsv41_set_rows(ctx, packed, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, rows), ggml_cast(ctx, ggml_arange(ctx, 0, rows, 1), GGML_TYPE_I32), type);
         };
         auto * raw = cache(GGML_DSV41_QUANT_MXFP8, window + tokens + 5);
-        auto * kv = ratio ? cache(GGML_DSV41_QUANT_NVFP4, 1024) : nullptr;
+        auto * kv = ratio ? cache(GGML_DSV41_QUANT_NVFP4, kv_rows) : nullptr;
         auto * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2 : 1, heads);
         auto * positions = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? 2 : 1, tokens);
         const int topk = dim == 512 ? 512 : 65;
@@ -4703,9 +4704,10 @@ struct test_dsv41_attn : public test_case {
             ggml_backend_tensor_set(positions, &pos, it*positions->nb[0], sizeof(pos));
             if (indices) {
                 std::vector<int32_t> ids(indices->ne[0], -1);
-                const int visible = std::min(1024, (pos + 1)/ratio);
+                const int visible = std::min(kv_rows, (pos + 1)/ratio);
                 for (int i = 0; i < (int) ids.size(); ++i) {
-                    if (visible && i % 7) { ids[i] = (i/2) % visible; }
+                    if (visible && i % 7) { ids[i] = ((i/2)*(kv_rows > 1024 ? 127 : 1)) % visible; }
+                    if (kv_rows > 1024 && i % 31 == 0) { ids[i] = kv_rows - 1; }
                 }
                 ggml_backend_tensor_set(indices, ids.data(), it*indices->nb[1], ids.size()*sizeof(int32_t));
             }
@@ -10231,8 +10233,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_dsv41_attn(64, 128, 0, ratio, strided));
             test_cases.emplace_back(new test_dsv41_attn(512, 128, 1285, ratio, strided, 1286));
             test_cases.emplace_back(new test_dsv41_attn(64, 1, 3, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(64, 1, 0, ratio, strided));
             test_cases.emplace_back(new test_dsv41_attn(64, 5, 61, ratio, strided));
             test_cases.emplace_back(new test_dsv41_attn(512, 1, 1285, ratio, strided));
+            test_cases.emplace_back(new test_dsv41_attn(512, 1, 1285, ratio, strided, 1286));
+            if (ratio) { test_cases.emplace_back(new test_dsv41_attn(512, 1, 30000, ratio, strided, 0, 32768)); }
             test_cases.emplace_back(new test_dsv41_attn(64, 5, 61, ratio, strided, 61));
             test_cases.emplace_back(new test_dsv41_attn(512, 4, 1285, ratio, strided, 1286));
         }
@@ -12355,6 +12360,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int ratio : { 1, 2 }) {
+        test_cases.emplace_back(new test_dsv41_attn(512, 1, 30000, ratio, false, 0, 32768));
+    }
 
     for (int64_t n_tokens : {1, 8, 32, 512, 2048}) {
         test_cases.emplace_back(new test_qwen4exp_hc_reduce(2560, 4, n_tokens));

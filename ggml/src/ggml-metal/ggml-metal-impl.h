@@ -1479,6 +1479,9 @@ typedef struct {
     int32_t window;
     int32_t ratio;
     int32_t window_start;
+    int32_t selected;
+    int32_t precomputed;
+    int32_t slices;
     float scale;
     uint64_t nb_q1;
     uint64_t nb_q2;

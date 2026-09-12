@@ -1895,10 +1895,22 @@ int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_dsv41_attn_unpack_selected(const ggml_tensor * op) {
+    return op->src[0]->ne[2] == 1 && !getenv("GGML_METAL_DSV41_ATTN_UNPACK_ALL");
+}
+
+static bool ggml_metal_dsv41_attn_precompute_scores(const ggml_tensor * op) {
+    return ggml_metal_dsv41_attn_unpack_selected(op) && !getenv("GGML_METAL_DSV41_ATTN_INLINE_SCORES");
+}
+
 size_t ggml_metal_op_dsv41_attn_extra_cache(const ggml_tensor * op) {
     if (getenv("GGML_METAL_DSV41_ATTN_UNPACK_DISABLE")) { return 0; }
-    const size_t rows = op->src[1]->ne[1] + (op->src[5] ? op->src[5]->ne[1] : 0);
-    return rows*op->src[0]->ne[0]*sizeof(float);
+    const bool selected = ggml_metal_dsv41_attn_unpack_selected(op);
+    const size_t raw_rows = selected ? ggml_get_op_params_i32(op, 0) : op->src[1]->ne[1];
+    const size_t kv_rows = op->src[5] ? (selected ? op->src[4]->ne[0] : op->src[5]->ne[1]) : 0;
+    const size_t rows = raw_rows + kv_rows;
+    const size_t scores = ggml_metal_dsv41_attn_precompute_scores(op) ? rows*op->src[0]->ne[1] : 0;
+    return (rows*op->src[0]->ne[0] + scores)*sizeof(float);
 }
 
 int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
@@ -1914,6 +1926,9 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
         /*.window =*/ ggml_get_op_params_i32(op, 0),
         /*.ratio  =*/ ggml_get_op_params_i32(op, 1),
         /*.window_start =*/ ggml_get_op_params_i32(op, 2),
+        /*.selected =*/ ggml_metal_dsv41_attn_unpack_selected(op),
+        /*.precomputed =*/ ggml_metal_dsv41_attn_precompute_scores(op),
+        /*.slices =*/ ggml_metal_dsv41_attn_precompute_scores(op) && !getenv("GGML_METAL_DSV41_ATTN_SINGLE_SLICE") ? int(q->ne[0]/64) : 1,
         /*.scale  =*/ 1.0f/std::sqrt(float(q->ne[0])),
         /*.nb_q1  =*/ q->nb[1],
         /*.nb_q2  =*/ q->nb[2],
@@ -1930,21 +1945,37 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
     if (unpacked) {
         auto scratch = ggml_metal_get_buffer_id(op);
         scratch.offs += ggml_nbytes(op);
-        auto unpack = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, true);
+        auto unpack = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, true, false);
         ggml_metal_encoder_set_pipeline(enc, unpack);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, raw_buffer, 1);
         ggml_metal_encoder_set_buffer(enc, kv_buffer, 2);
         ggml_metal_encoder_set_buffer(enc, scratch, 3);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 5);
         const size_t values = ggml_metal_op_dsv41_attn_extra_cache(op)/sizeof(float);
         ggml_metal_encoder_dispatch_threadgroups(enc, std::min<size_t>((values + 255)/256, 256), 1, 1, 256, 1, 1);
         ggml_metal_op_concurrency_reset(ctx);
+        if (args.precomputed) {
+            const int rows = args.window + args.top_k;
+            auto scores = scratch;
+            scores.offs += size_t(rows)*args.dim*sizeof(float);
+            auto score_pipeline = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false, true);
+            ggml_metal_encoder_set_pipeline(enc, score_pipeline);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q), 1);
+            ggml_metal_encoder_set_buffer(enc, scratch, 2);
+            ggml_metal_encoder_set_buffer(enc, scores, 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 5);
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, (rows + 63)/64, 1, 64, 1, 1);
+            ggml_metal_op_concurrency_reset(ctx);
+        }
         raw_buffer = kv_buffer = scratch;
-        if (kv) { kv_buffer.offs += size_t(args.n_ring)*args.dim*sizeof(float); }
+        if (kv) { kv_buffer.offs += size_t(args.selected ? args.window : args.n_ring)*args.dim*sizeof(float); }
         args.nb_r1 = args.nb_k1 = args.dim*sizeof(float);
     }
-    auto pipeline = unpacked ? ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false) : ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+    auto pipeline = unpacked ? ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false, false) : ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
     for (int i = 0; i < 6; ++i) {
@@ -1952,7 +1983,7 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, buffer, i + 1);
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
-    ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, args.tokens, 1, 64, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, args.tokens, unpacked ? args.slices : 1, 64, 1, 1);
     return 1;
 }
 

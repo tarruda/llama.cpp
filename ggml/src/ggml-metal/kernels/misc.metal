@@ -996,23 +996,77 @@ static float dsv41_attn_value(device const uchar * row, int j, bool raw) {
     return kvalues_mxfp4_f[code]*dsv41_e4m3_value(row[sub]);
 }
 
+static float dsv41_attn_unpack_value(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const uchar * raw, device const uchar * kv, device const int * indices,
+        int last, int row, int j) {
+    const int raw_rows = args.selected ? args.window : args.n_ring;
+    const bool is_raw = row < raw_rows;
+    int id = is_raw ? row : row - raw_rows;
+    if (args.selected) {
+        if (is_raw) {
+            const int first = last - args.window + 1;
+            const int pos = (last == 0 ? max(0, first) : first) + id;
+            id = pos >= args.window_start && pos <= last ? pos % args.n_ring : -1;
+        } else {
+            id = indices[id];
+            if (id < 0 || id >= args.n_kv || id >= (long(last) + 1)/args.ratio) { id = -1; }
+        }
+    }
+    if (id < 0) { return 0; }
+    device const uchar * input = is_raw ? raw + id*args.nb_r1 : kv + id*args.nb_k1;
+    return dsv41_attn_value(input, j, is_raw);
+}
+
 kernel void kernel_dsv41_attn_unpack(
         constant ggml_metal_kargs_dsv41_attn & args,
         device const uchar * raw,
         device const uchar * kv,
         device float * dst,
         device const char * positions,
+        device const int * indices,
         uint tid [[thread_position_in_grid]],
         uint groups [[threadgroups_per_grid]]) {
     const int last = *(device const int *) (positions + (args.tokens - 1)*args.nb_p0);
-    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.n_kv) : 0;
-    const uint values = uint(args.n_ring + visible)*args.dim;
+    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.selected ? args.top_k : args.n_kv) : 0;
+    const int raw_rows = args.selected ? args.window : args.n_ring;
+    const uint values = uint(raw_rows + visible)*args.dim;
     for (uint i = tid; i < values; i += groups*256) {
         const uint row = i/args.dim, j = i%args.dim;
-        const bool is_raw = row < uint(args.n_ring);
-        device const uchar * input = is_raw ? raw + row*args.nb_r1 : kv + (row - args.n_ring)*args.nb_k1;
-        dst[i] = dsv41_attn_value(input, j, is_raw);
+        dst[i] = dsv41_attn_unpack_value(args, raw, kv, indices, last, row, j);
     }
+}
+
+kernel void kernel_dsv41_attn_scores(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const char * q,
+        device const float * cache,
+        device float * dst,
+        device const char * positions,
+        device const int * indices,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    threadgroup float query[512];
+    const int head = tgpig.x, row = tgpig.y*64 + tid;
+    device const float * input = (device const float *) (q + head*args.nb_q1);
+    for (int j = tid; j < args.dim; j += 64) { query[j] = input[j]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int last = *(device const int *) positions;
+    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.top_k) : 0;
+    if (row >= args.window + visible) { return; }
+    if (row < args.window) {
+        const int first = last - args.window + 1;
+        const int pos = (last == 0 ? max(0, first) : first) + row;
+        if (pos < args.window_start || pos > last) { return; }
+    } else {
+        const int id = indices[row - args.window];
+        if (id < 0 || id >= args.n_kv || id >= (long(last) + 1)/args.ratio) { return; }
+    }
+    float dot = 0;
+    for (int j = 0; j < args.dim; ++j) { dot += query[j]*cache[row*args.dim + j]; }
+    dst[head*(args.window + args.top_k) + row] = dot*args.scale;
 }
 
 template <bool unpacked>
@@ -1037,6 +1091,8 @@ kernel void kernel_dsv41_attn_impl(
     threadgroup float query[512], scores[64], weights[64], stats[3];
     threadgroup int ids[64];
     const int ih = tgpig.x, it = tgpig.y;
+    const int width = unpacked && args.precomputed ? args.dim/args.slices : args.dim;
+    const int first_channel = tgpig.z*width, end_channel = first_channel + width;
     const int pos = *(device const int *) (positions + it*args.nb_p0);
     const int last = *(device const int *) (positions + (args.tokens - 1)*args.nb_p0);
     const bool prefill = *(device const int *) positions == 0;
@@ -1061,13 +1117,19 @@ kernel void kernel_dsv41_attn_impl(
                 if (id < 0 || id >= args.n_kv || id >= (long(pos) + 1)/args.ratio) { id = -1; }
             }
         }
+        if (unpacked && args.selected && id >= 0) { id = is_raw ? start + tid : start + tid - window; }
         ids[tid] = id;
         float dot = 0;
-        if (id >= 0) {
+        if (id >= 0 && !(unpacked && args.precomputed)) {
             device const uchar * row = (device const uchar *) ((is_raw ? raw : kv) + id*(is_raw ? args.nb_r1 : args.nb_k1));
             for (int j = 0; j < args.dim; ++j) { dot += query[j]*dsv41_attn_read<unpacked>(row, j, is_raw); }
         }
         scores[tid] = id >= 0 ? dot*args.scale : -INFINITY;
+        if (unpacked && args.precomputed && id >= 0) {
+            const int rows = args.window + args.top_k;
+            device const float * cached_scores = (device const float *) raw + rows*args.dim;
+            scores[tid] = cached_scores[ih*rows + (is_raw ? id : args.window + id)];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
             float maximum = stats[0];
@@ -1085,7 +1147,7 @@ kernel void kernel_dsv41_attn_impl(
             for (int slot = 0; slot < count; ++slot) { sum += scores[slot]; }
             stats[1] = stats[1]*stats[2] + sum;
         }
-        for (int j = tid; j < args.dim; j += 64) {
+        for (int j = first_channel + tid; j < end_channel; j += 64) {
             float value = 0;
             for (int slot = 0; slot < count; ++slot) {
                 const int row_id = ids[slot];
@@ -1104,7 +1166,7 @@ kernel void kernel_dsv41_attn_impl(
         stats[1] += dsv41_exp(sink - stats[0]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int j = tid; j < args.dim; j += 64) {
+    for (int j = first_channel + tid; j < end_channel; j += 64) {
         dst[(it*args.heads + ih)*args.dim + j] = dsv41_round_bf16(precise::divide(accumulator[j/64], stats[1]));
     }
 }
