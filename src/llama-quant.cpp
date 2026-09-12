@@ -308,6 +308,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
 
+    // Preserve FP8 Engram tables and their elementwise weights.
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        quantize &= name.find(".engram_embd") == std::string::npos;
+        quantize &= name.find(".engram_k_weight.weight") == std::string::npos;
+        quantize &= name.find(".engram_q_weight.weight") == std::string::npos;
+    }
+
     // these are very small (e.g. 4x4)
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
