@@ -1309,6 +1309,61 @@ static float dsv41_attn_value(device const uchar * row, int j, bool raw) {
     return kvalues_mxfp4_f[code]*dsv41_e4m3_value(row[sub]);
 }
 
+kernel void kernel_dsv41_attn_pack(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const char * raw,
+        device const char * positions,
+        device const char * indices,
+        device const char * kv,
+        device ushort * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int row = tgpig.x*(ntg.x/32) + sgitg, it = tgpig.y;
+    const int rows = args.window + args.top_k;
+    if (row >= rows) { return; }
+    const int pos = *(device const int *) (positions + it*args.nb_p0);
+    const bool is_raw = row < args.window;
+    int id;
+    if (is_raw) {
+        const int p = pos - args.window + 1 + row;
+        id = p >= args.window_start && p <= pos ? p % args.n_ring : -1;
+    } else {
+        id = ((device const int *) (indices + it*args.nb_i1))[row - args.window];
+        if (id < 0 || id >= args.n_kv || id >= (long(pos) + 1)/args.ratio) { id = -1; }
+    }
+    device const uchar * input = (device const uchar *) ((is_raw ? raw : kv) + max(id, 0)*(is_raw ? args.nb_r1 : args.nb_k1));
+    device ushort * out = dst + (it*rows + row)*args.dim;
+    for (int j = tiisg; j < args.dim; j += 32) {
+        const float value = id >= 0 ? dsv41_attn_value(input, j, is_raw) : 0;
+        out[j] = ushort(as_type<uint>(dsv41_round_bf16(value)) >> 16);
+    }
+}
+
+kernel void kernel_dsv41_attn_mask(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const char * positions,
+        device const char * indices,
+        device half * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int row = tgpig.x*ntg.x + tid, it = tgpig.y;
+    const int rows = args.window + args.top_k;
+    if (row >= rows) { return; }
+    const int pos = *(device const int *) (positions + it*args.nb_p0);
+    bool valid;
+    if (row < args.window) {
+        const int p = pos - args.window + 1 + row;
+        valid = p >= args.window_start && p <= pos;
+    } else {
+        const int id = ((device const int *) (indices + it*args.nb_i1))[row - args.window];
+        valid = id >= 0 && id < args.n_kv && id < (long(pos) + 1)/args.ratio;
+    }
+    dst[it*rows + row] = valid ? half(0.0f) : half(-INFINITY);
+}
+
 static float dsv41_attn_unpack_value(
         constant ggml_metal_kargs_dsv41_attn & args,
         device const uchar * raw, device const uchar * kv, device const int * indices,

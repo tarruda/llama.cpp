@@ -599,8 +599,33 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
             selected = indices[hparams.dsv41_index_source[il]];
         }
         auto * kv = ratio ? cache_kv[hparams.dsv41_kv_source[il]] : nullptr;
-        auto * out = ggml_dsv41_attn(ctx0, q, raw, layer.attn_sinks, positions, selected, kv, hparams.n_swa, ratio);
-        if (il >= n_layer/2) { input->decoder_attention.push_back(out); }
+        ggml_tensor * out;
+        const char * flash_option = getenv("LLAMA_DSV41_FLASH_ATTN");
+        const bool cache_on_device = !ggml_backend_buffer_is_host(cache.raw->buffer) && (!kv || !ggml_backend_buffer_is_host(input->memory->layers[hparams.dsv41_kv_source[il]].kv->buffer));
+        const bool flash_decode = tokens == 1 && cparams.flash_attn && cache_on_device && (!flash_option || atoi(flash_option) > 0);
+        if (flash_decode) {
+            auto * packed = ggml_dsv41_attn_pack(ctx0, q, raw, positions, selected, kv, hparams.n_swa, ratio);
+            cb(packed, "dsv41_attn_packed", il);
+            const int64_t rows = hparams.n_swa + (selected ? selected->ne[0] : 0);
+            auto * k = ggml_view_4d(ctx0, packed, dim, rows, 1, tokens,
+                    dim*sizeof(ggml_bf16_t), dim*rows*sizeof(ggml_bf16_t), packed->nb[1], 0);
+            auto * mask = ggml_dsv41_attn_mask(ctx0, q, raw, positions, selected, kv, hparams.n_swa, ratio);
+            cb(mask, "dsv41_attn_mask", il);
+            if (il >= n_layer/2) {
+                input->decoder_attention.push_back(packed);
+                input->decoder_attention.push_back(mask);
+            }
+            mask = ggml_reshape_4d(ctx0, mask, rows, 1, 1, tokens);
+            auto * q_fa = ggml_reshape_4d(ctx0, q, dim, heads, 1, tokens);
+            out = ggml_flash_attn_ext(ctx0, q_fa, k, k, mask, 1.0f/std::sqrt(float(dim)), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks_rows(out, layer.attn_sinks);
+            ggml_prec_set_acc(out, GGML_PREC_F32);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out, il});
+            out = bf16(ggml_reshape_3d(ctx0, out, dim, heads, tokens));
+        } else {
+            out = ggml_dsv41_attn(ctx0, q, raw, layer.attn_sinks, positions, selected, kv, hparams.n_swa, ratio);
+            if (il >= n_layer/2) { input->decoder_attention.push_back(out); }
+        }
         if (ggml_backend_buffer_is_host(cache.raw->buffer) || (kv && ggml_backend_buffer_is_host(input->memory->layers[hparams.dsv41_kv_source[il]].kv->buffer))) {
             ggml_backend_sched_set_tensor_backend(sched, out, backend_cpu);
         }

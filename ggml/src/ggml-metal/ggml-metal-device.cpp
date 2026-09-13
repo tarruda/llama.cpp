@@ -121,6 +121,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_unpac
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_pack(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv41_attn_pack";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_mask(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv41_attn_mask";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_swiglu(ggml_metal_library_t lib, bool mxfp8) {
     const char * name = mxfp8 ? "kernel_dsv41_swiglu_mxfp8" : "kernel_dsv41_swiglu";
     auto res = ggml_metal_library_get_pipeline(lib, name);

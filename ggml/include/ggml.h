@@ -2909,6 +2909,26 @@ extern "C" {
             int32_t               window,
             int32_t               ratio);
 
+    GGML_API struct ggml_tensor * ggml_dsv41_attn_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * raw,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * kv,
+            int32_t               window,
+            int32_t               ratio);
+
+    GGML_API struct ggml_tensor * ggml_dsv41_attn_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * raw,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * kv,
+            int32_t               window,
+            int32_t               ratio);
+
     // Mask SWA positions before the replay boundary. Global context keeps its normal causal mask.
     GGML_API void ggml_dsv41_attn_set_window_start(struct ggml_tensor * a, int32_t window_start);
 

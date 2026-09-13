@@ -11807,6 +11807,46 @@ void ggml_compute_forward_dsv41_attn(const ggml_compute_params * params, ggml_te
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
+    const int mode = ggml_get_op_params_i32(dst, 3);
+    if (mode) {
+        const ggml_tensor * q = dst->src[0], * raw = dst->src[1], * positions = dst->src[3], * indices = dst->src[4], * kv = dst->src[5];
+        const int dim = q->ne[0], nt = q->ne[2];
+        const int window = ggml_get_op_params_i32(dst, 0), ratio = ggml_get_op_params_i32(dst, 1);
+        const int window_start = ggml_get_op_params_i32(dst, 2);
+        const int topk = indices ? indices->ne[0] : 0, rows = window + topk;
+        std::vector<float> values(mode == 1 ? dim : 0);
+        for (int64_t row = params->ith; row < int64_t(nt)*rows; row += params->nth) {
+            const int it = row/rows, slot = row % rows;
+            const int pos = *(const int32_t *) ((const char *) positions->data + it*positions->nb[0]);
+            bool valid = false;
+            if (slot < window) {
+                const int p = pos - window + 1 + slot;
+                valid = p >= window_start && p <= pos;
+            } else {
+                const int id = ((const int32_t *) ((const char *) indices->data + it*indices->nb[1]))[slot - window];
+                valid = id >= 0 && id < kv->ne[1] && id < (int64_t(pos) + 1)/ratio;
+            }
+            if (mode == 2) {
+                ((ggml_fp16_t *) ((char *) dst->data + it*dst->nb[1]))[slot] = GGML_FP32_TO_FP16(valid ? 0.0f : -INFINITY);
+                continue;
+            }
+            if (valid && slot < window) {
+                const int p = pos - window + 1 + slot;
+                dequantize_row_mxfp8_act((const uint8_t *) raw->data + (p % raw->ne[1])*raw->nb[1], values.data(), dim);
+            } else if (valid) {
+                const int id = ((const int32_t *) ((const char *) indices->data + it*indices->nb[1]))[slot - window];
+                dequantize_row_nvfp4((const block_nvfp4 *) ((const char *) kv->data + id*kv->nb[1]), values.data(), dim);
+            }
+            ggml_bf16_t * base = (ggml_bf16_t *) ((char *) dst->data + it*dst->nb[1]);
+            ggml_bf16_t * out = base + slot*dim;
+            if (valid) {
+                for (int j = 0; j < dim; ++j) { out[j] = GGML_FP32_TO_BF16(values[j]); }
+            } else {
+                std::fill_n(out, dim, GGML_FP32_TO_BF16(0.0f));
+            }
+        }
+        return;
+    }
     const ggml_tensor * q = dst->src[0], * raw = dst->src[1], * sinks = dst->src[2];
     const ggml_tensor * positions = dst->src[3], * indices = dst->src[4], * kv = dst->src[5];
     const int dim = q->ne[0], heads = q->ne[1], nt = q->ne[2];

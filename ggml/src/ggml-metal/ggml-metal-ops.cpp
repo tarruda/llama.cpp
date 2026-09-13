@@ -1961,6 +1961,7 @@ static bool ggml_metal_dsv41_attn_transpose_scores(const ggml_tensor * op) {
 }
 
 size_t ggml_metal_op_dsv41_attn_extra_cache(const ggml_tensor * op) {
+    if (ggml_get_op_params_i32(op, 3)) { return 0; }
     if (getenv("GGML_METAL_DSV41_ATTN_UNPACK_DISABLE")) { return 0; }
     const bool selected = ggml_metal_dsv41_attn_unpack_selected(op);
     const size_t raw_rows = selected ? ggml_get_op_params_i32(op, 0) : op->src[1]->ne[1];
@@ -1993,12 +1994,32 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
         /*.nb_q1  =*/ q->nb[1],
         /*.nb_q2  =*/ q->nb[2],
         /*.nb_r1  =*/ op->src[1]->nb[1],
-        /*.nb_s0  =*/ op->src[2]->nb[0],
+        /*.nb_s0  =*/ op->src[2] ? op->src[2]->nb[0] : 0,
         /*.nb_p0  =*/ op->src[3]->nb[0],
         /*.nb_i1  =*/ indices ? indices->nb[1] : 0,
         /*.nb_k1  =*/ kv ? kv->nb[1] : 0,
     };
     auto enc = ctx->enc;
+    const int mode = ggml_get_op_params_i32(op, 3);
+    if (mode) {
+        auto pipeline = mode == 1 ? ggml_metal_library_get_pipeline_dsv41_attn_pack(ctx->lib) : ggml_metal_library_get_pipeline_dsv41_attn_mask(ctx->lib);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        if (mode == 1) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(kv ? kv : op->src[1]), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (args.window + args.top_k + 15)/16, args.tokens, 1, 512, 1, 1);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (args.window + args.top_k + 255)/256, args.tokens, 1, 256, 1, 1);
+        }
+        return 1;
+    }
     const bool unpacked = ggml_metal_op_dsv41_attn_extra_cache(op) > 0;
     const bool simd_scores = ggml_metal_dsv41_attn_simd_scores(op);
     const bool unpack_rows = simd_scores && args.ratio > 1 && !getenv("GGML_METAL_DSV41_ATTN_UNPACK_ROWS_DISABLE");
@@ -4758,7 +4779,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         // simdgroups per threadgroup (a.k.a. warps)
         //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
-        int32_t nsg = 4;
+        const int32_t nsg = sinks_rows && ne00 == 512 && ne20 == 512 ? 8 : 4;
 
         const size_t smem = FATTN_SMEM(nsg);
 

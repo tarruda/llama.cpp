@@ -7039,6 +7039,64 @@ struct ggml_tensor * ggml_dsv41_attn(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv41_attn_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q, struct ggml_tensor * raw, struct ggml_tensor * positions,
+        struct ggml_tensor * indices, struct ggml_tensor * kv, int32_t window, int32_t ratio) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[3] == 1 && ggml_is_contiguous_rows(q));
+    GGML_ASSERT(raw->type == GGML_TYPE_I8 && ggml_is_matrix(raw) && ggml_is_contiguous_rows(raw));
+    GGML_ASSERT(raw->ne[0] == q->ne[0]/32*33 && window > 0 && raw->ne[1] >= window);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == q->ne[2]);
+    GGML_ASSERT((indices && kv && (ratio == 1 || ratio == 2)) || (!indices && !kv && ratio == 0));
+    if (kv) {
+        GGML_ASSERT(kv->type == GGML_TYPE_I8 && ggml_is_matrix(kv) && ggml_is_contiguous_rows(kv));
+        GGML_ASSERT(kv->ne[0] == (int64_t) ggml_row_size(GGML_TYPE_NVFP4, q->ne[0]));
+        GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_matrix(indices) && ggml_is_contiguous_rows(indices) && indices->ne[1] == q->ne[2]);
+    }
+    const int64_t rows = window + (indices ? indices->ne[0] : 0);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, q->ne[0]*rows, q->ne[2]);
+    result->op = GGML_OP_DSV41_ATTN;
+    result->src[0] = q;
+    result->src[1] = raw;
+    result->src[3] = positions;
+    result->src[4] = indices;
+    result->src[5] = kv;
+    ggml_set_op_params_i32(result, 0, window);
+    ggml_set_op_params_i32(result, 1, ratio);
+    ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, 1);
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_attn_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q, struct ggml_tensor * raw, struct ggml_tensor * positions,
+        struct ggml_tensor * indices, struct ggml_tensor * kv, int32_t window, int32_t ratio) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[3] == 1 && ggml_is_contiguous_rows(q));
+    GGML_ASSERT(raw->type == GGML_TYPE_I8 && ggml_is_matrix(raw) && ggml_is_contiguous_rows(raw));
+    GGML_ASSERT(raw->ne[0] == q->ne[0]/32*33 && window > 0 && raw->ne[1] >= window);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && positions->ne[0] == q->ne[2]);
+    GGML_ASSERT((indices && kv && (ratio == 1 || ratio == 2)) || (!indices && !kv && ratio == 0));
+    if (kv) {
+        GGML_ASSERT(kv->type == GGML_TYPE_I8 && ggml_is_matrix(kv) && ggml_is_contiguous_rows(kv));
+        GGML_ASSERT(kv->ne[0] == (int64_t) ggml_row_size(GGML_TYPE_NVFP4, q->ne[0]));
+        GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_matrix(indices) && ggml_is_contiguous_rows(indices) && indices->ne[1] == q->ne[2]);
+    }
+    const int64_t rows = window + (indices ? indices->ne[0] : 0);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, q->ne[2]);
+    result->op = GGML_OP_DSV41_ATTN;
+    result->src[0] = q;
+    result->src[1] = raw;
+    result->src[3] = positions;
+    result->src[4] = indices;
+    result->src[5] = kv;
+    ggml_set_op_params_i32(result, 0, window);
+    ggml_set_op_params_i32(result, 1, ratio);
+    ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, 2);
+    return result;
+}
+
 void ggml_dsv41_attn_set_window_start(struct ggml_tensor * a, int32_t window_start) {
     GGML_ASSERT(a->op == GGML_OP_DSV41_ATTN && window_start >= 0);
     ggml_set_op_params_i32(a, 2, window_start);

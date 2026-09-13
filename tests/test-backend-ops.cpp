@@ -4673,12 +4673,15 @@ struct test_dsv41_attn : public test_case {
     const bool strided;
     const int window_start;
     const int kv_rows;
+    const bool flash;
 
-    test_dsv41_attn(int64_t dim, int64_t tokens, int start, int ratio, bool strided, int window_start = 0, int kv_rows = 1024)
-        : dim(dim), tokens(tokens), start(start), ratio(ratio), strided(strided), window_start(window_start), kv_rows(kv_rows) {}
-    std::string vars() override { return VARS_TO_STR7(dim, tokens, start, ratio, strided, window_start, kv_rows); }
+    test_dsv41_attn(int64_t dim, int64_t tokens, int start, int ratio, bool strided, int window_start = 0, int kv_rows = 1024, bool flash = false)
+        : dim(dim), tokens(tokens), start(start), ratio(ratio), strided(strided), window_start(window_start), kv_rows(kv_rows), flash(flash) {}
+    std::string vars() override {
+        return flash ? VARS_TO_STR8(dim, tokens, start, ratio, strided, window_start, kv_rows, flash) : VARS_TO_STR7(dim, tokens, start, ratio, strided, window_start, kv_rows);
+    }
     // F32 exp differences can cross BF16 rounding boundaries.
-    double max_nmse_err() override { return 1e-8; }
+    double max_nmse_err() override { return flash ? 5e-4 : 1e-8; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t heads = dim == 512 ? 64 : 4;
@@ -4706,9 +4709,26 @@ struct test_dsv41_attn : public test_case {
         positions = ggml_transpose(ctx, positions);
         ggml_set_name(positions, "dsv41_attn_positions");
         if (indices) { ggml_set_name(indices, "dsv41_attn_indices"); }
-        auto * result = ggml_dsv41_attn(ctx, q, raw, sinks, positions, indices, kv, window, ratio);
-        ggml_dsv41_attn_set_window_start(result, window_start);
-        return result;
+        if (!flash) {
+            auto * result = ggml_dsv41_attn(ctx, q, raw, sinks, positions, indices, kv, window, ratio);
+            ggml_dsv41_attn_set_window_start(result, window_start);
+            return result;
+        }
+        GGML_ASSERT(tokens == 1);
+        auto * packed = ggml_dsv41_attn_pack(ctx, q, raw, positions, indices, kv, window, ratio);
+        auto * mask = ggml_dsv41_attn_mask(ctx, q, raw, positions, indices, kv, window, ratio);
+        ggml_dsv41_attn_set_window_start(packed, window_start);
+        ggml_dsv41_attn_set_window_start(mask, window_start);
+        const int64_t rows = window + (indices ? indices->ne[0] : 0);
+        auto * key = ggml_view_4d(ctx, packed, dim, rows, 1, tokens,
+                dim*sizeof(ggml_bf16_t), dim*rows*sizeof(ggml_bf16_t), packed->nb[1], 0);
+        mask = ggml_reshape_4d(ctx, mask, rows, 1, 1, tokens);
+        auto * query = ggml_view_4d(ctx, q, dim, heads, 1, tokens, q->nb[1], q->nb[2], q->nb[2], 0);
+        auto * result = ggml_flash_attn_ext(ctx, query, key, key, mask, 1.0f/std::sqrt(float(dim)), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks_rows(result, sinks);
+        ggml_prec_set_acc(result, GGML_PREC_F32);
+        result = ggml_dsv41_act_quant(ctx, result, GGML_DSV41_QUANT_BF16);
+        return ggml_reshape_3d(ctx, result, dim, heads, tokens);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -10281,6 +10301,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_dsv41_attn(512, 4, 1285, ratio, strided, 1286));
         }
     }
+    test_cases.emplace_back(new test_dsv41_attn(512, 1, 0, 0, false, 0, 1024, true));
+    test_cases.emplace_back(new test_dsv41_attn(512, 1, 3, 1, true, 0, 1024, true));
+    test_cases.emplace_back(new test_dsv41_attn(512, 1, 30000, 2, false, 0, 32768, true));
+    test_cases.emplace_back(new test_dsv41_attn(512, 1, 1285, 1, false, 1286, 1024, true));
     for (int64_t dim : { 64, 128, 512 }) {
         for (bool inverse : { false, true }) {
             test_cases.emplace_back(new test_dsv41_rope(dim, 1, 1, false, inverse));
