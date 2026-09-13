@@ -1381,6 +1381,15 @@ typedef struct {
 } ggml_metal_kargs_dsv41_act_quant;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  n_tokens;
+    uint64_t nb_e1;
+    uint64_t nb_e2;
+    uint64_t nb_s1;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv41_moe_combine;
+
+typedef struct {
     int32_t  dim;
     int32_t  hc;
     int32_t  n_rows;

@@ -724,6 +724,38 @@ static float dsv41_round_bf16(float x) {
     return as_type<float>(bits & 0xffff0000);
 }
 
+static float4 dsv41_round_bf16(float4 x) {
+    return float4(dsv41_round_bf16(x.x), dsv41_round_bf16(x.y), dsv41_round_bf16(x.z), dsv41_round_bf16(x.w));
+}
+
+kernel void kernel_dsv41_moe_combine_f32(
+        constant ggml_metal_kargs_dsv41_moe_combine & args,
+        device const char * experts,
+        device const char * shared,
+        device char * dst,
+        uint2 i[[thread_position_in_grid]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    if (i.x >= (uint) args.ne0 || i.y >= (uint) args.n_tokens) {
+        return;
+    }
+
+    experts += i.y*args.nb_e2;
+    const device float4 * e0 = (device const float4 *) (experts + 0*args.nb_e1);
+    const device float4 * e1 = (device const float4 *) (experts + 1*args.nb_e1);
+    const device float4 * e2 = (device const float4 *) (experts + 2*args.nb_e1);
+    const device float4 * e3 = (device const float4 *) (experts + 3*args.nb_e1);
+    const device float4 * e4 = (device const float4 *) (experts + 4*args.nb_e1);
+    const device float4 * e5 = (device const float4 *) (experts + 5*args.nb_e1);
+    float4 sum = dsv41_round_bf16(e0[i.x]) + dsv41_round_bf16(e1[i.x]);
+    sum = sum + dsv41_round_bf16(e2[i.x]);
+    sum = sum + dsv41_round_bf16(e3[i.x]);
+    sum = sum + dsv41_round_bf16(e4[i.x]);
+    sum = sum + dsv41_round_bf16(e5[i.x]);
+    const float4 addend = *(device const float4 *) (shared + i.y*args.nb_s1 + i.x*sizeof(float4));
+    *(device float4 *) (dst + i.y*args.nb_d1 + i.x*sizeof(float4)) = dsv41_round_bf16(sum + addend);
+}
+
 static float dsv41_index_score(
         constant ggml_metal_kargs_dsv41_index_scores & args,
         device const char * q, device const char * keys, device const char * weights,

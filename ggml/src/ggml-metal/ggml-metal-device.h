@@ -143,6 +143,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_a
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add  (ggml_metal_library_t lib, bool residual_first);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm  (ggml_metal_library_t lib, bool bf16);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack  (ggml_metal_library_t lib, enum ggml_type type);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_moe_combine (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_combine       (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weights       (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qwen4exp_hc_reduce (ggml_metal_library_t lib);

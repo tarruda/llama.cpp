@@ -1755,6 +1755,41 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_dsv41_act_quant(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && fusion->id == GGML_METAL_FUSION_DSV41_MOE_COMBINE) {
+            const ggml_tensor * experts = op->src[0];
+            const ggml_tensor * dst = ctx->node(idx + n - 1);
+            const ggml_tensor * shared = dst->src[0]->src[1];
+            ggml_metal_kargs_dsv41_moe_combine args = {
+                /*.ne0      =*/ (int32_t) dst->ne[0]/4,
+                /*.n_tokens =*/ (int32_t) dst->ne[1],
+                /*.nb_e1    =*/ experts->nb[1],
+                /*.nb_e2    =*/ experts->nb[2],
+                /*.nb_s1    =*/ shared->nb[1],
+                /*.nb_d1    =*/ dst->nb[1],
+            };
+
+            ggml_metal_encoder_t enc = ctx->enc;
+            auto pipeline = ggml_metal_library_get_pipeline_dsv41_moe_combine(ctx->lib);
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(experts), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(shared),  2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dst),     3);
+
+            const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+            ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, args.n_tokens, 1, nth, 1, 1);
+            ctx->count_fusions(fusion);
+            if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+                GGML_LOG_DEBUG("%s: fuse: DSV41_ACT_QUANT + ADD x 6 + DSV41_ACT_QUANT\n", __func__);
+            }
+            return n;
+        }
+    }
+
     const ggml_tensor * x = op->src[0];
     const auto type = (ggml_dsv41_quant_type) ggml_get_op_params_i32(op, 0);
 

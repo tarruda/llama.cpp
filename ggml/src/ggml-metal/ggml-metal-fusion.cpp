@@ -24,6 +24,21 @@ static bool ggml_metal_fusion_same_buffer(const ggml_tensor * a, const ggml_tens
     return ggml_metal_buffer_get_id(ca, a).metal == ggml_metal_buffer_get_id(cb, b).metal;
 }
 
+static bool ggml_metal_fusion_same_location(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b) {
+        return false;
+    }
+
+    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
+    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
+    ggml_metal_buffer_t ca = (ggml_metal_buffer_t) ba->context;
+    ggml_metal_buffer_t cb = (ggml_metal_buffer_t) bb->context;
+    const ggml_metal_buffer_id ia = ggml_metal_buffer_get_id(ca, a);
+    const ggml_metal_buffer_id ib = ggml_metal_buffer_get_id(cb, b);
+
+    return ia.metal == ib.metal && ia.offs == ib.offs;
+}
+
 // ---- pattern checks ------------------------------------------------------
 
 // NORM/RMS_NORM + MUL + ADD: the weight/bias of each fused step must match the norm input
@@ -533,7 +548,74 @@ static bool ggml_metal_fusion_check_dsv41_swiglu_mxfp8(
            nodes[0]->ne[0] % 32 == 0 && ggml_are_same_layout(nodes[0], nodes[1]) && ggml_is_contiguous(nodes[1]);
 }
 
+static bool ggml_metal_dsv41_moe_view_matches(
+        const ggml_tensor * view,
+        const ggml_tensor * experts,
+        int i_expert,
+        int64_t n_embd,
+        int64_t n_tokens) {
+    return view && view->op == GGML_OP_VIEW && view->view_src == experts &&
+        view->view_offs == (size_t) i_expert*experts->nb[1] && view->type == GGML_TYPE_F32 &&
+        view->ne[0] == n_embd && view->ne[1] == n_tokens && view->ne[2] == 1 && view->ne[3] == 1 &&
+        view->nb[0] == sizeof(float) && view->nb[1] == experts->nb[2] && ggml_is_contiguous_rows(view);
+}
+
+static bool ggml_metal_fusion_check_dsv41_moe_combine(
+        const ggml_metal_fusion *, const ggml_cgraph *, const int *,
+        const ggml_tensor * const * nodes, ggml_metal_fusion_mode mode) {
+    const ggml_tensor * rounded = nodes[0];
+    const ggml_tensor * down = rounded->src[0];
+    if (!down || down->op != GGML_OP_MUL_MAT_ID || down->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(rounded, 0) != GGML_DSV41_QUANT_BF16 || rounded->type != GGML_TYPE_F32 ||
+        down->ne[0] <= 0 || down->ne[0] % 4 != 0 || down->ne[1] != 6 || down->ne[2] <= 0 || down->ne[2] > 2 || down->ne[3] != 1 ||
+        !ggml_are_same_layout(down, rounded) || !ggml_is_contiguous(down)) {
+        return false;
+    }
+
+    const int64_t n_embd = down->ne[0];
+    const int64_t n_tokens = down->ne[2];
+    const ggml_tensor * previous = nullptr;
+    for (int i = 1; i <= 5; ++i) {
+        const ggml_tensor * add = nodes[i];
+        if (add->type != GGML_TYPE_F32 || add->ne[0] != n_embd || add->ne[1] != n_tokens || add->ne[2] != 1 || add->ne[3] != 1) {
+            return false;
+        }
+        if (i == 1) {
+            if (!ggml_metal_dsv41_moe_view_matches(add->src[0], rounded, 0, n_embd, n_tokens) ||
+                !ggml_metal_dsv41_moe_view_matches(add->src[1], rounded, 1, n_embd, n_tokens)) {
+                return false;
+            }
+        } else if (add->src[0] != previous || !ggml_metal_dsv41_moe_view_matches(add->src[1], rounded, i, n_embd, n_tokens)) {
+            return false;
+        }
+        previous = add;
+    }
+
+    const ggml_tensor * add_shared = nodes[6];
+    const ggml_tensor * shared = add_shared->src[1];
+    const ggml_tensor * dst = nodes[7];
+    if (add_shared->src[0] != previous || !shared || shared->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(shared, add_shared) || !ggml_is_contiguous(shared) ||
+        dst->src[0] != add_shared || dst->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(dst, 0) != GGML_DSV41_QUANT_BF16 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if ((ggml_metal_tensors_overlap(down, dst) && (n_tokens > 1 || !ggml_metal_fusion_same_location(down, dst))) ||
+            (ggml_metal_tensors_overlap(shared, dst) && !ggml_metal_fusion_same_location(shared, dst))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static const ggml_op ops_dsv41_swiglu_mxfp8[] = { GGML_OP_DSV41_SWIGLU, GGML_OP_DSV41_ACT_QUANT };
+static const ggml_op ops_dsv41_moe_combine[] = {
+    GGML_OP_DSV41_ACT_QUANT,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_DSV41_ACT_QUANT,
+};
 static const ggml_op ops_scale_silu[] = { GGML_OP_SCALE, GGML_OP_UNARY };
 static const ggml_op ops_sigmoid_scale[] = { GGML_OP_UNARY, GGML_OP_SCALE };
 static const ggml_op ops_softplus_sqrt[] = { GGML_OP_UNARY, GGML_OP_SQRT };
@@ -571,6 +653,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_DSV41_HC_PRE_NORM, ops_dsv41_hc_pre_norm, 5, GGML_METAL_FUSION_CHAIN, ggml_metal_fusion_check_dsv4_hc_pre_norm },
     { GGML_METAL_FUSION_DSV4_HC_PRE_NORM, ops_dsv4_hc_pre_norm, 3, GGML_METAL_FUSION_CHAIN, ggml_metal_fusion_check_dsv4_hc_pre_norm },
     { GGML_METAL_FUSION_DSV41_SWIGLU_MXFP8, ops_dsv41_swiglu_mxfp8, 2, GGML_METAL_FUSION_CHAIN, ggml_metal_fusion_check_dsv41_swiglu_mxfp8 },
+    { GGML_METAL_FUSION_DSV41_MOE_COMBINE, ops_dsv41_moe_combine, 8, GGML_METAL_FUSION_SUBGRAPH, ggml_metal_fusion_check_dsv41_moe_combine },
 
     { GGML_METAL_FUSION_SCALE_SILU, ops_scale_silu, 2, GGML_METAL_FUSION_CHAIN, ggml_metal_fusion_check_unary },
     { GGML_METAL_FUSION_SIGMOID_SCALE, ops_sigmoid_scale, 2, GGML_METAL_FUSION_CHAIN, ggml_metal_fusion_check_unary },
