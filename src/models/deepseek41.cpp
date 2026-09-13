@@ -336,6 +336,11 @@ public:
             pos[it] = replay ? memory->tokens.size() - n_tokens + it : ubatch->pos[it];
         }
         if (positions) { ggml_backend_tensor_set(positions, pos.data(), 0, pos.size()*sizeof(int32_t)); }
+        if (modalities) {
+            std::vector<int32_t> values(n_tokens);
+            for (int64_t it = 0; it < n_tokens; ++it) { values[it] = memory->tokens.at(pos[it]) == LLAMA_TOKEN_NULL; }
+            ggml_backend_tensor_set(modalities, values.data(), 0, values.size()*sizeof(int32_t));
+        }
         const int32_t window_start = replay ? pos[0] : memory->decoder_start;
         for (auto * attention : decoder_attention) { ggml_dsv41_attn_set_window_start(attention, window_start); }
         for (int ratio = 0; ratio < 3; ++ratio) {
@@ -459,6 +464,7 @@ public:
     std::array<std::vector<float>, 2> frequencies;
     std::array<ggml_tensor *, 3> rotations = {};
     std::array<ggml_tensor *, 3> cache_rows = {};
+    ggml_tensor * modalities = nullptr;
     std::vector<ggml_tensor *> engram;
     bool async_engram = false;
     std::vector<std::unique_ptr<dsv41_engram_read>> engram_reads;
@@ -718,6 +724,8 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
                     ggml_set_input(positions);
                     auto * rows = input->cache_rows[0] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
                     ggml_set_input(rows);
+                    input->modalities = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+                    ggml_set_input(input->modalities);
                     x = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, hidden, rows), n_embd, hc, tokens);
                     pre = ggml_get_rows(ctx0, mixes, rows);
                     cb(x, "dsv41_encoder_tail", split);
@@ -743,7 +751,7 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
             const auto ffn_mix = mix(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il, true);
             cur = norm(bf16(ggml_dsv4_hc_pre(ctx0, x, attn_mix.pre)), layer.ffn_norm);
             cb(cur, "dsv41_ffn_norm", il);
-            cur = moe(cur, il);
+            cur = moe(cur, il, input->modalities);
             x = hc_post(cur, x, ffn_mix);
             cb(x, "dsv41_layer", il);
             pre = ffn_mix.pre;
@@ -821,11 +829,16 @@ ggml_tensor * llama_model_deepseek41::graph::hc_post(ggml_tensor * x, ggml_tenso
     return result;
 }
 
-ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const {
+ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il, ggml_tensor * modalities) const {
     const auto & layer = model.layers[il];
     const int64_t used = hparams.n_expert_used(il);
     auto * scores = ggml_sqrt(ctx0, ggml_softplus(ctx0, mm_f32(layer.ffn_gate_inp, x)));
-    auto * bias = ubatch.embd && layer.ffn_exp_probs_b_vl ? layer.ffn_exp_probs_b_vl : layer.ffn_exp_probs_b;
+    ggml_tensor * bias = ubatch.embd && layer.ffn_exp_probs_b_vl ? layer.ffn_exp_probs_b_vl : layer.ffn_exp_probs_b;
+    if (modalities && layer.ffn_exp_probs_b_vl) {
+        auto * text = ggml_reshape_2d(ctx0, layer.ffn_exp_probs_b, n_expert, 1);
+        auto * vision = ggml_reshape_2d(ctx0, layer.ffn_exp_probs_b_vl, n_expert, 1);
+        bias = ggml_get_rows(ctx0, ggml_concat(ctx0, text, vision, 1), modalities);
+    }
     auto * ids = ggml_top_k(ctx0, ggml_add(ctx0, scores, bias), used);
     cb(ids, "dsv41_expert_ids", il);
     auto * weights = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_expert, tokens), ids);

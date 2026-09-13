@@ -747,7 +747,7 @@ struct server_slot {
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, bool prefill) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
@@ -768,7 +768,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
-                res = mtmd_helper_decode_image_chunk(
+                const auto process = prefill ? mtmd_helper_prefill_image_chunk : mtmd_helper_decode_image_chunk;
+                res = process(
                     mctx,
                     slot.ctx_tgt,
                     chunk.get(),
@@ -1031,7 +1032,7 @@ private:
         const bool has_spec = has_draft || spec_mtp;
 
         const bool has_block_draft = has_draft && std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
-        const bool can_prefill_ced = !(params_base.n_parallel != 1 || params_base.embedding || has_mmproj || (has_spec && !has_block_draft) ||
+        const bool can_prefill_ced = !(params_base.n_parallel != 1 || params_base.embedding || (has_spec && !has_block_draft) ||
                  params_base.speculative.has_synth() || std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                          [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; }));
         if (params_base.prefill_mode == COMMON_PREFILL_MODE_AUTO) {
@@ -3513,7 +3514,8 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            llama_set_moe_phase(ctx_tgt, LLAMA_MOE_PHASE_PREFILL);
+                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, params_base.prefill_mode == COMMON_PREFILL_MODE_CED);
                         });
 
                         if (res != 0) {

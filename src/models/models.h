@@ -1202,7 +1202,7 @@ struct llama_model_deepseek41 : public llama_model_base {
         ggml_tensor * mm_f32(ggml_tensor * weight, ggml_tensor * x) const;
         hc_mixes mix(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * scale, ggml_tensor * base, int il, bool ffn) const;
         ggml_tensor * hc_post(ggml_tensor * x, ggml_tensor * residual, const hc_mixes & mix) const;
-        ggml_tensor * moe(ggml_tensor * x, int il) const;
+        ggml_tensor * moe(ggml_tensor * x, int il, ggml_tensor * modalities = nullptr) const;
     };
 
     struct {

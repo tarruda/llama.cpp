@@ -1773,7 +1773,7 @@ int llama_context::decode(const llama_batch & batch_inp, bool prefill) {
     auto * dsv41_memory = dynamic_cast<llama_memory_dsv41 *>(memory.get());
     const bool ced = prefill && dsv41_memory;
     if (dsv41_memory) { dsv41_memory->prefill = ced; }
-    if (ced && (batch_inp.embd || cparams.embeddings || cparams.embeddings_nextn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT)) {
+    if (ced && (cparams.embeddings || cparams.embeddings_nextn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT)) {
         LLAMA_LOG_ERROR("%s: CED prefill requires a text generation context\n", __func__);
         return -1;
     }
