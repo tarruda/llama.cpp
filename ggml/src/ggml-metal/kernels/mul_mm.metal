@@ -369,13 +369,15 @@ kernel void kernel_mul_mm_id_map0(
         device        char * htpe,
         device        char * hids,
         threadgroup   char * shmem [[threadgroup(0)]],
-        ushort tpitg[[thread_position_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
-    const short ide = tpitg; // expert id
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    const int ide = tgpig*ntg + tpitg; // expert id
+    const bool active = ide < args.ne02;
 
     uint32_t n_all = 0;
 
-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+    device int32_t * ids_i32 = active ? (device int32_t *) hids + ide*args.ne21 : nullptr;
 
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
         if (i21 + tpitg < args.ne21) {
@@ -404,16 +406,20 @@ kernel void kernel_mul_mm_id_map0(
                 sel += (sids[i20] == ide)*(i20 + 1);
             }
 
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+            if (active) {
+                ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+            }
 
-            n_all += sel > 0;
+            n_all += active && sel > 0;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+    if (active) {
+        device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+        tpe_u32[ide] = n_all;
+    }
 }
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;

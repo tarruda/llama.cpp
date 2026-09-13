@@ -1327,9 +1327,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.nr0  = use_parallel ? 256 : ne02;
-    res.nr1  = use_parallel ? ne02 : 1;
-    res.smem = use_parallel ? 0 : GGML_PAD((size_t) ne02*ne20*sizeof(uint16_t), 16);
+    const bool split_experts = !use_parallel && ne02 > 1024;
+    res.nr0  = use_parallel || split_experts ? 256 : ne02;
+    res.nr1  = use_parallel ? ne02 : (ne02 + res.nr0 - 1)/res.nr0;
+    res.smem = use_parallel ? 0 : GGML_PAD((size_t) res.nr0*ne20*sizeof(uint16_t), 16);
 
     return res;
 }

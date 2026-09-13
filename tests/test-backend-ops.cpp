@@ -11475,6 +11475,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 255, 10, false, 64, 256, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 256, 10, false, 64, 255, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 256, 10, false, 64, 256, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1025, 6, false, 8, 32, 64));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, false, 64, 512, 64));
     }
