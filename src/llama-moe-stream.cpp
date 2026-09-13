@@ -321,33 +321,47 @@ struct llama_moe_stream::impl {
         if (global_cache && std::any_of(layers.begin(), layers.end(), [=](const layer & l) { return l.expert_bytes != expert_bytes; })) {
             throw std::runtime_error("adaptive MoE caching requires equal expert sizes in every layer");
         }
+        const uint64_t available_slots = std::min(total_experts, budget/expert_bytes);
+        const bool profile_mode = params.moe_profile && params.moe_profile[0];
+        const int resident_layers = global_cache && !profile_mode && !params.moe_pin_encoder &&
+                params.moe_pin_count == 0 && layers.size() > 19 && available_slots >= 12*(uint64_t) n_expert ? 4 : 0;
+        if (resident_layers) {
+            static constexpr int order[] = { 0, 1, 19, 2 };
+            for (int i = 0; i < resident_layers; ++i) { layers[order[i]].fully_resident = true; }
+        }
+        const uint64_t resident_bytes = (uint64_t) resident_layers*n_expert*expert_bytes;
         uint64_t minimum = 0, pinned_bytes = 0;
         size_t total_pins = 0;
         std::array<size_t, 3> phase_pin_counts = {};
         for (auto & l : layers) {
             const int pins = std::count(l.pinned.begin(), l.pinned.end(), true);
-            total_pins += pins;
-            pinned_bytes += pins*l.expert_bytes;
+            if (!l.fully_resident) {
+                total_pins += pins;
+                pinned_bytes += pins*l.expert_bytes;
+            }
             int max_pins = pins;
             for (size_t p = 0; p < l.phase_pins.size(); ++p) {
                 const int count = std::count(l.phase_pins[p].begin(), l.phase_pins[p].end(), true);
-                phase_pin_counts[p] += count;
+                if (!l.fully_resident) { phase_pin_counts[p] += count; }
                 max_pins = std::max(max_pins, count);
             }
-            l.n_slots = std::min(n_expert, max_pins + 1);
+            l.n_slots = l.fully_resident ? n_expert : std::min(n_expert, max_pins + 1);
             minimum += l.n_slots*l.expert_bytes;
         }
         if (global_cache) {
             const uint64_t max_pins = *std::max_element(phase_pin_counts.begin(), phase_pin_counts.end());
-            minimum = (max_pins + (max_pins < total_experts))*expert_bytes;
+            const uint64_t resident_experts = resident_bytes/expert_bytes;
+            const uint64_t streamed_experts = total_experts - resident_experts;
+            minimum = (resident_experts + max_pins + (max_pins < streamed_experts))*expert_bytes;
         }
         if (budget < minimum) {
             throw std::runtime_error(format("MoE cache requires at least %.2f MiB for requested pins and dynamic slots; budget is %.2f MiB", minimum/1048576.0, budget/1048576.0));
         }
         uint64_t allocated = 0;
         if (global_cache) {
-            global_n_slots = std::min(total_experts, budget/expert_bytes);
-            allocated = global_n_slots*expert_bytes;
+            const uint64_t resident_experts = resident_bytes/expert_bytes;
+            global_n_slots = std::min(total_experts - resident_experts, budget/expert_bytes - resident_experts);
+            allocated = (global_n_slots + resident_experts)*expert_bytes;
             global_slot_to_layer.assign(global_n_slots, -1);
             global_slot_to_expert.assign(global_n_slots, -1);
             global_valid_projections.assign(global_n_slots, 0);
@@ -367,9 +381,9 @@ struct llama_moe_stream::impl {
             }
         }
         for (auto & l : layers) {
-            l.fully_resident = !global_cache && l.n_slots == n_expert;
+            if (!global_cache) { l.fully_resident = l.n_slots == n_expert; }
             l.expert_to_slot.assign(n_expert, -1);
-            if (!global_cache) {
+            if (!uses_global(l)) {
                 l.slot_to_expert.assign(l.n_slots, -1);
                 l.valid_projections.assign(l.n_slots, 0);
                 l.age.assign(l.n_slots, 0);
@@ -380,8 +394,13 @@ struct llama_moe_stream::impl {
             throw std::runtime_error("LLAMA_MOE_PREFILL_HOT is not supported by the global adaptive cache");
         }
         LLAMA_LOG_INFO("moe_stream: %s cache policy%s\n", adaptive ? "adaptive" : "lru", global_cache ? " with a global slot pool" : "");
-        LLAMA_LOG_INFO("moe_stream: %zu pins (%d encoder preset), %.2f MiB pinned, %.2f MiB dynamic, %.2f MiB total routed cache, %d read threads\n",
-                total_pins, encoder_pins, pinned_bytes/1048576.0, (allocated - pinned_bytes)/1048576.0, allocated/1048576.0, n_readers);
+        LLAMA_LOG_INFO("moe_stream: %zu pins (%d encoder preset), %d resident layers, %.2f MiB resident, %.2f MiB pinned, %.2f MiB dynamic, %.2f MiB total routed cache, %d read threads\n",
+                total_pins, encoder_pins, resident_layers, resident_bytes/1048576.0, pinned_bytes/1048576.0,
+                (allocated - resident_bytes - pinned_bytes)/1048576.0, allocated/1048576.0, n_readers);
+    }
+
+    bool uses_global(const layer & l) const {
+        return global_cache && !l.fully_resident;
     }
 
     struct expert_load {
@@ -418,19 +437,19 @@ struct llama_moe_stream::impl {
 
     size_t count_pins() const {
         size_t count = 0;
-        for (const auto & l : layers) { count += std::count(l.pinned.begin(), l.pinned.end(), true); }
+        for (const auto & l : layers) { if (!l.fully_resident) { count += std::count(l.pinned.begin(), l.pinned.end(), true); } }
         return count;
     }
 
     size_t count_phase_pins(llama_moe_phase selected) const {
         size_t count = 0;
-        for (const auto & l : layers) { count += std::count(l.phase_pins[selected].begin(), l.phase_pins[selected].end(), true); }
+        for (const auto & l : layers) { if (!l.fully_resident) { count += std::count(l.phase_pins[selected].begin(), l.phase_pins[selected].end(), true); } }
         return count;
     }
 
     uint64_t expert_age(const layer & l, int expert) const {
         const int slot = l.expert_to_slot[expert];
-        return slot < 0 ? 0 : global_cache ? global_age[slot] : l.age[slot];
+        return slot < 0 ? 0 : uses_global(l) ? global_age[slot] : l.age[slot];
     }
 
     void select_layer_phase_pins(layer & l) {
@@ -461,6 +480,7 @@ struct llama_moe_stream::impl {
         std::vector<ranked_expert> hot;
         for (size_t il = 0; il < layers.size(); ++il) {
             const auto & l = layers[il];
+            if (l.fully_resident) { continue; }
             for (int e = 0; e < n_expert; ++e) {
                 if (!l.pinned[e] && l.expert_to_slot[e] >= 0 && l.frequency[LLAMA_MOE_PHASE_DECODE][e] > 0) { hot.push_back({(int) il, e}); }
             }
@@ -495,6 +515,7 @@ struct llama_moe_stream::impl {
             std::vector<ranked_expert> candidates;
             for (size_t il = 0; il < layers.size(); ++il) {
                 auto & candidate_layer = layers[il];
+                if (candidate_layer.fully_resident) { continue; }
                 const auto & permanent = candidate_layer.phase_pins[phase];
                 for (int e = 0; e < n_expert; ++e) {
                     if (candidate_layer.pinned[e] && !permanent[e] && (&candidate_layer != &l || !required[e])) {
@@ -567,7 +588,7 @@ struct llama_moe_stream::impl {
     bool expert_resident(const layer & l, int expert) const {
         const int slot = l.expert_to_slot[expert];
         if (slot < 0) { return false; }
-        return (global_cache ? global_valid_projections[slot] : l.valid_projections[slot]) == 7;
+        return (uses_global(l) ? global_valid_projections[slot] : l.valid_projections[slot]) == 7;
     }
 
     void set_decode_mask(decode_graph & decode, uint32_t mask) const {
@@ -687,7 +708,7 @@ struct llama_moe_stream::impl {
                     {"bytes", batch.bytes}, {"span_us", now - batch.start}, {"wait_us", wait}, {"prefetch", batch.prefetch}}).dump() << '\n';
         }
         for (const auto & load : batch.loads) {
-            if (global_cache) {
+            if (uses_global(l)) {
                 global_valid_projections[load.slot] |= load.projections;
                 global_age[load.slot] = ++tick;
             } else {
@@ -699,7 +720,8 @@ struct llama_moe_stream::impl {
 
     void acquire(layer & l, const std::vector<int32_t> & experts, uint8_t projections = 7, bool prefetch = false) {
         const int il = &l - layers.data();
-        const int64_t n_slots = global_cache ? global_n_slots : l.n_slots;
+        const bool shared = uses_global(l);
+        const int64_t n_slots = shared ? global_n_slots : l.n_slots;
         std::vector<bool> protect(n_expert, false);
         for (int32_t e : experts) { protect[e] = true; }
         std::vector<expert_load> loads;
@@ -708,9 +730,9 @@ struct llama_moe_stream::impl {
             const int current = l.expert_to_slot[e];
             const uint8_t wanted = l.pinned[e] ? 7 : projections;
             if (current >= 0) {
-                if (global_cache) { global_age[current] = ++tick; }
+                if (shared) { global_age[current] = ++tick; }
                 else { l.age[current] = ++tick; }
-                const uint8_t valid = global_cache ? global_valid_projections[current] : l.valid_projections[current];
+                const uint8_t valid = shared ? global_valid_projections[current] : l.valid_projections[current];
                 const uint8_t missing = wanted & ~valid;
                 if (missing) {
                     loads.push_back({e, current, missing});
@@ -724,24 +746,24 @@ struct llama_moe_stream::impl {
             }
             int victim = -1;
             for (int slot = 0; slot < n_slots; ++slot) {
-                const int old_layer = global_cache ? global_slot_to_layer[slot] : il;
-                const int old = global_cache ? global_slot_to_expert[slot] : l.slot_to_expert[slot];
+                const int old_layer = shared ? global_slot_to_layer[slot] : il;
+                const int old = shared ? global_slot_to_expert[slot] : l.slot_to_expert[slot];
                 if (reserved[slot] || (old >= 0 && (layers[old_layer].pinned[old] || (old_layer == il && protect[old])))) { continue; }
-                const int previous_layer = victim < 0 ? -1 : global_cache ? global_slot_to_layer[victim] : il;
-                const int previous = victim < 0 ? -1 : global_cache ? global_slot_to_expert[victim] : l.slot_to_expert[victim];
+                const int previous_layer = victim < 0 ? -1 : shared ? global_slot_to_layer[victim] : il;
+                const int previous = victim < 0 ? -1 : shared ? global_slot_to_expert[victim] : l.slot_to_expert[victim];
                 if (victim < 0 || old < 0 || (previous >= 0 && (
                         adaptive && layers[old_layer].frequency[phase][old] != layers[previous_layer].frequency[phase][previous] ?
                         layers[old_layer].frequency[phase][old] < layers[previous_layer].frequency[phase][previous] :
-                        (global_cache ? global_age[slot] < global_age[victim] : l.age[slot] < l.age[victim])))) {
+                        (shared ? global_age[slot] < global_age[victim] : l.age[slot] < l.age[victim])))) {
                     victim = slot;
                 }
                 if (old < 0) { break; }
             }
             if (victim < 0) { throw std::runtime_error("MoE expert group exceeds available cache slots"); }
-            const int old_layer = global_cache ? global_slot_to_layer[victim] : il;
-            const int old = global_cache ? global_slot_to_expert[victim] : l.slot_to_expert[victim];
+            const int old_layer = shared ? global_slot_to_layer[victim] : il;
+            const int old = shared ? global_slot_to_expert[victim] : l.slot_to_expert[victim];
             if (old >= 0) { layers[old_layer].expert_to_slot[old] = -1; ++evictions; ++phase_stats[phase].evictions; }
-            if (global_cache) {
+            if (shared) {
                 global_slot_to_layer[victim] = -1;
                 global_slot_to_expert[victim] = -1;
                 global_valid_projections[victim] = 0;
@@ -756,7 +778,7 @@ struct llama_moe_stream::impl {
         }
         for (const auto & load : loads) {
             l.expert_to_slot[load.expert] = load.slot;
-            if (global_cache) {
+            if (shared) {
                 global_slot_to_layer[load.slot] = il;
                 global_slot_to_expert[load.slot] = load.expert;
             } else {
@@ -955,7 +977,9 @@ llama_moe_stream::~llama_moe_stream() { synchronize(); print_stats(); }
 
 int64_t llama_moe_stream::slots(const char * name) const {
     const auto it = pimpl->names.find(name);
-    return it == pimpl->names.end() ? 0 : pimpl->global_cache ? 1 : pimpl->layers[it->second.first].n_slots;
+    if (it == pimpl->names.end()) { return 0; }
+    const auto & l = pimpl->layers[it->second.first];
+    return pimpl->uses_global(l) ? 1 : l.n_slots;
 }
 
 void llama_moe_stream::bind(ggml_tensor * tensor) {
@@ -975,9 +999,11 @@ bool llama_moe_stream::load(llama_files & files) {
         const ggml_init_params params = { 4*ggml_tensor_overhead(), nullptr, true };
         pimpl->global_cache_ctx.reset(ggml_init(params));
         if (!pimpl->global_cache_ctx) { throw std::runtime_error("failed to create global MoE cache context"); }
-        auto * buft = ggml_backend_buffer_get_type(pimpl->layers.front().projections.front().cache->buffer);
+        const auto dynamic = std::find_if(pimpl->layers.begin(), pimpl->layers.end(), [&](const auto & l) { return pimpl->uses_global(l); });
+        GGML_ASSERT(dynamic != pimpl->layers.end());
+        auto * buft = ggml_backend_buffer_get_type(dynamic->projections.front().cache->buffer);
         for (size_t p = 0; p < pimpl->global_cache_tensors.size(); ++p) {
-            const auto * base = pimpl->layers.front().projections[p].cache;
+            const auto * base = dynamic->projections[p].cache;
             auto * tensor = ggml_dup_tensor(pimpl->global_cache_ctx.get(), base);
             tensor->ne[2] = pimpl->global_n_slots;
             tensor->nb[3] = tensor->ne[2]*tensor->nb[2];
@@ -995,6 +1021,7 @@ bool llama_moe_stream::load(llama_files & files) {
         if (!pimpl->global_cache_buffer) { throw std::runtime_error("failed to allocate global MoE cache"); }
         ggml_backend_buffer_set_usage(pimpl->global_cache_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         for (auto & l : pimpl->layers) {
+            if (!pimpl->uses_global(l)) { continue; }
             for (size_t p = 0; p < l.projections.size(); ++p) {
                 auto * cache = l.projections[p].cache;
                 const auto * global = pimpl->global_cache_tensors[p];
