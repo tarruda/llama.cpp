@@ -1315,7 +1315,7 @@ kernel void kernel_dsv41_attn_pack(
         device const char * positions,
         device const char * indices,
         device const char * kv,
-        device ushort * dst,
+        device half * dst,
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -1334,10 +1334,10 @@ kernel void kernel_dsv41_attn_pack(
         if (id < 0 || id >= args.n_kv || id >= (long(pos) + 1)/args.ratio) { id = -1; }
     }
     device const uchar * input = (device const uchar *) ((is_raw ? raw : kv) + max(id, 0)*(is_raw ? args.nb_r1 : args.nb_k1));
-    device ushort * out = dst + (it*rows + row)*args.dim;
+    device half * out = dst + (it*rows + row)*args.dim;
     for (int j = tiisg; j < args.dim; j += 32) {
         const float value = id >= 0 ? dsv41_attn_value(input, j, is_raw) : 0;
-        out[j] = ushort(as_type<uint>(dsv41_round_bf16(value)) >> 16);
+        out[j] = half(value);
     }
 }
 
@@ -1959,6 +1959,9 @@ kernel void kernel_dsv4_hc_post_f32_impl(
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         if (residual_first) {
             result[idst] = xv*post_reg[idst] + result[idst];
+        }
+        if (args.output_bf16) {
+            result[idst] = dsv41_round_bf16(result[idst]);
         }
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }

@@ -616,9 +616,9 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
                 input->decoder_attention.push_back(mask);
             }
             mask = ggml_reshape_4d(ctx0, mask, rows, 1, 1, tokens);
-            auto * q_fa = ggml_reshape_4d(ctx0, q, dim, heads, 1, tokens);
+            auto * q_fa = ggml_reshape_4d(ctx0, q, dim, 1, heads, tokens);
             out = ggml_flash_attn_ext(ctx0, q_fa, k, k, mask, 1.0f/std::sqrt(float(dim)), 0.0f, 0.0f);
-            ggml_flash_attn_ext_add_sinks_rows(out, layer.attn_sinks);
+            ggml_flash_attn_ext_add_sinks(out, layer.attn_sinks);
             ggml_prec_set_acc(out, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out, il});
             out = bf16(ggml_reshape_3d(ctx0, out, dim, heads, tokens));
@@ -815,7 +815,9 @@ llama_model_deepseek41::graph::hc_mixes llama_model_deepseek41::graph::mix(ggml_
 }
 
 ggml_tensor * llama_model_deepseek41::graph::hc_post(ggml_tensor * x, ggml_tensor * residual, const hc_mixes & mix) const {
-    return bf16(ggml_dsv4_hc_post_ext(ctx0, x, residual, mix.post, mix.comb, true));
+    auto * result = ggml_dsv4_hc_post_ext(ctx0, x, residual, mix.post, mix.comb, true);
+    ggml_dsv4_hc_post_set_bf16(result);
+    return result;
 }
 
 ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const {

@@ -6809,6 +6809,11 @@ struct ggml_tensor * ggml_dsv4_hc_post_ext(
     return result;
 }
 
+void ggml_dsv4_hc_post_set_bf16(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_DSV4_HC_POST);
+    ggml_set_op_params_i32(a, 1, 1);
+}
+
 // ggml_dsv41_act_quant
 
 struct ggml_tensor * ggml_dsv41_act_quant(
@@ -7054,7 +7059,7 @@ struct ggml_tensor * ggml_dsv41_attn_pack(
         GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_matrix(indices) && ggml_is_contiguous_rows(indices) && indices->ne[1] == q->ne[2]);
     }
     const int64_t rows = window + (indices ? indices->ne[0] : 0);
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, q->ne[0]*rows, q->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, q->ne[0]*rows, q->ne[2]);
     result->op = GGML_OP_DSV41_ATTN;
     result->src[0] = q;
     result->src[1] = raw;

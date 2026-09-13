@@ -2808,6 +2808,8 @@ extern "C" {
             struct ggml_tensor  * comb,
             bool residual_first);
 
+    GGML_API void ggml_dsv4_hc_post_set_bf16(struct ggml_tensor * a);
+
     enum ggml_dsv41_quant_type {
         GGML_DSV41_QUANT_BF16,
         GGML_DSV41_QUANT_MXFP8,

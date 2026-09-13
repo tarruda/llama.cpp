@@ -5082,6 +5082,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool fuse_add;
     const bool residual_first;
+    const bool bf16;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5089,13 +5090,13 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, fuse_add, residual_first);
+        return VARS_TO_STR5(n_embd, n_tokens, fuse_add, residual_first, bf16);
     }
 
-    bool run_whole_graph() override { return fuse_add; }
+    bool run_whole_graph() override { return fuse_add || bf16; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool fuse_add = false, bool residual_first = false)
-        : n_embd(n_embd), n_tokens(n_tokens), fuse_add(fuse_add), residual_first(residual_first) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool fuse_add = false, bool residual_first = false, bool bf16 = false)
+        : n_embd(n_embd), n_tokens(n_tokens), fuse_add(fuse_add), residual_first(residual_first), bf16(bf16) {}
 
     double max_nmse_err() override { return residual_first ? 1e-14 : test_dsv4_hc::max_nmse_err(); }
 
@@ -5119,6 +5120,9 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_set_name(comb, "comb");
 
         out = ggml_dsv4_hc_post_ext(ctx, x, residual, post, comb, residual_first);
+        if (bf16) {
+            ggml_dsv4_hc_post_set_bf16(out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10347,6 +10351,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(5120, 33, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(5120, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(5120, 1, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(5120, 33, false, true, true));
 
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(1, 2, 1));
     test_cases.emplace_back(new test_qwen4exp_hc_reduce(31, 4, 17));

@@ -1532,6 +1532,7 @@ typedef struct {
 typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
+    int32_t  output_bf16;
     uint64_t nb_x0;
     uint64_t nb_x1;
     uint64_t nb_r0;

@@ -11837,12 +11837,12 @@ void ggml_compute_forward_dsv41_attn(const ggml_compute_params * params, ggml_te
                 const int id = ((const int32_t *) ((const char *) indices->data + it*indices->nb[1]))[slot - window];
                 dequantize_row_nvfp4((const block_nvfp4 *) ((const char *) kv->data + id*kv->nb[1]), values.data(), dim);
             }
-            ggml_bf16_t * base = (ggml_bf16_t *) ((char *) dst->data + it*dst->nb[1]);
-            ggml_bf16_t * out = base + slot*dim;
+            ggml_fp16_t * base = (ggml_fp16_t *) ((char *) dst->data + it*dst->nb[1]);
+            ggml_fp16_t * out = base + slot*dim;
             if (valid) {
-                for (int j = 0; j < dim; ++j) { out[j] = GGML_FP32_TO_BF16(values[j]); }
+                for (int j = 0; j < dim; ++j) { out[j] = GGML_FP32_TO_FP16(values[j]); }
             } else {
-                std::fill_n(out, dim, GGML_FP32_TO_BF16(0.0f));
+                std::fill_n(out, dim, GGML_FP32_TO_FP16(0.0f));
             }
         }
         return;
@@ -12012,6 +12012,7 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
     const bool residual_first = ggml_get_op_params_i32(dst, 0);
+    const bool output_bf16 = ggml_get_op_params_i32(dst, 1);
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -12065,7 +12066,11 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
                 sum = isrc == 0 ? product : sum + product;
             }
             volatile float product = xv * pv;
-            *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = product + sum;
+            float result = product + sum;
+            if (output_bf16) {
+                result = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(result));
+            }
+            *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = result;
             continue;
         }
 
@@ -12076,6 +12081,9 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
             sum += rv * cv;
         }
 
+        if (output_bf16) {
+            sum = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(sum));
+        }
         *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = sum;
     }
 }

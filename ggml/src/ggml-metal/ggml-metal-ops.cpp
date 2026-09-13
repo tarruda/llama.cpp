@@ -2336,6 +2336,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_kargs_dsv4_hc_post args = {
                     /*.n_embd   =*/ (int32_t) x->ne[0],
                     /*.n_tokens =*/ (int32_t) x->ne[1],
+                    /*.output_bf16 =*/ ggml_get_op_params_i32(op, 1),
                     /*.nb_x0    =*/ x->nb[0],
                     /*.nb_x1    =*/ x->nb[1],
                     /*.nb_r0    =*/ residual->nb[0],
@@ -5188,6 +5189,7 @@ static int ggml_metal_op_try_dsv4_hc_post_add(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_dsv4_hc_post args = {
         /*.n_embd   =*/ (int32_t) x->ne[0],
         /*.n_tokens =*/ (int32_t) x->ne[1],
+        /*.output_bf16 =*/ false,
         /*.nb_x0    =*/ x->nb[0],
         /*.nb_x1    =*/ x->nb[1],
         /*.nb_r0    =*/ residual->nb[0],
