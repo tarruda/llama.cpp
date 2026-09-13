@@ -1196,7 +1196,7 @@ struct llama_model_deepseek41 : public llama_model_base {
         };
 
         ggml_tensor * bf16(ggml_tensor * x) const;
-        ggml_tensor * linear(ggml_tensor * w, ggml_tensor * x, bool fp8) const;
+        ggml_tensor * linear(ggml_tensor * w, ggml_tensor * x, bool fp8, bool output_bf16 = true) const;
         ggml_tensor * norm(ggml_tensor * x, ggml_tensor * weight) const;
         ggml_tensor * rstd(ggml_tensor * x) const;
         ggml_tensor * mm_f32(ggml_tensor * weight, ggml_tensor * x) const;

@@ -110,6 +110,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn        (ggml_metal_library_t lib, bool unpack, bool scores);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_matrix(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_scores_simd(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_unpack_rows(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_swiglu      (ggml_metal_library_t lib, bool mxfp8);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_index_matrix(ggml_metal_library_t lib, bool bounds);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);

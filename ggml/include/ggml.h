@@ -2856,6 +2856,14 @@ extern "C" {
             struct ggml_tensor  * weights,
             float                 limit);
 
+    GGML_API struct ggml_tensor * ggml_dsv41_swiglu_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * weights,
+            float                 limit,
+            bool                  input_bf16);
+
     // Pack F32 rows into an I8 cache matrix. Distinct nonnegative row IDs are required; -1 skips a row. The result aliases cache.
     GGML_API struct ggml_tensor * ggml_dsv41_set_rows(
             struct ggml_context * ctx,

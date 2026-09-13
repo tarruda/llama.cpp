@@ -1416,6 +1416,7 @@ typedef struct {
     int32_t  ne1;
     int32_t  ne2;
     int32_t  weighted;
+    int32_t  input_bf16;
     float    limit;
     uint64_t nb_g1;
     uint64_t nb_g2;
@@ -1463,6 +1464,7 @@ typedef struct {
     int32_t block_size;
     int32_t candidate_source;
     int32_t n_candidates;
+    int32_t score_bf16;
     uint64_t nb_s1;
     uint64_t nb_p0;
     uint64_t nb_c0;

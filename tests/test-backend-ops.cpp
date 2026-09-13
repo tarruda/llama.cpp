@@ -4580,9 +4580,10 @@ struct test_dsv41_select : public test_case {
     const bool candidate_source;
     const bool strided;
     const bool compact;
+    const bool bf16_scores;
 
-    test_dsv41_select(int64_t width, int64_t tokens, bool candidate_source, bool strided, bool compact = false) : width(width), tokens(tokens), candidate_source(candidate_source), strided(strided), compact(compact) {}
-    std::string vars() override { return VARS_TO_STR5(width, tokens, candidate_source, strided, compact); }
+    test_dsv41_select(int64_t width, int64_t tokens, bool candidate_source, bool strided, bool compact = false, bool bf16_scores = false) : width(width), tokens(tokens), candidate_source(candidate_source), strided(strided), compact(compact), bf16_scores(bf16_scores) {}
+    std::string vars() override { return VARS_TO_STR6(width, tokens, candidate_source, strided, compact, bf16_scores); }
     double max_nmse_err() override { return 0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4598,6 +4599,7 @@ struct test_dsv41_select : public test_case {
         pos = ggml_transpose(ctx, pos);
         ggml_set_name(scores, "dsv41_select_scores");
         ggml_set_name(pos, "dsv41_select_positions");
+        if (bf16_scores) { scores = ggml_dsv41_act_quant(ctx, scores, GGML_DSV41_QUANT_BF16); }
         if (candidates) {
             candidates = ggml_transpose(ctx, candidates);
             ggml_set_name(candidates, "dsv41_select_candidates");
@@ -4819,18 +4821,20 @@ struct test_dsv41_swiglu : public test_case {
     const bool weighted;
     const bool strided;
     const bool mxfp8;
+    const bool input_bf16;
 
-    test_dsv41_swiglu(float limit, bool weighted, bool strided, bool mxfp8 = false) : limit(limit), weighted(weighted), strided(strided), mxfp8(mxfp8) {}
-    std::string vars() override { return VARS_TO_STR4(limit, weighted, strided, mxfp8); }
+    test_dsv41_swiglu(float limit, bool weighted, bool strided, bool mxfp8, bool input_bf16) : limit(limit), weighted(weighted), strided(strided), mxfp8(mxfp8), input_bf16(input_bf16) {}
+    std::string vars() override { return VARS_TO_STR5(limit, weighted, strided, mxfp8, input_bf16); }
     std::string op_desc(ggml_tensor * t) override { return mxfp8 ? "DSV41_SWIGLU_MXFP8" : test_case::op_desc(t); }
     double max_nmse_err() override { return 1e-9; }
-    bool run_whole_graph() override { return mxfp8; }
+    bool run_whole_graph() override { return mxfp8 || input_bf16; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t width = limit > 0 ? 2304 : mxfp8 ? 64 : 63, tokens = strided ? 5 : 1;
         const auto branch = [&]() {
             auto * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, strided ? 2*width : width, 6, tokens, 2);
-            x = ggml_dsv41_act_quant(ctx, ggml_scale(ctx, x, 12.0f), GGML_DSV41_QUANT_BF16);
+            x = ggml_scale(ctx, x, 12.0f);
+            if (!input_bf16) { x = ggml_dsv41_act_quant(ctx, x, GGML_DSV41_QUANT_BF16); }
             if (strided) {
                 x = ggml_view_4d(ctx, x, width, 6, tokens, 2, x->nb[1], x->nb[2], x->nb[3], width*sizeof(float));
                 x = ggml_permute(ctx, x, 0, 2, 1, 3);
@@ -4847,7 +4851,7 @@ struct test_dsv41_swiglu : public test_case {
                 weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
             }
         }
-        auto * result = ggml_dsv41_swiglu(ctx, gate, up, weights, limit);
+        auto * result = ggml_dsv41_swiglu_ext(ctx, gate, up, weights, limit, input_bf16);
         return mxfp8 ? ggml_dsv41_act_quant(ctx, result, GGML_DSV41_QUANT_MXFP8) : result;
     }
 };
@@ -10248,6 +10252,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_dsv41_select(1025, 7, source, strided));
         }
         test_cases.emplace_back(new test_dsv41_select(128000, 1, source, false));
+        test_cases.emplace_back(new test_dsv41_select(128000, 1, source, false, false, true));
     }
     test_cases.emplace_back(new test_dsv41_select(1, 3, true, true));
     for (bool strided : { false, true }) {
@@ -10293,12 +10298,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (float limit : { 0.0f, 10.0f }) {
         for (bool weighted : { false, true }) {
             for (bool strided : { false, true }) {
-                test_cases.emplace_back(new test_dsv41_swiglu(limit, weighted, strided));
-                test_cases.emplace_back(new test_dsv41_swiglu(limit, weighted, strided, true));
+                for (bool input_bf16 : { false, true }) {
+                    test_cases.emplace_back(new test_dsv41_swiglu(limit, weighted, strided, false, input_bf16));
+                    test_cases.emplace_back(new test_dsv41_swiglu(limit, weighted, strided, true, input_bf16));
+                }
             }
         }
     }
-
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));

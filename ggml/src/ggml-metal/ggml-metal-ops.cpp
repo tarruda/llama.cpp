@@ -1838,8 +1838,9 @@ int ggml_metal_op_dsv41_set_rows(ggml_metal_op_t ctx, int idx) {
 
 size_t ggml_metal_op_dsv41_index_extra_cache(const ggml_tensor * op) {
     const char * value = getenv("GGML_METAL_DSV41_INDEX_MATRIX");
-    const bool enabled = !value || atoi(value) > 0;
-    const bool large = ggml_nelements(op) >= 8192 || (value && atoi(value) > 0);
+    const bool forced = value && atoi(value) > 0;
+    const bool enabled = (!value || forced) && (op->ne[1] > 1 || forced);
+    const bool large = ggml_nelements(op) >= 8192 || forced;
     return enabled && large && op->src[0]->ne[0] == 128 && op->src[0]->ne[1] == 32 ? 2*op->ne[1]*sizeof(int32_t) : 0;
 }
 
@@ -1883,13 +1884,23 @@ int ggml_metal_op_dsv41_index_scores(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
     if (matrix) { ggml_metal_encoder_set_buffer(enc, scratch, 7); }
-    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_scores + (matrix ? 31 : 3))/(matrix ? 32 : 4), op->ne[1], 1, 32, 4, 1);
+    int simdgroups = candidates ? 8 : 32;
+    if (!matrix) {
+        const char * value = getenv("GGML_METAL_DSV41_INDEX_SIMDGROUPS");
+        const int limit = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/32;
+        simdgroups = std::clamp(value ? atoi(value) : simdgroups, 1, limit);
+    }
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_scores + (matrix ? 31 : simdgroups - 1))/(matrix ? 32 : simdgroups), op->ne[1], 1, 32, matrix ? 4 : simdgroups, 1);
     return 1;
 }
 
 int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     const auto * candidates = op->src[2];
+    const ggml_tensor * score_src = op->src[0];
+    while (score_src->view_src) { score_src = score_src->view_src; }
+    const bool score_bf16 = score_src->op == GGML_OP_DSV41_INDEX_SCORES ||
+        (score_src->op == GGML_OP_DSV41_ACT_QUANT && ggml_get_op_params_i32(score_src, 0) == GGML_DSV41_QUANT_BF16);
     ggml_metal_kargs_dsv41_select args = {
         /*.n_keys           =*/ (int32_t) op->src[0]->ne[0],
         /*.top_k            =*/ ggml_get_op_params_i32(op, 0),
@@ -1898,6 +1909,7 @@ int ggml_metal_op_dsv41_select(ggml_metal_op_t ctx, int idx) {
         /*.block_size       =*/ ggml_get_op_params_i32(op, 3),
         /*.candidate_source =*/ ggml_get_op_params_i32(op, 4),
         /*.n_candidates     =*/ candidates ? (int32_t) candidates->ne[0] : 0,
+        /*.score_bf16       =*/ score_bf16 && !getenv("GGML_METAL_DSV41_SELECT_BF16_DISABLE"),
         /*.nb_s1            =*/ op->src[0]->nb[1],
         /*.nb_p0            =*/ op->src[1]->nb[0],
         /*.nb_c0            =*/ candidates ? candidates->nb[0] : 0,
@@ -1928,10 +1940,14 @@ static bool ggml_metal_dsv41_attn_precompute_scores(const ggml_tensor * op) {
     return ggml_metal_dsv41_attn_unpack_selected(op) && !getenv("GGML_METAL_DSV41_ATTN_INLINE_SCORES");
 }
 
+static bool ggml_metal_dsv41_attn_simd_scores(const ggml_tensor * op) {
+    return ggml_metal_dsv41_attn_precompute_scores(op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[3]) && (!op->src[4] || ggml_is_contiguous(op->src[4])) && !getenv("GGML_METAL_DSV41_ATTN_SIMD_SCORES_DISABLE");
+}
+
 static int ggml_metal_dsv41_attn_threads(const ggml_tensor * op) {
     if (ggml_metal_dsv41_attn_precompute_scores(op) && !getenv("GGML_METAL_DSV41_ATTN_SINGLE_SLICE")) {
         const char * value = getenv("GGML_METAL_DSV41_ATTN_THREADS");
-        const int threads = value ? atoi(value) : 256;
+        const int threads = value ? atoi(value) : 512;
         if ((threads == 64 || threads == 128 || threads == 256 || threads == 512) && op->src[0]->ne[0] % threads == 0) {
             return threads;
         }
@@ -1941,7 +1957,7 @@ static int ggml_metal_dsv41_attn_threads(const ggml_tensor * op) {
 
 static bool ggml_metal_dsv41_attn_transpose_scores(const ggml_tensor * op) {
     const char * value = getenv("GGML_METAL_DSV41_ATTN_TRANSPOSE_SCORES");
-    return ggml_metal_dsv41_attn_precompute_scores(op) && op->src[4] && op->src[4]->ne[0] >= 256 && (!value || atoi(value));
+    return !ggml_metal_dsv41_attn_simd_scores(op) && ggml_metal_dsv41_attn_precompute_scores(op) && op->src[4] && op->src[4]->ne[0] >= 256 && (!value || atoi(value));
 }
 
 size_t ggml_metal_op_dsv41_attn_extra_cache(const ggml_tensor * op) {
@@ -1984,12 +2000,14 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
     };
     auto enc = ctx->enc;
     const bool unpacked = ggml_metal_op_dsv41_attn_extra_cache(op) > 0;
+    const bool simd_scores = ggml_metal_dsv41_attn_simd_scores(op);
+    const bool unpack_rows = simd_scores && args.ratio > 1 && !getenv("GGML_METAL_DSV41_ATTN_UNPACK_ROWS_DISABLE");
     auto raw_buffer = ggml_metal_get_buffer_id(op->src[1]);
     auto kv_buffer = ggml_metal_get_buffer_id(kv ? kv : op->src[3]);
     if (unpacked) {
         auto scratch = ggml_metal_get_buffer_id(op);
         scratch.offs += ggml_nbytes(op);
-        auto unpack = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, true, false);
+        auto unpack = unpack_rows ? ggml_metal_library_get_pipeline_dsv41_attn_unpack_rows(ctx->lib) : ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, true, false);
         ggml_metal_encoder_set_pipeline(enc, unpack);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, raw_buffer, 1);
@@ -1998,13 +2016,15 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 5);
         const size_t values = ggml_metal_op_dsv41_attn_extra_cache(op)/sizeof(float);
-        ggml_metal_encoder_dispatch_threadgroups(enc, std::min<size_t>((values + 255)/256, 256), 1, 1, 256, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, unpack_rows ? (args.window + args.top_k + 15)/16 : std::min<size_t>((values + 255)/256, 256), 1, 1, unpack_rows ? 512 : 256, 1, 1);
         ggml_metal_op_concurrency_reset(ctx);
         if (args.precomputed) {
             const int rows = args.window + args.top_k;
             auto scores = scratch;
             scores.offs += size_t(rows)*args.dim*sizeof(float);
-            auto score_pipeline = ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false, true);
+            const int score_threads = simd_scores ? 512 : 64;
+            const int score_rows = simd_scores ? 16 : 64;
+            auto score_pipeline = simd_scores ? ggml_metal_library_get_pipeline_dsv41_attn_scores_simd(ctx->lib) : ggml_metal_library_get_pipeline_dsv41_attn(ctx->lib, false, true);
             ggml_metal_encoder_set_pipeline(enc, score_pipeline);
             ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q), 1);
@@ -2012,7 +2032,7 @@ int ggml_metal_op_dsv41_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, scores, 3);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indices ? indices : op->src[3]), 5);
-            ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, (rows + 63)/64, 1, 64, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.heads, (rows + score_rows - 1)/score_rows, 1, score_threads, 1, 1);
             ggml_metal_op_concurrency_reset(ctx);
         }
         raw_buffer = kv_buffer = scratch;
@@ -2074,6 +2094,7 @@ int ggml_metal_op_dsv41_swiglu(ggml_metal_op_t ctx, int idx) {
         /*.ne1      =*/ (int32_t) gate->ne[1],
         /*.ne2      =*/ (int32_t) gate->ne[2],
         /*.weighted =*/ weights != nullptr,
+        /*.input_bf16 =*/ ggml_get_op_params_i32(op, 1),
         /*.limit    =*/ ggml_get_op_params_f32(op, 0),
         /*.nb_g1    =*/ gate->nb[1],
         /*.nb_g2    =*/ gate->nb[2],

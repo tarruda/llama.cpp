@@ -954,11 +954,12 @@ static float dsv41_select_value(device const float * scores, int i, int visible,
 
 static void dsv41_select_ids(
         device const float * scores, device int * out, int visible, int block_size, uint top_k, uint tid,
+        int min_shift,
         threadgroup atomic_uint * hist, threadgroup uint * counts, threadgroup uint * ties, threadgroup uint * shared) {
     const uint n = block_size ? (visible + block_size - 1)/block_size : visible;
     if (n == 0) { return; }
     uint prefix = 0, desired = min(top_k, n);
-    for (int shift = 28; shift >= 0; shift -= 4) {
+    for (int shift = 28; shift >= min_shift; shift -= 4) {
         if (tid < 16) { atomic_store_explicit(hist + tid, 0u, memory_order_relaxed); }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint local[16] = {};
@@ -985,11 +986,12 @@ static void dsv41_select_ids(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    const uint key_mask = min_shift ? 0xffffffffu << min_shift : 0xffffffffu;
     const uint begin = tid*((n + 255)/256), end = min(begin + (n + 255)/256, n);
     uint above = 0, equal = 0;
     for (uint i = begin; i < end; ++i) {
         const float value = dsv41_select_value(scores, i, visible, block_size);
-        const uint key = dsv41_select_key(value);
+        const uint key = dsv41_select_key(value) & key_mask;
         above += value > -INFINITY && key > prefix;
         equal += value > -INFINITY && key == prefix;
     }
@@ -1022,7 +1024,7 @@ static void dsv41_select_ids(
     uint offset = counts[tid], tie = tie_start;
     for (uint i = begin; i < end; ++i) {
         const float value = dsv41_select_value(scores, i, visible, block_size);
-        const uint key = dsv41_select_key(value);
+        const uint key = dsv41_select_key(value) & key_mask;
         if (value > -INFINITY && (key > prefix || (key == prefix && tie++ < tie_limit))) { out[offset++] = i; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1057,7 +1059,8 @@ kernel void kernel_dsv41_select(
     device int * out = dst + it*(args.top_k + args.top_k_blocks);
     for (int i = tid; i < args.top_k + args.top_k_blocks; i += 256) { out[i] = -1; }
     threadgroup_barrier(mem_flags::mem_device);
-    dsv41_select_ids(row, out, visible, 0, args.top_k, tid, hist, counts, ties, shared);
+    const int min_shift = args.score_bf16 ? 16 : 0;
+    dsv41_select_ids(row, out, visible, 0, args.top_k, tid, min_shift, hist, counts, ties, shared);
     if (args.n_candidates) {
         threadgroup_barrier(mem_flags::mem_device);
         for (int i = tid; i < args.top_k; i += 256) {
@@ -1068,7 +1071,7 @@ kernel void kernel_dsv41_select(
         }
     }
     if (args.candidate_source) {
-        dsv41_select_ids(row, out + args.top_k, visible, args.block_size, args.top_k_blocks, tid, hist, counts, ties, shared);
+        dsv41_select_ids(row, out + args.top_k, visible, args.block_size, args.top_k_blocks, tid, min_shift, hist, counts, ties, shared);
     }
 }
 
@@ -1366,6 +1369,35 @@ kernel void kernel_dsv41_attn_unpack(
     }
 }
 
+kernel void kernel_dsv41_attn_unpack_rows(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const uchar * raw,
+        device const uchar * kv,
+        device float * dst,
+        device const char * positions,
+        device const int * indices,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int row = tgpig.x*(ntg.x/32) + sgitg;
+    const int last = *(device const int *) (positions + (args.tokens - 1)*args.nb_p0);
+    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.top_k) : 0;
+    if (row >= args.window + visible) { return; }
+    const bool is_raw = row < args.window;
+    int id = row - (is_raw ? 0 : args.window);
+    if (is_raw) {
+        const int first = last - args.window + 1;
+        const int pos = (last == 0 ? max(0, first) : first) + id;
+        id = pos >= args.window_start && pos <= last ? pos % args.n_ring : -1;
+    } else {
+        id = indices[id];
+        if (id < 0 || id >= args.n_kv || id >= (long(last) + 1)/args.ratio) { id = -1; }
+    }
+    device const uchar * input = is_raw ? raw + max(id, 0)*args.nb_r1 : kv + max(id, 0)*args.nb_k1;
+    for (int j = tiisg; j < args.dim; j += 32) { dst[row*args.dim + j] = id >= 0 ? dsv41_attn_value(input, j, is_raw) : 0; }
+}
+
 kernel void kernel_dsv41_attn_scores(
         constant ggml_metal_kargs_dsv41_attn & args,
         device const char * q,
@@ -1402,6 +1434,44 @@ kernel void kernel_dsv41_attn_scores(
         for (int j = 0; j < args.dim; ++j) { dot += query[j]*cache[row*args.dim + j]; }
     }
     dst[head*(args.window + args.top_k) + row] = dot*args.scale;
+}
+
+kernel void kernel_dsv41_attn_scores_simd(
+        constant ggml_metal_kargs_dsv41_attn & args,
+        device const char * q,
+        device const float * cache,
+        device float * dst,
+        device const char * positions,
+        device const int * indices,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    threadgroup float query[512];
+    const int head = tgpig.x, row = tgpig.y*(ntg.x/32) + sgitg;
+    device const float * input = (device const float *) (q + head*args.nb_q1);
+    for (int j = tid; j < args.dim; j += ntg.x) { query[j] = input[j]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int last = *(device const int *) positions;
+    const int visible = args.ratio ? clamp((last + 1)/args.ratio, 0, args.top_k) : 0;
+    if (row >= args.window + visible) { return; }
+    if (row < args.window) {
+        const int first = last - args.window + 1;
+        const int pos = (last == 0 ? max(0, first) : first) + row;
+        if (pos < args.window_start || pos > last) { return; }
+    } else {
+        const int id = indices[row - args.window];
+        if (id < 0 || id >= args.n_kv || id >= (long(last) + 1)/args.ratio) { return; }
+    }
+    float2 dot = {0, 0};
+    for (int j = tiisg; j < args.dim; j += 32) { dot = dsv41_pair_add(dot, float2(query[j]*cache[row*args.dim + j], 0)); }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        dot = dsv41_pair_add(dot, float2(simd_shuffle_down(dot.x, offset), simd_shuffle_down(dot.y, offset)));
+    }
+    if (tiisg == 0) { dst[head*(args.window + args.top_k) + row] = (dot.x + dot.y)*args.scale; }
 }
 
 template <bool unpacked>
@@ -1566,8 +1636,10 @@ kernel void kernel_dsv41_swiglu_impl(
     device const float * g = (device const float *) (gate + i1*args.nb_g1 + i2*args.nb_g2 + i3*args.nb_g3);
     device const float * u = (device const float *) (up + i1*args.nb_u1 + i2*args.nb_u2 + i3*args.nb_u3);
     const float w = args.weighted ? *(device const float *) (weights + i1*args.nb_w1 + i2*args.nb_w2 + i3*args.nb_w3) : 1.0f;
-    const float a = args.limit > 0 ? min(g[i], args.limit) : g[i];
-    const float b = args.limit > 0 ? clamp(u[i], -args.limit, args.limit) : u[i];
+    const float gate_value = args.input_bf16 ? dsv41_round_bf16(g[i]) : g[i];
+    const float up_value = args.input_bf16 ? dsv41_round_bf16(u[i]) : u[i];
+    const float a = args.limit > 0 ? min(gate_value, args.limit) : gate_value;
+    const float b = args.limit > 0 ? clamp(up_value, -args.limit, args.limit) : up_value;
     const float silu = precise::divide(a, 1.0f + precise::exp(-a));
     uint bits = as_type<uint>((silu*b)*w);
     bits = (bits & 0x7fffffff) > 0x7f800000 ? bits | 0x400000 : bits + 0x7fff + ((bits >> 16) & 1);

@@ -11678,6 +11678,7 @@ void ggml_compute_forward_dsv41_swiglu(const ggml_compute_params * params, ggml_
     const ggml_tensor * up = dst->src[1];
     const ggml_tensor * weights = dst->src[2];
     const float limit = ggml_get_op_params_f32(dst, 0);
+    const bool input_bf16 = ggml_get_op_params_i32(dst, 1);
     for (int64_t row = params->ith; row < ggml_nrows(gate); row += params->nth) {
         const int64_t i1 = row % gate->ne[1], i2 = row / gate->ne[1] % gate->ne[2], i3 = row / (gate->ne[1]*gate->ne[2]);
         const float * g = (const float *) ((const char *) gate->data + i1*gate->nb[1] + i2*gate->nb[2] + i3*gate->nb[3]);
@@ -11685,8 +11686,10 @@ void ggml_compute_forward_dsv41_swiglu(const ggml_compute_params * params, ggml_
         const float weight = weights ? *(const float *) ((const char *) weights->data + i1*weights->nb[1] + i2*weights->nb[2] + i3*weights->nb[3]) : 1.0f;
         float * out = (float *) dst->data + row*gate->ne[0];
         for (int64_t i = 0; i < gate->ne[0]; ++i) {
-            const float a = limit > 0 ? std::min(g[i], limit) : g[i];
-            const float b = limit > 0 ? std::clamp(u[i], -limit, limit) : u[i];
+            const float gate_value = input_bf16 ? GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(g[i])) : g[i];
+            const float up_value = input_bf16 ? GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(u[i])) : u[i];
+            const float a = limit > 0 ? std::min(gate_value, limit) : gate_value;
+            const float b = limit > 0 ? std::clamp(up_value, -limit, limit) : up_value;
             const float silu = a/(1.0f + std::exp(-a));
             const float value = (silu*b)*weight;
             out[i] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));

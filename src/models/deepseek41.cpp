@@ -744,14 +744,14 @@ ggml_tensor * llama_model_deepseek41::graph::bf16(ggml_tensor * x) const {
     return ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_BF16);
 }
 
-ggml_tensor * llama_model_deepseek41::graph::linear(ggml_tensor * w, ggml_tensor * x, bool fp8) const {
+ggml_tensor * llama_model_deepseek41::graph::linear(ggml_tensor * w, ggml_tensor * x, bool fp8, bool output_bf16) const {
     if (fp8) { x = ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8); }
     auto * out = build_lora_mm(w, x);
     if (!fp8) {
         ggml_prec_set_src(out, GGML_PREC_F32, 0);
         ggml_prec_set_src(out, GGML_PREC_F32, 1);
     }
-    return bf16(out);
+    return output_bf16 ? bf16(out) : out;
 }
 
 ggml_tensor * llama_model_deepseek41::graph::norm(ggml_tensor * x, ggml_tensor * weight) const {
@@ -809,9 +809,10 @@ ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const 
     cb(weights, "dsv41_expert_weights", il);
     weights = ggml_reshape_3d(ctx0, weights, 1, used, tokens);
     const bool fp8 = hparams.dsv41_dense_act_fp8;
-    auto * shared_gate = linear(layer.ffn_gate_shexp, x, fp8);
-    auto * shared_up = linear(layer.ffn_up_shexp, x, fp8);
-    auto * shared_hidden = ggml_dsv41_swiglu(ctx0, shared_gate, shared_up, nullptr, hparams.swiglu_clamp_shexp[il]);
+    const bool swiglu_input_bf16 = !cparams.cb_eval && !getenv("LLAMA_DSV41_SWIGLU_INPUT_BF16_DISABLE");
+    auto * shared_gate = linear(layer.ffn_gate_shexp, x, fp8, !swiglu_input_bf16);
+    auto * shared_up = linear(layer.ffn_up_shexp, x, fp8, !swiglu_input_bf16);
+    auto * shared_hidden = ggml_dsv41_swiglu_ext(ctx0, shared_gate, shared_up, nullptr, hparams.swiglu_clamp_shexp[il], swiglu_input_bf16);
     auto * shared = linear(layer.ffn_down_shexp, shared_hidden, fp8);
     cb(shared, "dsv41_shared_expert", il);
     if (model.moe_stream && !cparams.cb_eval) {
@@ -819,11 +820,15 @@ ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const 
     }
     auto * cur = hparams.dsv41_expert_act_fp8 ? ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8) : x;
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, tokens);
-    auto * gate = bf16(build_lora_mm_id(layer.ffn_gate_exps, cur, ids));
-    auto * up = bf16(build_lora_mm_id(layer.ffn_up_exps, cur, ids));
+    auto * gate = build_lora_mm_id(layer.ffn_gate_exps, cur, ids);
+    auto * up = build_lora_mm_id(layer.ffn_up_exps, cur, ids);
+    if (!swiglu_input_bf16) {
+        gate = bf16(gate);
+        up = bf16(up);
+    }
     cb(gate, "dsv41_expert_gate", il);
     cb(up, "dsv41_expert_up", il);
-    cur = ggml_dsv41_swiglu(ctx0, gate, up, weights, hparams.swiglu_clamp_exp[il]);
+    cur = ggml_dsv41_swiglu_ext(ctx0, gate, up, weights, hparams.swiglu_clamp_exp[il], swiglu_input_bf16);
     cb(cur, "dsv41_expert_hidden", il);
     if (hparams.dsv41_expert_act_fp8) { cur = ggml_dsv41_act_quant(ctx0, cur, GGML_DSV41_QUANT_MXFP8); }
     cb(cur, "dsv41_expert_down_input", il);

@@ -6893,12 +6893,13 @@ struct ggml_tensor * ggml_dsv41_hc_split(
     return result;
 }
 
-struct ggml_tensor * ggml_dsv41_swiglu(
+struct ggml_tensor * ggml_dsv41_swiglu_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * gate,
         struct ggml_tensor  * up,
         struct ggml_tensor  * weights,
-        float                 limit) {
+        float                 limit,
+        bool                  input_bf16) {
     GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_rows(gate) && ggml_is_contiguous_rows(up) && ggml_are_same_shape(gate, up));
     GGML_ASSERT(isfinite(limit) && limit >= 0);
@@ -6912,7 +6913,17 @@ struct ggml_tensor * ggml_dsv41_swiglu(
     result->src[1] = up;
     result->src[2] = weights;
     ggml_set_op_params_f32(result, 0, limit);
+    ggml_set_op_params_i32(result, 1, input_bf16);
     return result;
+}
+
+struct ggml_tensor * ggml_dsv41_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * weights,
+        float                 limit) {
+    return ggml_dsv41_swiglu_ext(ctx, gate, up, weights, limit, false);
 }
 
 struct ggml_tensor * ggml_dsv41_set_rows(
