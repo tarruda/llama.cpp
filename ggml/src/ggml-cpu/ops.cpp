@@ -11968,6 +11968,7 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
+    const bool residual_first = ggml_get_op_params_i32(dst, 0);
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -12011,6 +12012,19 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
 
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
         const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+
+        if (residual_first) {
+            volatile float sum = 0.0f;
+            for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
+                const float cv = *(const float *) ((const char *) comb->data + idst*nbc0 + isrc*nbc1 + it*nbc2);
+                volatile float product = rv * cv;
+                sum = isrc == 0 ? product : sum + product;
+            }
+            volatile float product = xv * pv;
+            *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = product + sum;
+            continue;
+        }
 
         float sum = xv * pv;
         for (int64_t isrc = 0; isrc < hc; ++isrc) {

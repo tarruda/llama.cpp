@@ -2799,6 +2799,15 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // With residual_first, sum residual products in source order, then add x*post without FMA.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb,
+            bool residual_first);
+
     enum ggml_dsv41_quant_type {
         GGML_DSV41_QUANT_BF16,
         GGML_DSV41_QUANT_MXFP8,

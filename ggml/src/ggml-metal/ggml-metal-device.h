@@ -109,6 +109,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn        (ggml_metal_library_t lib, bool unpack, bool scores);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_matrix(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_swiglu      (ggml_metal_library_t lib, bool mxfp8);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_index_matrix(ggml_metal_library_t lib, bool bounds);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_contiguous    (ggml_metal_library_t lib, enum ggml_type type);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
@@ -131,10 +134,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_ad
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op, bool direct_k);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, enum ggml_op op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, enum ggml_op op, bool residual_first);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_affine    (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add  (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm  (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add  (ggml_metal_library_t lib, bool residual_first);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm  (ggml_metal_library_t lib, bool bf16);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack  (ggml_metal_library_t lib, enum ggml_type type);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_combine       (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weights       (ggml_metal_library_t lib);

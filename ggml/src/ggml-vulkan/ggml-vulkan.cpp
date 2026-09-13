@@ -19585,7 +19585,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->op == GGML_OP_DSV4_HC_PRE && op->src[0]->ne[1] != 4) {
                     return false;
                 }
-                if (op->op == GGML_OP_DSV4_HC_POST && op->src[1]->ne[1] != 4) {
+                if (op->op == GGML_OP_DSV4_HC_POST && (op->src[1]->ne[1] != 4 || ggml_get_op_params_i32(op, 0) != 0)) {
                     return false;
                 }
                 if (op->op == GGML_OP_DSV4_HC_COMB) {

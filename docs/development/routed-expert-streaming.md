@@ -34,7 +34,7 @@ Tensor storage for the Flash model's complete encoder expert bank:
 | IQ3_XXS | 96.90 GiB | 112.43 GiB | 105.18 GiB |
 | Q2_K | 83.06 GiB | 98.59 GiB | 91.34 GiB |
 
-The Q8_0 default reduces other resident tensor storage from 15.53 to 8.28 GiB; the native quantizer preserves norms, router gates, and elementwise Engram weights. These sizes come from actual tensor shapes, quantization block sizes, and a native dry run, not a full-encoder runtime measurement. Decoder expert cache, context, compute buffers, and any resident draft are additional allocations; Engram value and scale tables remain lazy. The complete decoder expert bank has the same storage size. Cache capacities per layer are fixed at model load; phase changes update pin selection, not capacity. Full encoder pinning remains active during generation, which still executes both networks in CED.
+The Q8_0 default reduces other resident tensor storage from 15.53 to 8.28 GiB; the native quantizer preserves norms, router gates, and elementwise Engram weights. These storage sizes come from actual tensor shapes and quantization block sizes. Decoder expert cache, context, and compute buffers are additional allocations; Engram value and scale tables remain lazy. The complete decoder expert bank has the same storage size. Cache capacities per layer are fixed at model load; phase changes update pin selection, not capacity. Full encoder pinning remains active during generation, which still executes both networks in CED.
 
 ## Serving
 
@@ -58,6 +58,24 @@ Context checkpoints are separate from `--cache-ram`: the server defaults to reta
 Before the dense FP8-to-BF16 upgrade, a 94 GiB routed cache with 2000 pins, four readers, 8192-token microbatches and two checkpoints passed a 20215-token recall request plus a follow-up that reused 20220 cached tokens. Peak process RSS was 109.5 GiB without added swap. Conversation recall, reasoning output, tool calls, tool-result handling and streaming responses also passed. These measurements cover the tested prompts; additional context and different PLE row access patterns can change memory use.
 
 Single-slot text serving defaults to CED prefill. `--prefill-mode full` selects full causal prefill. CED runs the encoder over the full prompt and replays the decoder's final window; every generation step still runs both halves. Streaming does not evict all encoder data at the start of generation.
+
+### Q2_K hot expert caching on M1 Ultra
+
+The Q2_K routed / Q8_0 default / original I8 Engram recipe can use a 109 GiB adaptive expert cache on a 128 GiB M1 Ultra. For chat, leave encoder pinning disabled so both halves can cache their hot experts:
+
+```bash
+./build/bin/llama-server -m model-Q2_K.gguf -ngl 99 -fa on \
+    --stream-moe --moe-cache-policy adaptive --moe-cache 111616 \
+    --moe-read-threads 4 --load-mode none --lazy-mode on \
+    --fit off -b 2048 -ub 2048 -c 262144 -np 1 -t 16 -tb 16 \
+    --prefill-mode ced --ctx-checkpoints 2 --cache-ram 1024 --no-warmup
+```
+
+No draft model is loaded. Eight read workers did not improve a matched three-turn chat compared with four. Use physical footprint and swap when sizing this configuration; RSS also includes reclaimable mapped Engram pages. Fresh adaptive caches fill on demand, so startup memory use does not show the eventual footprint.
+
+Adding `--moe-pin-encoder` permanently reserves 83.06 GiB for the encoder and leaves about 25.94 GiB for the decoder. That configuration used about 119 GiB of physical process memory in measured chats and 5120-token prefill probes without increasing swap. It removes routed reads from the encoder pass, but complete CED prompt timing still includes decoder replay over the last 128 tokens. An instrumented 1280-token prompt took 9.45 seconds through the pinned encoder and 4.86 seconds afterward with warmed experts, or 89 tokens/s overall. A 5120-token prompt took 52.58 seconds through the encoder across three batches and 2.65 seconds afterward, or 93 tokens/s overall. These probes cleared prompt state between repeats and synchronized once at the encoder boundary. They are not measurements with the entire model resident.
+
+The Q8_0 recipe requires Metal to honor explicit F32 activation requests on matrix multiplication. Otherwise, finite raw HC residuals above 65504 can overflow during F16 staging. The corrected F32-input Q8_0 matrix path avoids that overflow without changing weight bytes. V4.1 also uses the residual-first HC post mode to preserve separate product rounding and residual accumulation order when fusing the graph.
 
 ## Resident DSpark and images
 
@@ -110,4 +128,4 @@ The low-level API exposes `llama_set_moe_phase`, `llama_get_moe_cache_stats`, an
 
 Row/tensor splitting, MTP loading, Windows streaming, and model loading without GGUF source files are currently rejected. Automatic CPU repacking is disabled for streaming. Use native CPU or Metal buffers for routed tensors. The cache handles quantization strides directly; it does not requantize weights.
 
-Metal attention can decode visible cache rows into temporary F32 working storage and reuse them across query heads. Single-token attention expands only selected rows, computes each query/key score once, and splits independent output channels across threadgroups. Persistent context remains packed. The working allocation is included in the compute buffer, so include it when setting the routed cache budget. `GGML_METAL_DSV41_ATTN_UNPACK_DISABLE=1` selects the original packed attention path for comparisons. Streamed expert groups preserve the original Metal matrix/vector dispatch choice, since those kernels can use different dequantization precision for types such as Q8_0. LoRA tensors targeting nonresident routed weights are rejected; their canonical source descriptors do not expose a resident weight buffer.
+Metal attention can decode visible cache rows into temporary F32 working storage and reuse them across query heads. Single-token attention expands only selected rows, computes each query/key score once, and shares each online-softmax tile across 256 output threads when dimensions permit. With at least 256 visible compressed rows, a tiled unpack also creates a column-major key copy for coalesced score reads. The 128-dimensional indexer decodes each packed key once per lane and reuses the values across query heads. These paths preserve the existing arithmetic order and BF16 rounding boundaries. Persistent context remains packed. The working allocation is included in the compute buffer, so include it when setting the routed cache budget. `GGML_METAL_DSV41_ATTN_UNPACK_DISABLE=1` selects the original packed attention path for comparisons; `GGML_METAL_DSV41_ATTN_THREADS=64 GGML_METAL_DSV41_ATTN_TRANSPOSE_SCORES=0` selects the previous selected-row path. Streamed expert groups preserve the original Metal matrix/vector dispatch choice, since those kernels can use different dequantization precision for types such as Q8_0. LoRA tensors targeting nonresident routed weights are rejected; their canonical source descriptors do not expose a resident weight buffer.

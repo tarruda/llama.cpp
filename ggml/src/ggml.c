@@ -6760,6 +6760,16 @@ struct ggml_tensor * ggml_dsv4_hc_post(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * post,
         struct ggml_tensor  * comb) {
+    return ggml_dsv4_hc_post_ext(ctx, x, residual, post, comb, false);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_post_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb,
+        bool residual_first) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
@@ -6790,6 +6800,7 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
 
     result->op     = GGML_OP_DSV4_HC_POST;
+    ggml_set_op_params_i32(result, 0, residual_first);
     result->src[0] = x;
     result->src[1] = residual;
     result->src[2] = post;

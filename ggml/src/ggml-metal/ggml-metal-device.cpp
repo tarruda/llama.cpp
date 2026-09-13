@@ -100,6 +100,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_attn_matrix(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv41_attn_matrix_register";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_swiglu(ggml_metal_library_t lib, bool mxfp8) {
+    const char * name = mxfp8 ? "kernel_dsv41_swiglu_mxfp8" : "kernel_dsv41_swiglu";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv41_index_matrix(ggml_metal_library_t lib, bool bounds) {
+    const char * name = bounds ? "kernel_dsv41_index_query_bounds" : "kernel_dsv41_index_scores_matrix";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) { res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr); }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
     char base[256];
     char name[256];
@@ -566,8 +587,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm(ggml_metal_library_t lib) {
-    const char * name = "kernel_dsv4_hc_pre_norm_f32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_pre_norm(ggml_metal_library_t lib, bool bf16) {
+    const char * name = bf16 ? "kernel_dsv41_hc_pre_norm_f32" : "kernel_dsv4_hc_pre_norm_f32";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -601,13 +622,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weights(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, ggml_op op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, ggml_op op, bool residual_first) {
     const char * name = nullptr;
 
     switch (op) {
         case GGML_OP_DSV4_HC_COMB: name = "kernel_dsv4_hc_comb_f32"; break;
         case GGML_OP_DSV4_HC_PRE:  name = "kernel_dsv4_hc_pre_f32";  break;
-        case GGML_OP_DSV4_HC_POST: name = "kernel_dsv4_hc_post_f32"; break;
+        case GGML_OP_DSV4_HC_POST: name = residual_first ? "kernel_dsv4_hc_post_ordered_f32" : "kernel_dsv4_hc_post_f32"; break;
         default: GGML_ABORT("fatal error");
     }
 
@@ -619,8 +640,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add(ggml_metal_library_t lib) {
-    const char * name = "kernel_dsv4_hc_post_add_f32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add(ggml_metal_library_t lib, bool residual_first) {
+    const char * name = residual_first ? "kernel_dsv4_hc_post_add_ordered_f32" : "kernel_dsv4_hc_post_add_f32";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -936,7 +957,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
-    const bool f32_inputs = (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_BF16) && tsrc1 == GGML_TYPE_F32 &&
+    const bool f32_inputs = (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32 &&
         (ggml_get_op_params_i32(op, 2) == GGML_PREC_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32);
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;

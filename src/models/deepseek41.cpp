@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <stdexcept>
 
 #if defined(__APPLE__)
@@ -261,9 +262,48 @@ struct dsv41_engram_gather {
     }
 };
 
+struct dsv41_engram_read {
+    const ggml_tensor * weights;
+    const ggml_tensor * scales;
+    std::vector<dsv41_engram_request> requests;
+    std::vector<size_t> groups;
+    std::vector<float> values;
+    std::vector<uint8_t> scratch;
+    size_t n_workers;
+    std::promise<void> ready;
+    std::shared_future<void> loaded;
+
+    void run() {
+        dsv41_engram_gather gather = { weights, scales, requests, groups, values.data(), scratch.data(), n_workers };
+#if defined(__APPLE__)
+        if (n_workers > 1) {
+            dispatch_apply_f(n_workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &gather, dsv41_engram_gather::run);
+        } else
+#endif
+        {
+            dsv41_engram_gather::run(&gather, 0);
+        }
+        ready.set_value();
+    }
+
+    static void copy(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(ith);
+        GGML_UNUSED(nth);
+        const auto & read = *static_cast<dsv41_engram_read *>(userdata);
+        read.loaded.get();
+        GGML_ASSERT(ggml_nbytes(dst) == read.values.size()*sizeof(float));
+        std::memcpy(dst->data, read.values.data(), ggml_nbytes(dst));
+    }
+};
+
 class llm_graph_input_dsv41 : public llm_graph_input_i {
 public:
     llm_graph_input_dsv41(const llama_model_deepseek41 & model, llama_memory_dsv41 * memory) : model(model), memory(memory) {}
+
+    ~llm_graph_input_dsv41() override {
+        if (engram_worker.valid()) { engram_worker.wait(); }
+    }
+
 
     void init_rope(int n_rot, float base, float comp_base, float scale, float ext, int original_context, float beta_fast, float beta_slow) {
         for (int mode = 0; mode < 2; ++mode) {
@@ -287,6 +327,7 @@ public:
     }
 
     void set_input(const llama_ubatch * ubatch) override {
+        if (engram_worker.valid()) { engram_worker.get(); }
         const int64_t start = ggml_time_us();
         const auto & e = model.engram;
         const uint32_t heads = (e.ngram_size - 1)*e.n_heads;
@@ -319,7 +360,7 @@ public:
             }
             ggml_backend_tensor_set(rotations[mode], cs.data(), 0, cs.size()*sizeof(float));
         }
-        std::vector<float> values(engram.empty() ? 0 : n_tokens*heads*e.head_dim);
+        std::vector<float> values(engram.empty() || async_engram ? 0 : n_tokens*heads*e.head_dim);
         std::vector<dsv41_engram_request> requests(engram.empty() ? 0 : n_tokens*heads);
         for (size_t ie = 0; ie < engram.size(); ++ie) {
             const int64_t gather_start = ggml_time_us();
@@ -355,10 +396,23 @@ public:
             size_t n_workers = 1;
 #if defined(__APPLE__)
             // Concurrent reads are limited to the lazy CPU buffers.
-            if (groups.size() > 256 && ggml_backend_buffer_is_host(layer.engram_embd->buffer) && ggml_backend_buffer_is_host(layer.engram_embd_scale->buffer)) {
-                n_workers = std::min<size_t>(n_readers, (groups.size() - 1)/64);
+            if (groups.size() > 8 && ggml_backend_buffer_is_host(layer.engram_embd->buffer) && ggml_backend_buffer_is_host(layer.engram_embd_scale->buffer)) {
+                n_workers = std::min<size_t>(n_readers, (groups.size() - 1)/3);
             }
 #endif
+            if (async_engram) {
+                auto & read = *engram_reads[ie];
+                read.weights = layer.engram_embd;
+                read.scales = layer.engram_embd_scale;
+                read.requests = requests;
+                read.groups = std::move(groups);
+                read.values.resize(n_tokens*heads*e.head_dim);
+                read.scratch.resize(n_workers*(ggml_row_size(layer.engram_embd->type, e.head_dim) + e.head_dim/32));
+                read.n_workers = n_workers;
+                read.ready = std::promise<void>();
+                read.loaded = read.ready.get_future().share();
+                continue;
+            }
             std::vector<uint8_t> scratch(n_workers*(ggml_row_size(layer.engram_embd->type, e.head_dim) + e.head_dim/32));
             dsv41_engram_gather gather = { layer.engram_embd, layer.engram_embd_scale, requests, groups, values.data(), scratch.data(), n_workers };
 #if defined(__APPLE__)
@@ -373,6 +427,17 @@ public:
             if (n_tokens > 1) {
                 LLAMA_LOG_DEBUG("dsv41: Engram layer %u: %zu rows, %zu unique, %zu readers, %.3f ms\n", e.layers[ie], requests.size(), groups.size() - 1, n_workers, (ggml_time_us() - gather_start)/1000.0);
             }
+        }
+        if (async_engram && !engram_reads.empty()) {
+            engram_worker = std::async(std::launch::async, [this] {
+                size_t ie = 0;
+                try {
+                    for (; ie < engram_reads.size(); ++ie) { engram_reads[ie]->run(); }
+                } catch (...) {
+                    for (; ie < engram_reads.size(); ++ie) { engram_reads[ie]->ready.set_exception(std::current_exception()); }
+                    throw;
+                }
+            });
         }
         LLAMA_LOG_DEBUG("dsv41: prepared inputs for %lld tokens in %.3f ms\n", (long long) n_tokens, (ggml_time_us() - start)/1000.0);
     }
@@ -395,6 +460,9 @@ public:
     std::array<ggml_tensor *, 3> rotations = {};
     std::array<ggml_tensor *, 3> cache_rows = {};
     std::vector<ggml_tensor *> engram;
+    bool async_engram = false;
+    std::vector<std::unique_ptr<dsv41_engram_read>> engram_reads;
+    std::future<void> engram_worker;
 };
 
 struct dsv41_graph : public llama_model_deepseek41::graph {
@@ -576,9 +644,24 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
             res->add_input(std::move(owner));
         };
         add_input();
+#if defined(__APPLE__)
+        const char * async_engram = getenv("LLAMA_DSV41_ENGRAM_ASYNC");
+        input->async_engram = !async_engram || atoi(async_engram) > 0;
+        for (auto il : e.layers) {
+            input->async_engram = input->async_engram && ggml_backend_buffer_is_host(model.layers[il].engram_embd->buffer) && ggml_backend_buffer_is_host(model.layers[il].engram_embd_scale->buffer);
+        }
+#endif
         for (size_t ie = 0; !ubatch.embd && ie < e.layers.size(); ++ie) {
-            auto * rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (e.ngram_size - 1)*e.n_heads*e.head_dim, n_tokens);
-            ggml_set_input(rows);
+            const int64_t width = (e.ngram_size - 1)*e.n_heads*e.head_dim;
+            ggml_tensor * rows;
+            if (input->async_engram) {
+                input->engram_reads.push_back(std::make_unique<dsv41_engram_read>());
+                rows = ggml_custom_4d(ctx0, GGML_TYPE_F32, width, n_tokens, 1, 1, nullptr, 0, dsv41_engram_read::copy, 1, input->engram_reads.back().get());
+                ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
+            } else {
+                rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, width, n_tokens);
+                ggml_set_input(rows);
+            }
             input->engram.push_back(rows);
         }
         positions = build_inp_pos();
@@ -707,21 +790,7 @@ llama_model_deepseek41::graph::hc_mixes llama_model_deepseek41::graph::mix(ggml_
 }
 
 ggml_tensor * llama_model_deepseek41::graph::hc_post(ggml_tensor * x, ggml_tensor * residual, const hc_mixes & mix) const {
-    const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * out = nullptr;
-    for (int64_t dst = 0; dst < hc; ++dst) {
-        ggml_tensor * sum = nullptr;
-        for (int64_t src = 0; src < hc; ++src) {
-            auto * row = ggml_view_2d(ctx0, residual, n_embd, tokens, residual->nb[2], src*residual->nb[1]);
-            auto * weight = ggml_view_2d(ctx0, mix.comb, 1, tokens, mix.comb->nb[2], dst*mix.comb->nb[0] + src*mix.comb->nb[1]);
-            auto * term = ggml_mul(ctx0, row, weight);
-            sum = sum ? ggml_add(ctx0, sum, term) : term;
-        }
-        auto * post = ggml_view_2d(ctx0, mix.post, 1, tokens, mix.post->nb[1], dst*mix.post->nb[0]);
-        auto * copy = ggml_reshape_3d(ctx0, ggml_add(ctx0, ggml_mul(ctx0, x, post), sum), n_embd, 1, tokens);
-        out = out ? ggml_concat(ctx0, out, copy, 1) : copy;
-    }
-    return bf16(out);
+    return bf16(ggml_dsv4_hc_post_ext(ctx0, x, residual, mix.post, mix.comb, true));
 }
 
 ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const {
