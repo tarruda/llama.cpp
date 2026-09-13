@@ -105,6 +105,20 @@ struct llama_moe_stream::impl {
         bool direct_read = false;
     };
 
+    struct decode_graph {
+        ggml_tensor * prefetch = nullptr;
+        ggml_tensor * ids = nullptr;
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up = nullptr;
+        ggml_tensor * hidden = nullptr;
+        ggml_tensor * down_input = nullptr;
+        ggml_tensor * down = nullptr;
+        int layer = -1;
+        uint32_t resident_mask = 0;
+        uint32_t missing_mask = 0;
+        bool active = false;
+    };
+
     struct layer {
         std::array<projection, 3> projections;
         std::vector<bool> pinned;
@@ -124,6 +138,9 @@ struct llama_moe_stream::impl {
     ggml_context_ptr global_cache_ctx;
     ggml_backend_buffer_ptr global_cache_buffer;
     std::array<ggml_tensor *, 3> global_cache_tensors = {};
+    ggml_context_ptr split_ctx;
+    ggml_backend_buffer_ptr split_buffer;
+    std::array<ggml_tensor *, 5> split_tensors = {};
     std::vector<int32_t> global_slot_to_layer;
     std::vector<int32_t> global_slot_to_expert;
     std::vector<uint8_t> global_valid_projections;
@@ -131,12 +148,14 @@ struct llama_moe_stream::impl {
     std::unordered_map<std::string, std::pair<int, int>> names;
     std::unordered_map<std::string, int> id_names;
     std::unordered_map<std::string, int> prefetch_names;
+    std::unordered_map<const ggml_tensor *, decode_graph> decode_graphs;
     llama_files files;
     std::mutex mutex;
     std::mutex graph_mutex;
     std::mutex upload_mutex;
     std::unique_ptr<moe_read_pool> readers;
     int n_expert = 0;
+    int n_expert_used = 0;
     int n_readers = 0;
     int64_t global_n_slots = 0;
     uint64_t tick = 0;
@@ -144,6 +163,9 @@ struct llama_moe_stream::impl {
     uint64_t misses = 0;
     uint64_t evictions = 0;
     uint64_t bytes_read = 0;
+    uint64_t split_layers = 0;
+    uint64_t split_resident_experts = 0;
+    uint64_t split_missing_experts = 0;
     int64_t read_us = 0;
     int64_t read_span_us = 0;
     std::array<llama_moe_cache_stats, 3> phase_stats = {};
@@ -151,11 +173,14 @@ struct llama_moe_stream::impl {
     bool adaptive = false;
     bool global_cache = false;
     bool overlap = true;
+    bool split_enabled = true;
     int prefill_hot_percent = 0;
     std::ofstream trace;
     llama_moe_phase phase = LLAMA_MOE_PHASE_PREFILL;
     llama_progress_callback progress = nullptr;
     void * progress_data = nullptr;
+    using set_active_mask_t = void (*)(ggml_tensor *, uint32_t);
+    set_active_mask_t set_active_mask = nullptr;
 
     impl(llama_model_loader & loader, const llama_hparams & hp, const llama_model_params & params) {
         if (loader.get_arch() != LLM_ARCH_DEEPSEEK41 || hp.n_layer() % 2 != 0) {
@@ -177,12 +202,15 @@ struct llama_moe_stream::impl {
         if (n_expert <= 0 || (uint64_t) params.moe_pin_count > (uint64_t) hp.n_layer()*n_expert) {
             throw std::runtime_error("MoE pin count exceeds the model expert count");
         }
+        for (uint32_t il = 0; il < hp.n_layer(); ++il) { n_expert_used = std::max(n_expert_used, (int) hp.n_expert_used(il)); }
         n_readers = params.moe_read_threads;
         if (params.moe_cache_policy != LLAMA_MOE_CACHE_LRU && params.moe_cache_policy != LLAMA_MOE_CACHE_ADAPTIVE) {
             throw std::runtime_error("invalid MoE cache policy");
         }
         adaptive = params.moe_cache_policy == LLAMA_MOE_CACHE_ADAPTIVE;
         if (const char * value = std::getenv("LLAMA_MOE_OVERLAP")) { overlap = std::strcmp(value, "0") != 0; }
+        if (const char * value = std::getenv("LLAMA_MOE_SPLIT")) { split_enabled = std::strcmp(value, "0") != 0; }
+        split_enabled = split_enabled && overlap && n_expert_used <= 32;
         if (const char * value = std::getenv("LLAMA_MOE_PREFILL_HOT")) {
             size_t end;
             prefill_hot_percent = std::stoi(value, &end);
@@ -536,6 +564,67 @@ struct llama_moe_stream::impl {
         for (size_t i = 0; i < hot.size() && (int) i < limit - count; ++i) { l.pinned[hot[i]] = true; }
     }
 
+    bool expert_resident(const layer & l, int expert) const {
+        const int slot = l.expert_to_slot[expert];
+        if (slot < 0) { return false; }
+        return (global_cache ? global_valid_projections[slot] : l.valid_projections[slot]) == 7;
+    }
+
+    void set_decode_mask(decode_graph & decode, uint32_t mask) const {
+        set_active_mask(decode.gate, mask);
+        set_active_mask(decode.up, mask);
+        set_active_mask(decode.hidden, mask);
+        set_active_mask(decode.down, mask);
+    }
+
+    static void bind_split_tensor(ggml_tensor & target, const ggml_tensor * source, ggml_tensor * storage) {
+        GGML_ASSERT(ggml_nbytes(source) <= ggml_nbytes(storage));
+        target = *source;
+        target.buffer = storage->buffer;
+        target.data = storage->data;
+        target.view_src = nullptr;
+        target.view_offs = 0;
+    }
+
+    ggml_status launch_resident(ggml_backend_t backend, decode_graph & decode) {
+        ggml_tensor gate, up, hidden, quant, down;
+        bind_split_tensor(gate, decode.gate, split_tensors[0]);
+        bind_split_tensor(up, decode.up, split_tensors[1]);
+        bind_split_tensor(hidden, decode.hidden, split_tensors[2]);
+        bind_split_tensor(down, decode.down, split_tensors[4]);
+        hidden.src[0] = &gate;
+        hidden.src[1] = &up;
+        ggml_tensor * activation = &hidden;
+        const bool quantized = decode.down_input != decode.hidden;
+        if (quantized) {
+            bind_split_tensor(quant, decode.down_input, split_tensors[3]);
+            quant.src[0] = &hidden;
+            activation = &quant;
+        }
+        down.src[1] = activation;
+        set_active_mask(&gate, decode.resident_mask);
+        set_active_mask(&up, decode.resident_mask);
+        set_active_mask(&hidden, decode.resident_mask);
+        set_active_mask(&down, decode.resident_mask);
+
+        ggml_context_ptr ctx(ggml_init({ggml_graph_overhead_custom(8, false), nullptr, true}));
+        if (!ctx) { return GGML_STATUS_ALLOC_FAILED; }
+        auto * graph = ggml_new_graph_custom(ctx.get(), 8, false);
+        ggml_graph_add_node(graph, &gate);
+        ggml_graph_add_node(graph, &up);
+        ggml_graph_add_node(graph, &hidden);
+        if (quantized) { ggml_graph_add_node(graph, &quant); }
+        ggml_graph_add_node(graph, &down);
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+
+    ggml_status copy_resident_output(ggml_backend_t backend, const decode_graph & decode) {
+        ggml_tensor resident;
+        bind_split_tensor(resident, decode.down, split_tensors[4]);
+        ggml_backend_tensor_copy_async(backend, backend, &resident, decode.down);
+        return GGML_STATUS_SUCCESS;
+    }
+
     void begin_fill(layer & l, const std::vector<expert_load> & loads, bool prefetch) {
         GGML_ASSERT(!pending.target);
         if (loads.empty()) { return; }
@@ -680,16 +769,52 @@ struct llama_moe_stream::impl {
 
     ggml_status execute(ggml_backend_t backend, ggml_tensor * node) {
         std::lock_guard<std::mutex> lock(mutex);
+        const auto split_down = node->op == GGML_OP_MUL_MAT_ID && node->src[2] && node->src[2]->src[0] ? decode_graphs.find(node->src[2]->src[0]) : decode_graphs.end();
+        if (split_down != decode_graphs.end() && split_down->second.down == node) {
+            auto & decode = split_down->second;
+            GGML_ASSERT(decode.active);
+            auto status = copy_resident_output(backend, decode);
+            if (status == GGML_STATUS_SUCCESS) {
+                ggml_context_ptr ctx(ggml_init({ggml_graph_overhead_custom(2, false), nullptr, true}));
+                if (!ctx) { status = GGML_STATUS_ALLOC_FAILED; }
+                else {
+                    ggml_tensor operation = *node;
+                    auto * graph = ggml_new_graph_custom(ctx.get(), 2, false);
+                    ggml_graph_add_node(graph, &operation);
+                    status = ggml_backend_graph_compute_async(backend, graph);
+                }
+            }
+            decode.active = false;
+            return status;
+        }
         if (node->op == GGML_OP_VIEW) {
-            GGML_ASSERT(!pending.target || pending.target == &layers[id_names.at(node->name)]);
+            auto & l = layers[id_names.at(node->name)];
+            GGML_ASSERT(!pending.target || pending.target == &l);
             finish_fill();
+            const auto graph = node->src[0] ? decode_graphs.find(node->src[0]) : decode_graphs.end();
+            if (graph != decode_graphs.end() && graph->second.active) {
+                auto & decode = graph->second;
+                set_decode_mask(decode, decode.missing_mask);
+                ++split_layers;
+                split_resident_experts += __builtin_popcount(decode.resident_mask);
+                split_missing_experts += __builtin_popcount(decode.missing_mask);
+            }
             return GGML_STATUS_SUCCESS;
         }
         if (node->op == GGML_OP_DUP) {
             const bool prefetch = prefetch_names.count(node->name);
             const int il = prefetch ? prefetch_names.at(node->name) : id_names.at(node->name);
             auto & l = layers[il];
+            decode_graph * decode = nullptr;
+            const auto graph = decode_graphs.find(node);
+            if (graph != decode_graphs.end()) { decode = &graph->second; }
             ggml_backend_synchronize(backend);
+            if (decode && decode->gate) {
+                set_decode_mask(*decode, 0);
+                decode->resident_mask = 0;
+                decode->missing_mask = 0;
+                decode->active = false;
+            }
             const auto * ids = node->src[0];
             std::vector<uint8_t> raw(ggml_nbytes(ids));
             ggml_backend_tensor_get(ids, raw.data(), 0, raw.size());
@@ -707,9 +832,21 @@ struct llama_moe_stream::impl {
             std::sort(required.begin(), required.end());
             required.erase(std::unique(required.begin(), required.end()), required.end());
             fit_small_group(l, required);
+            if (prefetch && phase == LLAMA_MOE_PHASE_DECODE && decode && decode->gate && original.size() <= 32) {
+                const uint32_t all = original.size() == 32 ? UINT32_MAX : (1u << original.size()) - 1u;
+                for (size_t i = 0; i < original.size(); ++i) {
+                    if (expert_resident(l, original[i])) { decode->resident_mask |= 1u << i; }
+                }
+                decode->missing_mask = all & ~decode->resident_mask;
+                decode->active = decode->resident_mask != 0 && decode->missing_mask != 0;
+            }
             acquire(l, required, 7, prefetch);
             for (auto & e : original) { e = l.expert_to_slot[e]; }
             ggml_backend_tensor_set(node, original.data(), 0, original.size()*sizeof(int32_t));
+            if (decode && decode->active) {
+                const auto status = launch_resident(backend, *decode);
+                if (status != GGML_STATUS_SUCCESS) { return status; }
+            }
             return GGML_STATUS_SUCCESS;
         }
         const auto location = names.at(node->src[0]->name);
@@ -895,6 +1032,38 @@ bool llama_moe_stream::load(llama_files & files) {
                 p.direct_read = get_host_ptr && get_host_ptr(buffer);
             }
         }
+    }
+    if (pimpl->split_enabled) {
+        auto * buft = ggml_backend_buffer_get_type(pimpl->layers.front().projections.front().cache->buffer);
+        auto * dev = ggml_backend_buft_get_device(buft);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        pimpl->set_active_mask = reg ? (impl::set_active_mask_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_moe_active_mask") : nullptr;
+        pimpl->split_enabled = pimpl->set_active_mask && std::all_of(pimpl->layers.begin(), pimpl->layers.end(), [=](const auto & l) {
+            return std::all_of(l.projections.begin(), l.projections.end(), [=](const auto & p) {
+                return p.direct_read && ggml_backend_buffer_get_type(p.cache->buffer) == buft;
+            });
+        });
+        if (pimpl->split_enabled) {
+            int64_t hidden = 0, output = 0;
+            for (const auto & l : pimpl->layers) {
+                hidden = std::max({hidden, l.projections[0].original.ne[1], l.projections[1].original.ne[1]});
+                output = std::max(output, l.projections[2].original.ne[1]);
+            }
+            pimpl->split_ctx.reset(ggml_init({6*ggml_tensor_overhead(), nullptr, true}));
+            if (!pimpl->split_ctx) { throw std::runtime_error("failed to create split MoE context"); }
+            for (int i = 0; i < 4; ++i) {
+                pimpl->split_tensors[i] = ggml_new_tensor_3d(pimpl->split_ctx.get(), GGML_TYPE_F32, hidden, pimpl->n_expert_used, 1);
+                ggml_format_name(pimpl->split_tensors[i], "moe_stream_split.%d", i);
+            }
+            pimpl->split_tensors[4] = ggml_new_tensor_3d(pimpl->split_ctx.get(), GGML_TYPE_F32, output, pimpl->n_expert_used, 1);
+            ggml_set_name(pimpl->split_tensors[4], "moe_stream_split.output");
+            pimpl->split_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->split_ctx.get(), buft));
+            if (!pimpl->split_buffer) { throw std::runtime_error("failed to allocate split MoE workspace"); }
+            ggml_backend_buffer_set_usage(pimpl->split_buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            LLAMA_LOG_INFO("moe_stream: resident/missing overlap workspace = %.2f MiB\n", ggml_backend_buffer_get_size(pimpl->split_buffer.get())/1048576.0);
+        }
+    }
+    for (auto & l : pimpl->layers) {
         for (int e = 0; e < pimpl->n_expert; ++e) {
             if (!l.pinned[e] && !l.fully_resident) { continue; }
             if (pimpl->progress && !pimpl->progress(1.0f, pimpl->progress_data)) { return false; }
@@ -909,6 +1078,8 @@ bool llama_moe_stream::handles(const ggml_tensor * node, void * data) {
     if ((node->op == GGML_OP_DUP || node->op == GGML_OP_VIEW) && self.pimpl->id_names.count(node->name)) { return true; }
     if (node->op == GGML_OP_DUP && self.pimpl->prefetch_names.count(node->name)) { return true; }
     if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0]) { return false; }
+    const auto split_down = node->src[2] && node->src[2]->src[0] ? self.pimpl->decode_graphs.find(node->src[2]->src[0]) : self.pimpl->decode_graphs.end();
+    if (split_down != self.pimpl->decode_graphs.end() && split_down->second.down == node && split_down->second.active) { return true; }
     if (self.pimpl->id_names.count(node->src[2]->name)) { return false; }
     const auto it = self.pimpl->names.find(node->src[0]->name);
     return it != self.pimpl->names.end() && !self.pimpl->layers[it->second.first].fully_resident;
@@ -939,6 +1110,11 @@ void llama_moe_stream::print_stats() const {
     LLAMA_LOG_INFO("moe_stream: %llu hits, %llu misses, %llu evictions, %.3f GiB read, %.3f s waiting (%.3f s load intervals)\n",
             (unsigned long long) pimpl->hits, (unsigned long long) pimpl->misses, (unsigned long long) pimpl->evictions,
             pimpl->bytes_read/1073741824.0, pimpl->read_us/1e6, pimpl->read_span_us/1e6);
+    if (pimpl->split_layers) {
+        LLAMA_LOG_INFO("moe_stream: %llu resident/missing splits, %llu resident experts, %llu missing experts\n",
+                (unsigned long long) pimpl->split_layers, (unsigned long long) pimpl->split_resident_experts,
+                (unsigned long long) pimpl->split_missing_experts);
+    }
 }
 
 llama_moe_cache_stats llama_moe_stream::stats(llama_moe_phase phase) const {
@@ -961,8 +1137,12 @@ bool llama_moe_stream::synchronize() {
     }
 }
 
-ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_tensor * ids, ggml_tensor * shared, int il) const {
-    const auto & l = pimpl->layers.at(il);
+void llama_moe_stream::begin_graph() {
+    pimpl->decode_graphs.clear();
+}
+
+ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_tensor * ids, ggml_tensor * shared, ggml_tensor * expert_input, ggml_tensor * weights, int il) {
+    auto & l = pimpl->layers.at(il);
     if (l.fully_resident) { return ids; }
     int capacity = pimpl->global_cache ? pimpl->global_n_slots : l.n_slots;
     for (int phase = LLAMA_MOE_PHASE_CALIBRATION; phase <= LLAMA_MOE_PHASE_DECODE; ++phase) {
@@ -984,15 +1164,50 @@ ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched
         ggml_set_name(mapped, ((prefetch ? "moe_stream_prefetch." : "moe_stream_ids.") + std::to_string(il)).c_str());
         ggml_backend_sched_set_tensor_backend(sched, mapped, backend);
         if (prefetch) {
+            const bool split = pimpl->split_enabled && ids->ne[1] == 1 && expert_input && weights;
+            if (split) {
+                mapped->src[1] = expert_input;
+                mapped->src[2] = weights;
+            }
             ggml_build_forward_expand(graph, mapped);
             ggml_build_forward_expand(graph, shared);
             // The readiness marker aliases the IDs; it must not overwrite live GPU scratch.
             auto * ready = ggml_view_2d(ctx, mapped, mapped->ne[0], mapped->ne[1], mapped->nb[1], 0);
             ggml_set_name(ready, ("moe_stream_ids." + std::to_string(il)).c_str());
             ggml_backend_sched_set_tensor_backend(sched, ready, backend);
+            if (split) {
+                auto & decode = pimpl->decode_graphs[mapped];
+                decode = {};
+                decode.prefetch = mapped;
+                decode.ids = ready;
+                decode.layer = il;
+            }
             return ready;
         }
         return mapped;
     }
     return ids;
+}
+
+void llama_moe_stream::register_decode_graph(int il, ggml_tensor * ids, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * hidden, ggml_tensor * down_input, ggml_tensor * down) {
+    const auto graph = ids->src[0] ? pimpl->decode_graphs.find(ids->src[0]) : pimpl->decode_graphs.end();
+    if (graph == pimpl->decode_graphs.end()) { return; }
+    auto & decode = graph->second;
+    const bool valid = il == decode.layer && ids == decode.ids && gate->op == GGML_OP_MUL_MAT_ID && up->op == GGML_OP_MUL_MAT_ID && down->op == GGML_OP_MUL_MAT_ID &&
+            gate->src[2] == ids && up->src[2] == ids && down->src[2] == ids && hidden->op == GGML_OP_DSV41_SWIGLU &&
+            hidden->src[0] == gate && hidden->src[1] == up && down->src[1] == down_input &&
+            (down_input == hidden || (down_input->op == GGML_OP_DSV41_ACT_QUANT && down_input->src[0] == hidden)) &&
+            ggml_nbytes(gate) <= ggml_nbytes(pimpl->split_tensors[0]) && ggml_nbytes(up) <= ggml_nbytes(pimpl->split_tensors[1]) &&
+            ggml_nbytes(hidden) <= ggml_nbytes(pimpl->split_tensors[2]) && ggml_nbytes(down_input) <= ggml_nbytes(pimpl->split_tensors[3]) &&
+            ggml_nbytes(down) <= ggml_nbytes(pimpl->split_tensors[4]);
+    if (!valid) {
+        pimpl->decode_graphs.erase(graph);
+        return;
+    }
+    decode.gate = gate;
+    decode.up = up;
+    decode.hidden = hidden;
+    decode.down_input = down_input;
+    decode.down = down;
+    pimpl->set_decode_mask(decode, 0);
 }

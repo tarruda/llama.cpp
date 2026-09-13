@@ -644,6 +644,7 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    uint32_t active_mask;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
@@ -1427,6 +1428,7 @@ typedef struct {
     uint64_t nb_w1;
     uint64_t nb_w2;
     uint64_t nb_w3;
+    uint32_t active_mask;
 } ggml_metal_kargs_dsv41_swiglu;
 
 typedef struct {

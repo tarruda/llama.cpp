@@ -2126,6 +2126,7 @@ int ggml_metal_op_dsv41_swiglu(ggml_metal_op_t ctx, int idx) {
         /*.nb_w1    =*/ weights ? weights->nb[1] : 0,
         /*.nb_w2    =*/ weights ? weights->nb[2] : 0,
         /*.nb_w3    =*/ weights ? weights->nb[3] : 0,
+        /*.active_mask =*/ (uint32_t) ggml_get_op_params_i32(op, 2),
     };
     auto enc = ctx->enc;
     auto pipeline = ggml_metal_library_get_pipeline_dsv41_swiglu(ctx->lib, n_fuse > 1);
@@ -4101,6 +4102,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ nb1,
             /*.nr0  =*/ nr0,
+            /*.active_mask =*/ (uint32_t) ggml_get_op_params_i32(op, GGML_METAL_MUL_MAT_ID_ACTIVE_MASK),
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {

@@ -1688,6 +1688,7 @@ kernel void kernel_dsv41_swiglu_impl(
     const int i = 128*tgpig.x + tiitg, row = tgpig.y;
     if (i >= args.ne0) { return; }
     const int i1 = row % args.ne1, i2 = row / args.ne1 % args.ne2, i3 = row / (args.ne1*args.ne2);
+    if (args.active_mask != 0 && (args.active_mask & (1u << i1)) == 0) { return; }
     device const float * g = (device const float *) (gate + i1*args.nb_g1 + i2*args.nb_g2 + i3*args.nb_g3);
     device const float * u = (device const float *) (up + i1*args.nb_u1 + i2*args.nb_u2 + i3*args.nb_u3);
     const float w = args.weighted ? *(device const float *) (weights + i1*args.nb_w1 + i2*args.nb_w2 + i3*args.nb_w3) : 1.0f;

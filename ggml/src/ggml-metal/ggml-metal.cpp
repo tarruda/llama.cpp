@@ -955,9 +955,22 @@ static void ggml_backend_metal_mul_mat_id_preserve_dispatch(ggml_tensor * dst, c
     ggml_set_op_params_i32(dst, GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS, original > 0 ? original : src->src[2]->ne[1]);
 }
 
+static void ggml_backend_metal_set_moe_active_mask(ggml_tensor * tensor, uint32_t mask) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID) {
+        ggml_set_op_params_i32(tensor, GGML_METAL_MUL_MAT_ID_ACTIVE_MASK, mask);
+    } else if (tensor->op == GGML_OP_DSV41_SWIGLU) {
+        ggml_set_op_params_i32(tensor, 2, mask);
+    } else {
+        GGML_ABORT("unsupported masked MoE operation");
+    }
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_metal_mul_mat_id_preserve_dispatch") == 0) {
         return (void *) ggml_backend_metal_mul_mat_id_preserve_dispatch;
+    }
+    if (strcmp(name, "ggml_backend_metal_set_moe_active_mask") == 0) {
+        return (void *) ggml_backend_metal_set_moe_active_mask;
     }
     if (strcmp(name, "ggml_backend_metal_buffer_get_host_ptr") == 0) {
         return (void *) ggml_backend_metal_buffer_get_host_ptr;

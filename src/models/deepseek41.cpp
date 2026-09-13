@@ -652,6 +652,7 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
         const bool ced = params.gtype == LLM_GRAPH_TYPE_CED_PREFILL;
         const int split = n_layer/2;
         const auto & e = model.engram;
+        if (model.moe_stream && !cparams.cb_eval) { model.moe_stream->begin_graph(); }
         if (ced) {
             dsv41_require(n_layer % 2 == 0 && n_outputs <= 1, "invalid CED layer or output count");
             for (int il = split; il < n_layer; ++il) {
@@ -842,24 +843,33 @@ ggml_tensor * llama_model_deepseek41::graph::moe(ggml_tensor * x, int il) const 
     auto * shared_hidden = ggml_dsv41_swiglu_ext(ctx0, shared_gate, shared_up, nullptr, hparams.swiglu_clamp_shexp[il], swiglu_input_bf16);
     auto * shared = linear(layer.ffn_down_shexp, shared_hidden, fp8);
     cb(shared, "dsv41_shared_expert", il);
+    auto * expert_input = hparams.dsv41_expert_act_fp8 ? ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8) : x;
     if (model.moe_stream && !cparams.cb_eval) {
-        ids = model.moe_stream->build_ids(ctx0, sched, gf, ids, shared, il);
+        ids = model.moe_stream->build_ids(ctx0, sched, gf, ids, shared, expert_input, weights, il);
     }
-    auto * cur = hparams.dsv41_expert_act_fp8 ? ggml_dsv41_act_quant(ctx0, x, GGML_DSV41_QUANT_MXFP8) : x;
+    auto * cur = expert_input;
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, tokens);
-    auto * gate = build_lora_mm_id(layer.ffn_gate_exps, cur, ids);
-    auto * up = build_lora_mm_id(layer.ffn_up_exps, cur, ids);
+    auto * gate_mm = build_lora_mm_id(layer.ffn_gate_exps, cur, ids);
+    auto * up_mm = build_lora_mm_id(layer.ffn_up_exps, cur, ids);
+    auto * gate = gate_mm;
+    auto * up = up_mm;
     if (!swiglu_input_bf16) {
         gate = bf16(gate);
         up = bf16(up);
     }
     cb(gate, "dsv41_expert_gate", il);
     cb(up, "dsv41_expert_up", il);
-    cur = ggml_dsv41_swiglu_ext(ctx0, gate, up, weights, hparams.swiglu_clamp_exp[il], swiglu_input_bf16);
+    auto * hidden = ggml_dsv41_swiglu_ext(ctx0, gate, up, weights, hparams.swiglu_clamp_exp[il], swiglu_input_bf16);
+    cur = hidden;
     cb(cur, "dsv41_expert_hidden", il);
     if (hparams.dsv41_expert_act_fp8) { cur = ggml_dsv41_act_quant(ctx0, cur, GGML_DSV41_QUANT_MXFP8); }
     cb(cur, "dsv41_expert_down_input", il);
-    auto * experts = bf16(build_lora_mm_id(layer.ffn_down_exps, cur, ids));
+    auto * down_input = cur;
+    auto * down = build_lora_mm_id(layer.ffn_down_exps, cur, ids);
+    if (model.moe_stream && !cparams.cb_eval) {
+        model.moe_stream->register_decode_graph(il, ids, gate_mm, up_mm, hidden, down_input, down);
+    }
+    auto * experts = bf16(down);
     cb(experts, "dsv41_expert_output", il);
     ggml_tensor * sum = nullptr;
     for (int64_t i = 0; i < used; ++i) {

@@ -3336,6 +3336,8 @@ kernel void kernel_mul_mv_id(
     const int iid1 = tgpig.z/args.nei0;
     const int idx  = tgpig.z%args.nei0;
 
+    if (args.active_mask != 0 && (args.active_mask & (1u << idx)) == 0) { return; }
+
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
@@ -3397,6 +3399,7 @@ kernel void kernel_mul_mv_id_iq3_xxs_f32_decode(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const int idx = tgpig.z;
+    if (args.active_mask != 0 && (args.active_mask & (1u << idx)) == 0) { return; }
     const int32_t i02 = ((device const int32_t *) ids)[idx];
     const int64_t i11 = idx % args.ne11;
 

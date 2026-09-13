@@ -23,7 +23,7 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int32_t original_tokens = ggml_get_op_params_i32(op, GGML_METAL_MUL_MAT_ID_DISPATCH_TOKENS);
     const int64_t ne21 = original_tokens > 0 ? original_tokens : op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
+    return ggml_get_op_params_i32(op, GGML_METAL_MUL_MAT_ID_ACTIVE_MASK) == 0 && has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
