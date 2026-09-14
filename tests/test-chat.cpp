@@ -7030,6 +7030,16 @@ static void test_deepseek_v4_thinking_retention() {
 
     auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.jinja");
 
+    test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+        tc.params.enable_thinking = true;
+        tc.params.chat_template_kwargs["thinking"] = "false";
+        tc.params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        tc.params.add_generation_prompt = true;
+        tc.input = "The capital of France is Paris.";
+        tc.expect.role = "assistant";
+        tc.expect.content = tc.input;
+    }, false);
+
     common_chat_msg user_q1; user_q1.role = "user"; user_q1.content = "Question 1";
     common_chat_msg user_q2; user_q2.role = "user"; user_q2.content = "Question 2";
     common_chat_msg asst_a1 = simple_assist_msg("Answer 1", "thinking A1");
