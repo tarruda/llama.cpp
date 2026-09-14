@@ -4,8 +4,6 @@
 #include "log.h"
 #include "llama.h"
 #include "gguf.h"
-#include "json.h"
-#include "sampling.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +20,6 @@
 #include <map>
 #include <regex>
 #include <numeric>
-#include <array>
 #include <functional>
 
 #if defined(_MSC_VER)
@@ -63,10 +60,8 @@ class IMatrixCollector {
 public:
     IMatrixCollector() = default;
     void set_params(common_params params) { m_params = std::move(params); }
-    void set_model(const llama_model * model);
-    void set_phase(llama_moe_phase phase) { m_phase = phase; }
+    void set_model(const llama_model * model) { m_model = model; }
     void finish_chunks(int count);
-    void save_profile() const;
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
     void save_imatrix(int32_t n_chunk = -1) const;
@@ -81,21 +76,7 @@ private:
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
     const llama_model * m_model = nullptr;
-    llama_moe_phase m_phase = LLAMA_MOE_PHASE_CALIBRATION;
-    std::array<std::vector<std::vector<uint64_t>>, 3> m_routes;
-    std::array<std::vector<uint64_t>, 3> m_route_tokens;
 };
-
-void IMatrixCollector::set_model(const llama_model * model) {
-    m_model = model;
-    if (m_params.moe_profile_output.empty()) { return; }
-    const int layers = llama_model_n_layer(model), experts = llama_model_n_expert(model);
-    if (experts < 1) { throw std::runtime_error("routing profiles require a model with routed experts"); }
-    for (size_t phase = 0; phase < m_routes.size(); ++phase) {
-        m_routes[phase].assign(layers, std::vector<uint64_t>(experts, 0));
-        m_route_tokens[phase].assign(layers, 0);
-    }
-}
 
 void IMatrixCollector::finish_chunks(int count) {
     const int previous = m_last_chunk;
@@ -105,50 +86,6 @@ void IMatrixCollector::finish_chunks(int count) {
     }
     if (m_params.n_save_freq > 0 && previous/m_params.n_save_freq != m_last_chunk/m_params.n_save_freq) {
         save_imatrix(m_last_chunk);
-    }
-}
-
-void IMatrixCollector::save_profile() const {
-    if (!m_model || m_params.moe_profile_output.empty()) { return; }
-    char arch[128] = {}, name[512] = {};
-    llama_model_meta_val_str(m_model, "general.architecture", arch, sizeof(arch));
-    llama_model_meta_val_str(m_model, "general.name", name, sizeof(name));
-    common_json result = {
-        {"format", "llama-moe-profile"}, {"version", 1},
-        {"model", {{"architecture", arch}, {"name", name}, {"layers", llama_model_n_layer(m_model)},
-            {"experts_per_layer", llama_model_n_expert(m_model)}, {"embedding_length", llama_model_n_embd(m_model)}}},
-        {"corpus", m_params.prompt_file}, {"phase_switching", "profile pins follow the execution phase; encoder pins are permanent"},
-        {"phases", common_json::object()},
-    };
-    const std::array<const char *, 3> phases = {"calibration", "prefill", "decode"};
-    for (size_t phase = 0; phase < phases.size(); ++phase) {
-        common_json layers = common_json::array();
-        uint64_t observations = 0;
-        for (size_t il = 0; il < m_routes[phase].size(); ++il) {
-            common_json experts = common_json::array();
-            int coverage = 0;
-            for (size_t id = 0; id < m_routes[phase][il].size(); ++id) {
-                const uint64_t count = m_routes[phase][il][id];
-                experts.push_back({{"id", id}, {"count", count}});
-                coverage += count > 0;
-            }
-            layers.push_back({{"layer", il}, {"tokens", m_route_tokens[phase][il]}, {"observed_experts", coverage}, {"experts", experts}});
-            observations += m_route_tokens[phase][il];
-        }
-        if (phase == 0) { result["layers"] = layers; }
-        if (observations) { result["phases"][phases[phase]] = {{"layer_token_observations", observations}, {"layers", layers}}; }
-    }
-    result["generation_sampling"] = {{"tokens_per_prompt", m_params.moe_profile_generate}, {"prompts", m_params.moe_profile_prompts},
-        {"prompt_tokens", m_params.moe_profile_prompt_tokens}, {"seed", m_params.sampling.seed}, {"temperature", m_params.sampling.temp}};
-    const auto temporary = m_params.moe_profile_output + ".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        out << result.dump(2) << '\n';
-        out.close();
-        if (!out) { throw std::runtime_error("failed to write routing profile: " + temporary); }
-    }
-    if (std::rename(temporary.c_str(), m_params.moe_profile_output.c_str()) != 0) {
-        throw std::runtime_error("failed to replace routing profile: " + m_params.moe_profile_output);
     }
 }
 
@@ -337,15 +274,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         canonical->ne[2] == 1 && canonical->ne[3] == 1 && canonical->ne[0] == src0->ne[0] &&
         canonical->nb[0] == src0->nb[0] && canonical->nb[1] == src0->nb[1] && ggml_nbytes(canonical) == ggml_nbytes(src0);
     std::string wname = filter_tensor_name(grouped_view ? canonical->name : src0->name);
-    int route_layer = -1, route_end = 0;
-    const bool route_gate = t->op == GGML_OP_MUL_MAT_ID &&
-        sscanf(wname.c_str(), "blk.%d.ffn_gate_exps.weight%n", &route_layer, &route_end) == 1 && route_end == (int) wname.size();
-
 
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {
-        if (m_phase != LLAMA_MOE_PHASE_CALIBRATION) { return route_gate && !m_params.moe_profile_output.empty(); }
         if (t->op == GGML_OP_MUL_MAT_ID) return true; // collect all indirect matrix multiplications
         if (t->op != GGML_OP_MUL_MAT) return false;
         // why are small batches ignored (<16 tokens)?
@@ -355,23 +287,6 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
-
-    if (route_gate && m_model && !m_params.moe_profile_output.empty()) {
-        const auto * ids = t->src[2];
-        m_ids.resize(ggml_nbytes(ids));
-        ggml_backend_tensor_get(ids, m_ids.data(), 0, m_ids.size());
-        auto & counts = m_routes[m_phase].at(route_layer);
-        for (int64_t token = 0; token < ids->ne[1]; ++token) {
-            for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
-                int32_t id;
-                memcpy(&id, m_ids.data() + token*ids->nb[1] + rank*ids->nb[0], sizeof(id));
-                if (id < 0 || (size_t) id >= counts.size()) { throw std::runtime_error("invalid original expert ID during profiling"); }
-                ++counts[id];
-            }
-        }
-        m_route_tokens[m_phase][route_layer] += ids->ne[1];
-    }
-    if (m_phase != LLAMA_MOE_PHASE_CALIBRATION) { return true; }
 
     // copy the data from the GPU memory if needed
     const bool is_host = ggml_backend_buffer_is_host(src1->buffer);
@@ -634,7 +549,6 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
 }
 
 void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
-    save_profile();
     auto fname = m_params.out_file;
     int8_t use_legacy_format = m_params.imat_dat;
 
@@ -1069,60 +983,6 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     return true;
 }
 
-static bool profile_generation(llama_context * ctx, const common_params & params) {
-    if (params.moe_profile_generate == 0) { return true; }
-    if (params.moe_profile_output.empty()) {
-        LOG_ERR("%s: --moe-profile-generate requires --moe-profile-output\n", __func__);
-        return false;
-    }
-    const auto tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
-    const int prompt_size = std::min<size_t>(params.moe_profile_prompt_tokens, tokens.size());
-    if (prompt_size < 1 || uint64_t(prompt_size) + params.moe_profile_generate > llama_n_ctx(ctx)) {
-        LOG_ERR("%s: profiling prompt and generation must fit in the context\n", __func__);
-        return false;
-    }
-    const auto * model = llama_get_model(ctx);
-    const auto * vocab = llama_model_get_vocab(model);
-    llama_batch batch = llama_batch_init(std::min(prompt_size, params.n_batch), 0, 1);
-    for (int sample = 0; sample < params.moe_profile_prompts; ++sample) {
-        llama_memory_clear(llama_get_memory(ctx), true);
-        auto sampling = params.sampling;
-        common_sampler_ptr sampler(common_sampler_init(model, sampling));
-        if (!sampler) { llama_batch_free(batch); return false; }
-        const size_t start = params.moe_profile_prompts > 1 ? (tokens.size() - prompt_size)*sample/(params.moe_profile_prompts - 1) : 0;
-        g_collector.set_phase(LLAMA_MOE_PHASE_PREFILL);
-        llama_set_moe_phase(ctx, LLAMA_MOE_PHASE_PREFILL);
-        for (int pos = 0; pos < prompt_size;) {
-            common_batch_clear(batch);
-            const int count = std::min(params.n_batch, prompt_size - pos);
-            for (int i = 0; i < count; ++i) {
-                auto token = tokens[start + pos + i];
-                if (pos + i == 0 && llama_vocab_get_add_bos(vocab)) { token = llama_vocab_bos(vocab); }
-                common_batch_add(batch, token, pos + i, {0}, pos + i == prompt_size - 1);
-                common_sampler_accept(sampler.get(), token, false);
-            }
-            if (llama_prefill(ctx, batch)) { llama_batch_free(batch); return false; }
-            pos += count;
-        }
-        g_collector.set_phase(LLAMA_MOE_PHASE_DECODE);
-        llama_set_moe_phase(ctx, LLAMA_MOE_PHASE_DECODE);
-        int generated = 0;
-        for (; generated < params.moe_profile_generate; ++generated) {
-            const auto token = common_sampler_sample(sampler.get(), ctx, -1);
-            if (llama_vocab_is_eog(vocab, token)) { break; }
-            common_sampler_accept(sampler.get(), token, true);
-            common_batch_clear(batch);
-            common_batch_add(batch, token, prompt_size + generated, {0}, true);
-            if (llama_decode(ctx, batch)) { llama_batch_free(batch); return false; }
-        }
-        g_collector.save_profile();
-        LOG_INF("%s: prompt %d/%d: %d prefill tokens, %d generated tokens\n", __func__, sample + 1, params.moe_profile_prompts, prompt_size, generated);
-    }
-    g_collector.set_phase(LLAMA_MOE_PHASE_CALIBRATION);
-    llama_batch_free(batch);
-    return true;
-}
-
 static bool show_statistics(const common_params & params) {
     std::vector<tensor_statistics> ts;
     if (params.in_files.empty() || params.in_files.size() > 1) {
@@ -1343,7 +1203,6 @@ int main(int argc, char ** argv) {
     }
 
     g_collector.save_imatrix();
-    if (!profile_generation(ctx, params)) { return 1; }
 
     LOG("\n");
     llama_perf_context_print(ctx);

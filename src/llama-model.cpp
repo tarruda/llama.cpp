@@ -2796,10 +2796,6 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.moe_cache_bytes             =*/ 0,
-        /*.moe_profile                 =*/ nullptr,
-        /*.moe_pin_count               =*/ 0,
-        /*.moe_read_threads            =*/ 4,
-        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_LRU,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2812,7 +2808,6 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.stream_moe                  =*/ false,
-        /*.moe_pin_encoder             =*/ false,
     };
 
     return result;

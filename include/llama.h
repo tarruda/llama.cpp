@@ -217,11 +217,6 @@ extern "C" {
         LLAMA_MOE_PHASE_DECODE = 2,
     };
 
-    enum llama_moe_cache_policy {
-        LLAMA_MOE_CACHE_LRU = 0,
-        LLAMA_MOE_CACHE_ADAPTIVE = 1,
-    };
-
     struct llama_moe_cache_stats {
         uint64_t hits;
         uint64_t misses;
@@ -342,11 +337,7 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
-        uint64_t moe_cache_bytes;   // total routed expert cache, including pins; 0 = automatic
-        const char * moe_profile;   // routing frequency JSON; required for a positive pin count
-        int32_t moe_pin_count;      // global expert bundle count, including encoder pins
-        int32_t moe_read_threads;   // concurrent positioned reads
-        enum llama_moe_cache_policy moe_cache_policy;
+        uint64_t moe_cache_bytes; // routed expert cache; 0 = active-expert working set only
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -373,7 +364,6 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool stream_moe;      // force load-mode none and lazy-mode on
-        bool moe_pin_encoder; // always pin all routed encoder experts
     };
 
     struct llama_sampler_seq_config {

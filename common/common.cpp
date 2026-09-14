@@ -1678,10 +1678,6 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
-    if (params.moe_cache_policy == LLAMA_MOE_CACHE_ADAPTIVE &&
-            (!params.stream_moe || !params.moe_profile.empty() || params.moe_pin_count > 0)) {
-        throw std::invalid_argument("adaptive MoE caching requires --stream-moe and excludes --moe-profile and positive --moe-pin-count");
-    }
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
@@ -1695,11 +1691,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.lazy_mode = params.lazy_mode;
     mparams.stream_moe = params.stream_moe;
     mparams.moe_cache_bytes = params.moe_cache_bytes;
-    mparams.moe_pin_count = params.moe_pin_count;
-    mparams.moe_pin_encoder = params.moe_pin_encoder;
-    mparams.moe_read_threads = params.moe_read_threads;
-    mparams.moe_cache_policy = params.moe_cache_policy;
-    mparams.moe_profile = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
     if (params.stream_moe) {
         LOG_INF("%s: routed streaming uses load-mode none and lazy-mode on\n", __func__);
         params.load_mode = LLAMA_LOAD_MODE_NONE;

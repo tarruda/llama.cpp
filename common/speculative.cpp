@@ -2527,11 +2527,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
         result.stream_moe            = false;
         result.moe_cache_bytes       = 0;
-        result.moe_pin_count         = 0;
-        result.moe_pin_encoder       = false;
-        result.moe_cache_policy       = LLAMA_MOE_CACHE_LRU;
-        result.moe_profile.clear();
-        result.moe_profile_output.clear();
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;

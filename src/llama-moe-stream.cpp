@@ -79,13 +79,6 @@ private:
     bool stop = false;
 };
 
-uint64_t profile_uint(const nlohmann::json & value) {
-    if (!value.is_number_unsigned() && !(value.is_number_integer() && value.get<int64_t>() >= 0)) {
-        throw std::runtime_error("MoE profile integers must be nonnegative");
-    }
-    return value.get<uint64_t>();
-}
-
 ggml_tensor * external_tensor(ggml_context * ctx, const ggml_tensor * tensor) {
     auto * result = ggml_dup_tensor(ctx, tensor);
     std::copy_n(tensor->nb, GGML_MAX_DIMS, result->nb);
@@ -121,8 +114,7 @@ struct llama_moe_stream::impl {
 
     struct layer {
         std::array<projection, 3> projections;
-        std::vector<bool> pinned;
-        std::array<std::vector<bool>, 3> phase_pins;
+        std::vector<bool> protected_experts;
         std::vector<int32_t> expert_to_slot;
         std::vector<int32_t> slot_to_expert;
         std::vector<uint8_t> valid_projections;
@@ -170,11 +162,9 @@ struct llama_moe_stream::impl {
     int64_t read_span_us = 0;
     std::array<llama_moe_cache_stats, 3> phase_stats = {};
     bool check_tensors = false;
-    bool adaptive = false;
     bool global_cache = false;
     bool overlap = true;
     bool split_enabled = true;
-    int prefill_hot_percent = 0;
     std::ofstream trace;
     llama_moe_phase phase = LLAMA_MOE_PHASE_PREFILL;
     llama_progress_callback progress = nullptr;
@@ -195,32 +185,13 @@ struct llama_moe_stream::impl {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR || params.split_mode == LLAMA_SPLIT_MODE_ROW || params.load_mtp) {
             throw std::runtime_error("routed streaming does not support tensor/row splitting or MTP");
         }
-        if (params.moe_pin_count < 0 || params.moe_read_threads < 1 || params.moe_read_threads > 64) {
-            throw std::runtime_error("invalid MoE pin count or read thread count");
-        }
         n_expert = hp.n_expert;
-        if (n_expert <= 0 || (uint64_t) params.moe_pin_count > (uint64_t) hp.n_layer()*n_expert) {
-            throw std::runtime_error("MoE pin count exceeds the model expert count");
-        }
+        if (n_expert <= 0) { throw std::runtime_error("routed streaming requires experts"); }
         for (uint32_t il = 0; il < hp.n_layer(); ++il) { n_expert_used = std::max(n_expert_used, (int) hp.n_expert_used(il)); }
-        n_readers = params.moe_read_threads;
-        if (params.moe_cache_policy != LLAMA_MOE_CACHE_LRU && params.moe_cache_policy != LLAMA_MOE_CACHE_ADAPTIVE) {
-            throw std::runtime_error("invalid MoE cache policy");
-        }
-        adaptive = params.moe_cache_policy == LLAMA_MOE_CACHE_ADAPTIVE;
+        n_readers = 4;
         if (const char * value = std::getenv("LLAMA_MOE_OVERLAP")) { overlap = std::strcmp(value, "0") != 0; }
         if (const char * value = std::getenv("LLAMA_MOE_SPLIT")) { split_enabled = std::strcmp(value, "0") != 0; }
         split_enabled = split_enabled && overlap && n_expert_used <= 32;
-        if (const char * value = std::getenv("LLAMA_MOE_PREFILL_HOT")) {
-            size_t end;
-            prefill_hot_percent = std::stoi(value, &end);
-            if (value[end] || prefill_hot_percent < 0 || prefill_hot_percent > 75) {
-                throw std::runtime_error("LLAMA_MOE_PREFILL_HOT must be between 0 and 75");
-            }
-        }
-        if (adaptive && (params.moe_pin_count > 0 || (params.moe_profile && params.moe_profile[0]))) {
-            throw std::runtime_error("adaptive MoE caching excludes --moe-profile and positive --moe-pin-count");
-        }
         check_tensors = params.check_tensors;
         progress = params.progress_callback;
         progress_data = params.progress_callback_user_data;
@@ -231,8 +202,7 @@ struct llama_moe_stream::impl {
             auto & l = layers[il];
             id_names.emplace("moe_stream_ids." + std::to_string(il), il);
             prefetch_names.emplace("moe_stream_prefetch." + std::to_string(il), il);
-            l.pinned.assign(n_expert, params.moe_pin_encoder && il < layers.size()/2);
-            l.phase_pins.fill(l.pinned);
+            l.protected_experts.assign(n_expert, false);
             for (size_t p = 0; p < kinds.size(); ++p) {
                 const auto name = tn(kinds[p], "weight", il).str();
                 auto * t = loader.require_tensor_meta(name);
@@ -255,107 +225,34 @@ struct llama_moe_stream::impl {
             }
         }
 
-        const int encoder_pins = params.moe_pin_encoder ? int(layers.size()/2)*n_expert : 0;
-        const int ranked_pins = std::max(0, params.moe_pin_count - encoder_pins);
-        if (params.moe_pin_count > 0 && (!params.moe_profile || !params.moe_profile[0])) {
-            throw std::runtime_error("a positive MoE pin count requires a routing profile");
-        }
-        if (params.moe_profile && params.moe_profile[0]) {
-            std::ifstream input(params.moe_profile);
-            if (!input) { throw std::runtime_error("cannot open MoE routing profile"); }
-            const auto doc = nlohmann::json::parse(input);
-            const auto & model = doc.at("model");
-            if (doc.at("format") != "llama-moe-profile" || profile_uint(doc.at("version")) != 1 ||
-                    model.at("architecture") != loader.get_arch_name() || profile_uint(model.at("layers")) != layers.size() ||
-                    profile_uint(model.at("experts_per_layer")) != (uint64_t) n_expert || profile_uint(model.at("embedding_length")) != hp.n_embd) {
-                throw std::runtime_error("MoE profile does not match the model architecture and expert topology");
-            }
-            const std::array<const char *, 3> phases = {"calibration", "prefill", "decode"};
-            for (size_t phase_id = 0; phase_id < phases.size(); ++phase_id) {
-                struct ranked_expert { uint64_t count; int layer; int expert; };
-                std::vector<ranked_expert> ranked;
-                std::vector<bool> seen(layers.size()*n_expert, false);
-                const bool has_phase = doc.contains("phases") && doc.at("phases").contains(phases[phase_id]);
-                if (!has_phase && ranked_pins > 0) {
-                    LLAMA_LOG_WARN("moe_stream: no %s observations; using calibration counts for these pins\n", phases[phase_id]);
-                }
-                const auto & observations = has_phase ?
-                    doc.at("phases").at(phases[phase_id]).at("layers") : doc.at("layers");
-                for (const auto & row : observations) {
-                    const uint64_t il = profile_uint(row.at("layer"));
-                    if (il >= layers.size()) { throw std::runtime_error("MoE profile layer is out of range"); }
-                    for (const auto & expert : row.at("experts")) {
-                        const uint64_t id = profile_uint(expert.at("id"));
-                        if (id >= (uint64_t) n_expert || seen[il*n_expert + id]) {
-                            throw std::runtime_error("MoE profile has duplicate or invalid experts");
-                        }
-                        seen[il*n_expert + id] = true;
-                        const uint64_t count = profile_uint(expert.at("count"));
-                        if (!layers[il].pinned[id]) { ranked.push_back({count, (int) il, (int) id}); }
-                    }
-                }
-                if (std::find(seen.begin(), seen.end(), false) != seen.end()) {
-                    throw std::runtime_error("MoE profile must include counts for every expert, including zero counts");
-                }
-                std::sort(ranked.begin(), ranked.end(), [](const ranked_expert & a, const ranked_expert & b) {
-                    if (a.count != b.count) { return a.count > b.count; }
-                    return std::tie(a.layer, a.expert) < std::tie(b.layer, b.expert);
-                });
-                for (int i = 0; i < ranked_pins; ++i) { layers[ranked[i].layer].phase_pins[phase_id][ranked[i].expert] = true; }
-            }
-        }
-
-        for (auto & l : layers) { l.pinned = l.phase_pins[phase]; }
-
         uint64_t budget = params.moe_cache_bytes;
-        if (!budget) {
-            size_t free = 0, total = 0;
-            auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            ggml_backend_dev_memory(cpu, &free, &total);
-            budget = (free ? free : total)/3*2;
-        }
         const uint64_t expert_bytes = layers.front().expert_bytes;
+        if (!budget) { budget = std::max(1, n_expert_used)*expert_bytes; }
         const uint64_t total_routed_bytes = std::accumulate(layers.begin(), layers.end(), uint64_t(0), [=](uint64_t sum, const layer & l) { return sum + n_expert*l.expert_bytes; });
         const uint64_t total_experts = layers.size()*n_expert;
-        global_cache = adaptive && budget < total_routed_bytes;
+        global_cache = budget < total_routed_bytes;
         if (global_cache && std::any_of(layers.begin(), layers.end(), [=](const layer & l) { return l.expert_bytes != expert_bytes; })) {
             throw std::runtime_error("adaptive MoE caching requires equal expert sizes in every layer");
         }
         const uint64_t available_slots = std::min(total_experts, budget/expert_bytes);
-        const bool profile_mode = params.moe_profile && params.moe_profile[0];
-        const int resident_layers = global_cache && !profile_mode && !params.moe_pin_encoder &&
-                params.moe_pin_count == 0 && layers.size() > 19 && available_slots >= 12*(uint64_t) n_expert ? 4 : 0;
+        const int resident_layers = global_cache && layers.size() > 19 && available_slots >= 12*(uint64_t) n_expert ? 4 : 0;
         if (resident_layers) {
             static constexpr int order[] = { 0, 1, 19, 2 };
             for (int i = 0; i < resident_layers; ++i) { layers[order[i]].fully_resident = true; }
         }
         const uint64_t resident_bytes = (uint64_t) resident_layers*n_expert*expert_bytes;
-        uint64_t minimum = 0, pinned_bytes = 0;
-        size_t total_pins = 0;
-        std::array<size_t, 3> phase_pin_counts = {};
+        uint64_t minimum = 0;
         for (auto & l : layers) {
-            const int pins = std::count(l.pinned.begin(), l.pinned.end(), true);
-            if (!l.fully_resident) {
-                total_pins += pins;
-                pinned_bytes += pins*l.expert_bytes;
-            }
-            int max_pins = pins;
-            for (size_t p = 0; p < l.phase_pins.size(); ++p) {
-                const int count = std::count(l.phase_pins[p].begin(), l.phase_pins[p].end(), true);
-                if (!l.fully_resident) { phase_pin_counts[p] += count; }
-                max_pins = std::max(max_pins, count);
-            }
-            l.n_slots = l.fully_resident ? n_expert : std::min(n_expert, max_pins + 1);
+            l.n_slots = l.fully_resident ? n_expert : 1;
             minimum += l.n_slots*l.expert_bytes;
         }
         if (global_cache) {
-            const uint64_t max_pins = *std::max_element(phase_pin_counts.begin(), phase_pin_counts.end());
             const uint64_t resident_experts = resident_bytes/expert_bytes;
             const uint64_t streamed_experts = total_experts - resident_experts;
-            minimum = (resident_experts + max_pins + (max_pins < streamed_experts))*expert_bytes;
+            minimum = (resident_experts + (streamed_experts > 0))*expert_bytes;
         }
         if (budget < minimum) {
-            throw std::runtime_error(format("MoE cache requires at least %.2f MiB for requested pins and dynamic slots; budget is %.2f MiB", minimum/1048576.0, budget/1048576.0));
+            throw std::runtime_error(format("MoE cache requires at least %.2f MiB for its working slots; budget is %.2f MiB", minimum/1048576.0, budget/1048576.0));
         }
         uint64_t allocated = 0;
         if (global_cache) {
@@ -388,15 +285,11 @@ struct llama_moe_stream::impl {
                 l.valid_projections.assign(l.n_slots, 0);
                 l.age.assign(l.n_slots, 0);
             }
-            if (adaptive) { for (auto & counts : l.frequency) { counts.assign(n_expert, 0); } }
+            for (auto & counts : l.frequency) { counts.assign(n_expert, 0); }
         }
-        if (global_cache && prefill_hot_percent) {
-            throw std::runtime_error("LLAMA_MOE_PREFILL_HOT is not supported by the global adaptive cache");
-        }
-        LLAMA_LOG_INFO("moe_stream: %s cache policy%s\n", adaptive ? "adaptive" : "lru", global_cache ? " with a global slot pool" : "");
-        LLAMA_LOG_INFO("moe_stream: %zu pins (%d encoder preset), %d resident layers, %.2f MiB resident, %.2f MiB pinned, %.2f MiB dynamic, %.2f MiB total routed cache, %d read threads\n",
-                total_pins, encoder_pins, resident_layers, resident_bytes/1048576.0, pinned_bytes/1048576.0,
-                (allocated - resident_bytes - pinned_bytes)/1048576.0, allocated/1048576.0, n_readers);
+        LLAMA_LOG_INFO("moe_stream: adaptive cache%s\n", global_cache ? " with a global slot pool" : "");
+        LLAMA_LOG_INFO("moe_stream: %d resident layers, %.2f MiB resident, %.2f MiB dynamic, %.2f MiB total routed cache, %d read threads\n",
+                resident_layers, resident_bytes/1048576.0, (allocated - resident_bytes)/1048576.0, allocated/1048576.0, n_readers);
     }
 
     bool uses_global(const layer & l) const {
@@ -425,7 +318,6 @@ struct llama_moe_stream::impl {
             trace << nlohmann::json({{"layer", il}, {"phase", phase}, {"used", used}, {"ids", original}}).dump() << '\n';
             if (!trace) { throw std::runtime_error("cannot write MoE route trace"); }
         }
-        if (!adaptive) { return; }
         auto & counts = l.frequency[phase];
         for (size_t i = 0; i < original.size(); ++i) {
             counts[original[i]] += 1.0f;
@@ -435,15 +327,9 @@ struct llama_moe_stream::impl {
         }
     }
 
-    size_t count_pins() const {
+    size_t count_protected() const {
         size_t count = 0;
-        for (const auto & l : layers) { if (!l.fully_resident) { count += std::count(l.pinned.begin(), l.pinned.end(), true); } }
-        return count;
-    }
-
-    size_t count_phase_pins(llama_moe_phase selected) const {
-        size_t count = 0;
-        for (const auto & l : layers) { if (!l.fully_resident) { count += std::count(l.phase_pins[selected].begin(), l.phase_pins[selected].end(), true); } }
+        for (const auto & l : layers) { if (!l.fully_resident) { count += std::count(l.protected_experts.begin(), l.protected_experts.end(), true); } }
         return count;
     }
 
@@ -452,37 +338,16 @@ struct llama_moe_stream::impl {
         return slot < 0 ? 0 : uses_global(l) ? global_age[slot] : l.age[slot];
     }
 
-    void select_layer_phase_pins(layer & l) {
-        if (!adaptive || phase == LLAMA_MOE_PHASE_DECODE || l.fully_resident) { return; }
-        std::vector<int> hot;
-        for (int e = 0; e < n_expert; ++e) {
-            if (!l.pinned[e] && l.expert_to_slot[e] >= 0 && l.frequency[LLAMA_MOE_PHASE_DECODE][e] > 0) { hot.push_back(e); }
-        }
-        std::sort(hot.begin(), hot.end(), [&](int a, int b) {
-            const auto & counts = l.frequency[LLAMA_MOE_PHASE_DECODE];
-            if (counts[a] != counts[b]) { return counts[a] > counts[b]; }
-            return expert_age(l, a) > expert_age(l, b);
-        });
-        // Keep a quarter of the dynamic slots available for prompt work.
-        const size_t dynamic = l.n_slots - std::count(l.pinned.begin(), l.pinned.end(), true);
-        const size_t keep = std::min(hot.size(), dynamic - (dynamic + 3)/4);
-        for (size_t i = 0; i < keep; ++i) { l.pinned[hot[i]] = true; }
-    }
-
-    void select_phase_pins() {
-        for (auto & l : layers) { l.pinned = l.phase_pins[phase]; }
-        if (!global_cache) {
-            for (auto & l : layers) { select_layer_phase_pins(l); }
-            return;
-        }
-        if (!adaptive || phase == LLAMA_MOE_PHASE_DECODE) { return; }
+    void select_phase_protection() {
+        for (auto & l : layers) { std::fill(l.protected_experts.begin(), l.protected_experts.end(), false); }
+        if (!global_cache || phase == LLAMA_MOE_PHASE_DECODE) { return; }
         struct ranked_expert { int layer; int expert; };
         std::vector<ranked_expert> hot;
         for (size_t il = 0; il < layers.size(); ++il) {
             const auto & l = layers[il];
             if (l.fully_resident) { continue; }
             for (int e = 0; e < n_expert; ++e) {
-                if (!l.pinned[e] && l.expert_to_slot[e] >= 0 && l.frequency[LLAMA_MOE_PHASE_DECODE][e] > 0) { hot.push_back({(int) il, e}); }
+                if (!l.protected_experts[e] && l.expert_to_slot[e] >= 0 && l.frequency[LLAMA_MOE_PHASE_DECODE][e] > 0) { hot.push_back({(int) il, e}); }
             }
         }
         std::sort(hot.begin(), hot.end(), [&](const ranked_expert & a, const ranked_expert & b) {
@@ -495,94 +360,45 @@ struct llama_moe_stream::impl {
             const uint64_t ab = expert_age(lb, b.expert);
             return aa != ab ? aa > ab : std::tie(a.layer, a.expert) < std::tie(b.layer, b.expert);
         });
-        const size_t dynamic = global_n_slots - count_pins();
+        const size_t dynamic = global_n_slots - count_protected();
         const size_t reserve = std::min(dynamic, std::max<size_t>(n_expert, (dynamic + 9)/10));
         const size_t keep = std::min(hot.size(), dynamic - reserve);
-        for (size_t i = 0; i < keep; ++i) { layers[hot[i].layer].pinned[hot[i].expert] = true; }
+        for (size_t i = 0; i < keep; ++i) { layers[hot[i].layer].protected_experts[hot[i].expert] = true; }
     }
 
     void fit_small_group(layer & l, const std::vector<int32_t> & experts) {
-        if (!adaptive || phase == LLAMA_MOE_PHASE_DECODE) { return; }
-        if (global_cache) {
-            const int available = global_n_slots - count_phase_pins(phase);
-            if ((int) experts.size() > available) { return; }
-            std::vector<bool> required(n_expert, false);
-            int needed = 0;
-            for (int e : experts) { required[e] = true; needed += !l.pinned[e]; }
-            int capacity = global_n_slots - count_pins();
-            if (capacity >= needed) { return; }
-            struct ranked_expert { int layer; int expert; };
-            std::vector<ranked_expert> candidates;
-            for (size_t il = 0; il < layers.size(); ++il) {
-                auto & candidate_layer = layers[il];
-                if (candidate_layer.fully_resident) { continue; }
-                const auto & permanent = candidate_layer.phase_pins[phase];
-                for (int e = 0; e < n_expert; ++e) {
-                    if (candidate_layer.pinned[e] && !permanent[e] && (&candidate_layer != &l || !required[e])) {
-                        candidates.push_back({(int) il, e});
-                    }
-                }
-            }
-            std::sort(candidates.begin(), candidates.end(), [&](const ranked_expert & a, const ranked_expert & b) {
-                const auto & la = layers[a.layer];
-                const auto & lb = layers[b.layer];
-                const float ca = la.frequency[LLAMA_MOE_PHASE_DECODE][a.expert];
-                const float cb = lb.frequency[LLAMA_MOE_PHASE_DECODE][b.expert];
-                if (ca != cb) { return ca < cb; }
-                return expert_age(la, a.expert) < expert_age(lb, b.expert);
-            });
-            for (const auto & candidate : candidates) {
-                if (capacity >= needed) { break; }
-                layers[candidate.layer].pinned[candidate.expert] = false;
-                ++capacity;
-            }
-            return;
-        }
-        const auto & permanent = l.phase_pins[phase];
-        const int available = l.n_slots - std::count(permanent.begin(), permanent.end(), true);
+        if (!global_cache || phase == LLAMA_MOE_PHASE_DECODE) { return; }
+        const int available = global_n_slots;
         if ((int) experts.size() > available) { return; }
         std::vector<bool> required(n_expert, false);
         int needed = 0;
-        for (int e : experts) { required[e] = true; needed += !l.pinned[e]; }
-        int capacity = l.n_slots - std::count(l.pinned.begin(), l.pinned.end(), true);
+        for (int e : experts) { required[e] = true; needed += !l.protected_experts[e]; }
+        int capacity = global_n_slots - count_protected();
         if (capacity >= needed) { return; }
-        std::vector<int> candidates;
-        for (int e = 0; e < n_expert; ++e) {
-            if (l.pinned[e] && !permanent[e] && !required[e]) { candidates.push_back(e); }
+        struct ranked_expert { int layer; int expert; };
+        std::vector<ranked_expert> candidates;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & candidate_layer = layers[il];
+            if (candidate_layer.fully_resident) { continue; }
+            for (int e = 0; e < n_expert; ++e) {
+                if (candidate_layer.protected_experts[e] && (&candidate_layer != &l || !required[e])) {
+                    candidates.push_back({(int) il, e});
+                }
+            }
         }
-        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-            const auto & counts = l.frequency[LLAMA_MOE_PHASE_DECODE];
-            if (counts[a] != counts[b]) { return counts[a] < counts[b]; }
-            return expert_age(l, a) < expert_age(l, b);
+        std::sort(candidates.begin(), candidates.end(), [&](const ranked_expert & a, const ranked_expert & b) {
+            const auto & la = layers[a.layer];
+            const auto & lb = layers[b.layer];
+            const float ca = la.frequency[LLAMA_MOE_PHASE_DECODE][a.expert];
+            const float cb = lb.frequency[LLAMA_MOE_PHASE_DECODE][b.expert];
+            if (ca != cb) { return ca < cb; }
+            return expert_age(la, a.expert) < expert_age(lb, b.expert);
         });
-        // A small append can fit as one group by releasing the least useful temporary protections.
-        for (int e : candidates) {
+        for (const auto & candidate : candidates) {
             if (capacity >= needed) { break; }
-            l.pinned[e] = false;
+            layers[candidate.layer].protected_experts[candidate.expert] = false;
             ++capacity;
         }
-    }
-
-    void select_prompt_pins(layer & l, const std::vector<int32_t> & experts) {
-        if (!adaptive || !prefill_hot_percent || phase == LLAMA_MOE_PHASE_DECODE || l.fully_resident) { return; }
-        const int permanent = std::count(l.phase_pins[phase].begin(), l.phase_pins[phase].end(), true);
-        if ((int) experts.size() <= l.n_slots - permanent) { return; }
-        l.pinned = l.phase_pins[phase];
-        select_layer_phase_pins(l);
-        const int limit = permanent + (l.n_slots - permanent)*prefill_hot_percent/100;
-        const int count = std::count(l.pinned.begin(), l.pinned.end(), true);
-        if (count >= limit) { return; }
-        std::vector<int> hot;
-        for (int e : experts) { if (!l.pinned[e]) { hot.push_back(e); } }
-        std::sort(hot.begin(), hot.end(), [&](int a, int b) {
-            const auto & counts = l.frequency[phase];
-            if (counts[a] != counts[b]) { return counts[a] > counts[b]; }
-            const auto age_a = expert_age(l, a);
-            const auto age_b = expert_age(l, b);
-            return age_a != age_b ? age_a > age_b : a < b;
-        });
-        // Retain complete prompt bundles across projections and leave room for streaming.
-        for (size_t i = 0; i < hot.size() && (int) i < limit - count; ++i) { l.pinned[hot[i]] = true; }
     }
 
     bool expert_resident(const layer & l, int expert) const {
@@ -728,7 +544,7 @@ struct llama_moe_stream::impl {
         std::vector<bool> reserved(n_slots, false);
         for (int32_t e : experts) {
             const int current = l.expert_to_slot[e];
-            const uint8_t wanted = l.pinned[e] ? 7 : projections;
+            const uint8_t wanted = l.protected_experts[e] ? 7 : projections;
             if (current >= 0) {
                 if (shared) { global_age[current] = ++tick; }
                 else { l.age[current] = ++tick; }
@@ -748,11 +564,11 @@ struct llama_moe_stream::impl {
             for (int slot = 0; slot < n_slots; ++slot) {
                 const int old_layer = shared ? global_slot_to_layer[slot] : il;
                 const int old = shared ? global_slot_to_expert[slot] : l.slot_to_expert[slot];
-                if (reserved[slot] || (old >= 0 && (layers[old_layer].pinned[old] || (old_layer == il && protect[old])))) { continue; }
+                if (reserved[slot] || (old >= 0 && (layers[old_layer].protected_experts[old] || (old_layer == il && protect[old])))) { continue; }
                 const int previous_layer = victim < 0 ? -1 : shared ? global_slot_to_layer[victim] : il;
                 const int previous = victim < 0 ? -1 : shared ? global_slot_to_expert[victim] : l.slot_to_expert[victim];
                 if (victim < 0 || old < 0 || (previous >= 0 && (
-                        adaptive && layers[old_layer].frequency[phase][old] != layers[previous_layer].frequency[phase][previous] ?
+                        layers[old_layer].frequency[phase][old] != layers[previous_layer].frequency[phase][previous] ?
                         layers[old_layer].frequency[phase][old] < layers[previous_layer].frequency[phase][previous] :
                         (shared ? global_age[slot] < global_age[victim] : l.age[slot] < l.age[victim])))) {
                     victim = slot;
@@ -900,16 +716,15 @@ struct llama_moe_stream::impl {
         std::vector<int32_t> required;
         if (location.second == 0) { observe(location.first, original, used); }
         for (int e = 0; e < n_expert; ++e) { if (!rows[e].empty()) { required.push_back(e); } }
-        if (location.second == 0) { select_prompt_pins(l, required); }
         fit_small_group(l, required);
-        const int pins = global_cache ? count_pins() : std::count(l.pinned.begin(), l.pinned.end(), true);
-        const int capacity = (global_cache ? global_n_slots : l.n_slots) - pins;
+        const int protected_count = global_cache ? count_protected() : std::count(l.protected_experts.begin(), l.protected_experts.end(), true);
+        const int capacity = (global_cache ? global_n_slots : l.n_slots) - protected_count;
         std::vector<std::vector<int32_t>> groups(1);
         int unpinned = 0;
         for (int e : required) {
-            if (!l.pinned[e] && unpinned == capacity) { groups.emplace_back(); unpinned = 0; }
+            if (!l.protected_experts[e] && unpinned == capacity) { groups.emplace_back(); unpinned = 0; }
             groups.back().push_back(e);
-            unpinned += !l.pinned[e];
+            unpinned += !l.protected_experts[e];
         }
         for (const auto & group : groups) {
             acquire(l, group, groups.size() == 1 ? 7 : 1 << location.second);
@@ -1039,7 +854,7 @@ bool llama_moe_stream::load(llama_files & files) {
         if (!pimpl->trace) { throw std::runtime_error("cannot open MoE route trace"); }
         nlohmann::json layout = nlohmann::json::array();
         for (const auto & l : pimpl->layers) {
-            layout.push_back({{"slots", l.n_slots}, {"expert_bytes", l.expert_bytes}, {"phase_pins", l.phase_pins}, {"fully_resident", l.fully_resident}});
+            layout.push_back({{"slots", l.n_slots}, {"expert_bytes", l.expert_bytes}, {"fully_resident", l.fully_resident}});
         }
         pimpl->trace << nlohmann::json({{"format", "llama-moe-trace"}, {"version", 1}, {"experts", pimpl->n_expert},
                 {"global_slots", pimpl->global_n_slots}, {"layers", layout}}).dump() << '\n';
@@ -1092,7 +907,7 @@ bool llama_moe_stream::load(llama_files & files) {
     }
     for (auto & l : pimpl->layers) {
         for (int e = 0; e < pimpl->n_expert; ++e) {
-            if (!l.pinned[e] && !l.fully_resident) { continue; }
+            if (!l.protected_experts[e] && !l.fully_resident) { continue; }
             if (pimpl->progress && !pimpl->progress(1.0f, pimpl->progress_data)) { return false; }
             pimpl->acquire(l, {e});
         }
@@ -1120,7 +935,7 @@ void llama_moe_stream::set_phase(llama_moe_phase phase) {
     pimpl->finish_fill();
     if (pimpl->phase == phase) { return; }
     pimpl->phase = phase;
-    pimpl->select_phase_pins();
+    pimpl->select_phase_protection();
 }
 
 ggml_status llama_moe_stream::compute(ggml_backend_t backend, ggml_tensor * node, void * data) {
@@ -1171,11 +986,7 @@ void llama_moe_stream::begin_graph() {
 ggml_tensor * llama_moe_stream::build_ids(ggml_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_tensor * ids, ggml_tensor * shared, ggml_tensor * expert_input, ggml_tensor * weights, int il) {
     auto & l = pimpl->layers.at(il);
     if (l.fully_resident) { return ids; }
-    int capacity = pimpl->global_cache ? pimpl->global_n_slots : l.n_slots;
-    for (int phase = LLAMA_MOE_PHASE_CALIBRATION; phase <= LLAMA_MOE_PHASE_DECODE; ++phase) {
-        const int pins = pimpl->global_cache ? pimpl->count_phase_pins((llama_moe_phase) phase) : std::count(l.phase_pins[phase].begin(), l.phase_pins[phase].end(), true);
-        capacity = std::min(capacity, (int) (pimpl->global_cache ? pimpl->global_n_slots : l.n_slots) - pins);
-    }
+    const int capacity = pimpl->global_cache ? pimpl->global_n_slots : l.n_slots;
     if (ggml_nelements(ids) > capacity) { return ids; }
     auto * buft = ggml_backend_buffer_get_type(l.projections[0].cache->buffer);
     auto * dev = ggml_backend_buft_get_device(buft);

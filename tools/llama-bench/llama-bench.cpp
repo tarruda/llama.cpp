@@ -335,15 +335,9 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
 struct moe_stream_params {
     bool enabled = false;
     uint64_t cache_bytes = 0;
-    std::string profile;
-    int32_t pin_count = 0;
-    int32_t read_threads = 4;
-    llama_moe_cache_policy cache_policy = LLAMA_MOE_CACHE_LRU;
-    bool pin_encoder = false;
 
     bool operator==(const moe_stream_params & other) const {
-        return enabled == other.enabled && cache_bytes == other.cache_bytes && profile == other.profile &&
-            pin_count == other.pin_count && read_threads == other.read_threads && pin_encoder == other.pin_encoder && cache_policy == other.cache_policy;
+        return enabled == other.enabled && cache_bytes == other.cache_bytes;
     }
 };
 
@@ -457,12 +451,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -smoe, --stream-moe                         stream routed experts; forces load-mode none and lazy-mode on\n");
-    printf("  --moe-cache <MiB>                           routed cache including pins (default: 0 = automatic)\n");
-    printf("  --moe-profile <file>                        expert frequency JSON from llama-imatrix\n");
-    printf("  --moe-pin-count <N>                         global pinned expert bundles (default: 0; positive requires profile)\n");
-    printf("  --moe-pin-encoder                           permanently pin the full encoder\n");
-    printf("  --moe-read-threads <N>                       parallel read workers (default: 4)\n");
-    printf("  --moe-cache-policy <lru|adaptive>            eviction policy (default: lru; adaptive excludes profile pins)\n");
+    printf("  --moe-cache <MiB>                           adaptive routed cache; requires --stream-moe (default: 0 = active-expert working set only)\n");
     printf("  --prefill-mode <auto|full|ced>               prompt execution (default: auto)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -579,19 +568,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 exit(0);
             } else if (arg == "-smoe" || arg == "--stream-moe") {
                 params.moe.enabled = true;
-            } else if (arg == "--moe-pin-encoder") {
-                params.moe.pin_encoder = true;
-            } else if (arg == "--moe-cache" || arg == "--moe-profile" || arg == "--moe-pin-count" ||
-                       arg == "--moe-read-threads" || arg == "--moe-cache-policy" || arg == "--prefill-mode") {
+            } else if (arg == "--moe-cache" || arg == "--prefill-mode") {
                 if (++i >= argc) { invalid_param = true; break; }
                 const std::string value = argv[i];
-                if (arg == "--moe-profile") {
-                    params.moe.profile = value;
-                } else if (arg == "--moe-cache-policy") {
-                    if (value == "lru") { params.moe.cache_policy = LLAMA_MOE_CACHE_LRU; }
-                    else if (value == "adaptive") { params.moe.cache_policy = LLAMA_MOE_CACHE_ADAPTIVE; }
-                    else { invalid_param = true; break; }
-                } else if (arg == "--prefill-mode") {
+                if (arg == "--prefill-mode") {
                     if (value == "auto") { params.prefill_mode = COMMON_PREFILL_MODE_AUTO; }
                     else if (value == "full") { params.prefill_mode = COMMON_PREFILL_MODE_FULL; }
                     else if (value == "ced") { params.prefill_mode = COMMON_PREFILL_MODE_CED; }
@@ -603,12 +583,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     if (arg == "--moe-cache") {
                         if (uint64_t(number) > UINT64_MAX/1048576) { invalid_param = true; break; }
                         params.moe.cache_bytes = uint64_t(number)*1048576;
-                    } else if (arg == "--moe-pin-count") {
-                        if (number > INT32_MAX) { invalid_param = true; break; }
-                        params.moe.pin_count = number;
-                    } else {
-                        if (number < 1 || number > 64) { invalid_param = true; break; }
-                        params.moe.read_threads = number;
                     }
                 }
             } else if (arg == "-m" || arg == "--model") {
@@ -1299,11 +1273,6 @@ struct cmd_params_instance {
         mparams.no_host       = no_host;
         mparams.stream_moe = moe.enabled;
         mparams.moe_cache_bytes = moe.cache_bytes;
-        mparams.moe_profile = moe.profile.empty() ? nullptr : moe.profile.c_str();
-        mparams.moe_pin_count = moe.pin_count;
-        mparams.moe_read_threads = moe.read_threads;
-        mparams.moe_cache_policy = moe.cache_policy;
-        mparams.moe_pin_encoder = moe.pin_encoder;
         if (moe.enabled) {
             mparams.load_mode = LLAMA_LOAD_MODE_NONE;
             mparams.lazy_mode = LLAMA_LAZY_MODE_ON;
@@ -1678,7 +1647,7 @@ struct test {
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "stream_moe", "moe_cache_bytes", "moe_profile", "moe_pin_count", "moe_read_threads", "moe_pin_encoder", "moe_cache_policy", "prefill_mode",
+            "stream_moe", "moe_cache_bytes", "prefill_mode",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1692,11 +1661,11 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
-            field == "moe_cache_bytes" || field == "moe_pin_count" || field == "moe_read_threads") {
+            field == "moe_cache_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host" || field == "stream_moe" || field == "moe_pin_encoder") {
+            field == "embeddings" || field == "no_host" || field == "stream_moe") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1783,11 +1752,6 @@ struct test {
                                             std::to_string(n_depth),
                                             std::to_string(moe.enabled),
                                             std::to_string(moe.cache_bytes),
-                                            moe.profile,
-                                            std::to_string(moe.pin_count),
-                                            std::to_string(moe.read_threads),
-                                            std::to_string(moe.pin_encoder),
-                                            moe.cache_policy == LLAMA_MOE_CACHE_ADAPTIVE ? "adaptive" : "lru",
                                             prefill_mode == COMMON_PREFILL_MODE_FULL ? "full" : prefill_mode == COMMON_PREFILL_MODE_CED ? "ced" : "auto",
                                             test_time,
                                             std::to_string(avg_ns()),
