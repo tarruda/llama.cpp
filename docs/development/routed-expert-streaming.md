@@ -1,131 +1,86 @@
 # Routed expert streaming
 
-This private branch supports bounded routed expert streaming for DeepSeek V4.1 inference on POSIX systems. Metal shared buffers on Apple silicon receive positioned SSD reads directly. Other supported buffers use staged uploads. Always-used weights remain resident; Engram/PLE embedding rows use the existing lazy loader.
+This private branch supports routed expert streaming for DeepSeek V4.1 on POSIX systems. Always-used tensors stay resident. The routed expert gate, up, and down projections are loaded from GGUF shards into a bounded cache. Engram/PLE embedding rows use the separate lazy tensor loader.
 
-## Options
+## Interface
 
 | Option | Meaning |
 | --- | --- |
-| `-smoe`, `--stream-moe` | Enable streaming and force `--load-mode none --lazy-mode on`. |
-| `--moe-cache MiB` | Total routed cache allocation, including pins. Zero selects an automatic budget. Other model and runtime allocations are additional. |
-| `--moe-cache-policy lru\|adaptive` | Eviction policy, default `lru`. Adaptive learns live expert usage and excludes `--moe-profile` and positive `--moe-pin-count`. |
-| `--moe-profile FNAME` | Read a version 1 routing JSON from `llama-imatrix`. |
-| `--moe-pin-count N` | Global number of expert bundles selected for permanent encoder pins and phase-specific frequency pins. A positive value requires a profile. |
-| `--moe-pin-encoder` | Permanently pin every encoder expert, even if the pin count is smaller. These experts consume the pin count first. |
-| `--moe-read-threads N` | Number of concurrent positioned-read workers; default 4. |
+| `-smoe`, `--stream-moe` | Enable routed expert streaming. This forces `--load-mode none --lazy-mode on`. Without `--moe-cache`, the runtime allocates only enough slots for one active expert set. |
+| `--moe-cache MiB` | Allocate an adaptive routed expert cache. The value is the total routed cache budget and requires `--stream-moe`. Other model, context, compute, and lazy row allocations are additional. |
 
-An expert bundle contains its gate, up, and down projections. The budget is measured in bytes so it also works with mixed quantizations. Each layer has a bounded cache with enough room for its largest phase-specific pin set plus a dynamic slot, unless that layer is fully resident. Remaining budget is distributed across layers. Unpinned experts use LRU eviction by default. The cache may use slightly less than the requested budget because complete bundles must fit.
+The earlier LRU, routing JSON, expert pin count, encoder pin, and read worker options were removed. Adaptive routing is now the only cache policy. Streaming uses four positioned-read workers internally. `llama-imatrix` continues to collect quantization importance data, but it no longer emits or consumes expert frequency JSON.
 
-`--moe-cache-policy adaptive` learns decayed routing frequency from hits and misses, breaking frequency ties by recency. Calibration, prefill, and decode have separate histories. During prompt work, part of the resident decode working set stays protected while the remaining slots serve the prompt. Adaptive mode requires streaming and rejects profile input or a positive pin count. Explicit full-encoder residency works in either policy. Learned frequencies last for the loaded model's lifetime; adaptive startup has no calibration history.
-
-For small route sets on Metal shared buffers, selected expert reads start before the shared expert runs. A readiness boundary waits for the reads before routed projections consume the weights. Large route sets and staged-upload buffers retain the synchronous path. `LLAMA_MOE_OVERLAP=0` disables overlap for comparison. Read wait measures the exposed wait; load intervals also include time while the GPU does other work.
-
-For local diagnosis, `LLAMA_MOE_TRACE=/path/to/routes.jsonl` records cache layout and ordered routes at streamed layer boundaries. Fully resident layers do not emit route records. This is separate from imatrix profile output and can add logging overhead; use it to compare cache policies on the same traffic.
-
-Pin rankings are global within each execution phase. Prefill and decode rankings can allocate different pin counts to a layer; capacity must accommodate both. Overlapping pins retain their data across a phase change. Newly selected pins fill on first use and then remain protected in that phase. Encoder pins remain protected in every phase. If a phase is missing from the JSON, calibration counts are used with a warning. A profile with incompatible architecture, dimensions, missing expert IDs, or invalid counts is rejected.
-
-`--moe-pin-encoder --moe-pin-count 8000` on a 40-layer, 384-expert V4.1 model pins all 7,680 encoder experts plus the 320 highest-ranked decoder experts in each phase. Without an additional decoder pin count, the encoder flag can be used alone. The full MXFP4 encoder exceeds 128 GiB by itself and cannot fit on a 128 GiB device; reserve this option for smaller quantizations.
-
-Tensor storage for the Flash model's complete encoder expert bank:
-
-| Routed type | Encoder expert bank | With original resident weights | With Q8_0 default resident weights |
-| --- | --- | --- | --- |
-| MXFP4 | 134.47 GiB | 150.01 GiB | 142.75 GiB |
-| IQ3_XXS | 96.90 GiB | 112.43 GiB | 105.18 GiB |
-| Q2_K | 83.06 GiB | 98.59 GiB | 91.34 GiB |
-
-The Q8_0 default reduces other resident tensor storage from 15.53 to 8.28 GiB; the native quantizer preserves norms, router gates, and elementwise Engram weights. These storage sizes come from actual tensor shapes and quantization block sizes. Decoder expert cache, context, and compute buffers are additional allocations; Engram value and scale tables remain lazy. The complete decoder expert bank has the same storage size. Cache capacities per layer are fixed at model load; phase changes update pin selection, not capacity. Full encoder pinning remains active during generation, which still executes both networks in CED.
-
-## Serving
+An expert bundle contains one expert's gate, up, and down projections. Cache sizing uses the exact tensor strides, so it supports MXFP4, Q3_K, Q2_K, and other uniform routed quantizations. A budget that cannot hold one complete bundle is rejected. A zero cache setting still needs transient storage for the six experts selected by one V4.1 token; those slots have no persistent capacity beyond the active working set.
 
 ```bash
-./build/bin/llama-server -m model.gguf -ngl 99 -fa on \
-    --stream-moe --moe-cache 92160 \
-    --moe-profile experts.json --moe-pin-count 2000 \
-    --fit off -b 8192 -ub 8192 -c 128000 -np 1 \
-    --ctx-checkpoints 2 --cache-ram 512 --no-warmup \
+./build/bin/llama-server -m model.gguf --mmproj mmproj-BF16.gguf \
+    --stream-moe --moe-cache 87040 \
+    -ngl 99 -fa on --fit off -c 262144 -np 1 \
+    -b 8192 -ub 8192 -t 16 -tb 16 \
+    --prefill-mode ced --ctx-checkpoints 2 --cache-ram 1024 \
     --host 127.0.0.1 --port 8080
 ```
 
-The numbers above are starting points, not universal recommendations. Increase the cache only while measuring total physical memory and swap, including after a long prompt. Compare several held-out chats with and without pins: a corpus-specific pin set can reduce the space available for experts needed by a different workload. The server reports read bytes, cache misses, and read wait separately for prefill and decode. Cache lookups are counted at a layer or projection boundary depending on the execution path; compare bytes and time when comparing paths.
+## Cache behavior
 
-Before the dense FP8-to-BF16 upgrade, a 97 GiB routed cache, 2000 pins and 2048-token microbatches reached approximately 109.4 GiB process RSS on a 128 GiB M1 Ultra. Four read workers performed similarly to eight and better than two. Increasing the microbatch to 8192 improved a 5075-token prompt from 51.1 to 64.0 tokens/s at a 90 GiB cache budget, with identical responses and about 1.1 GiB more peak RSS. These historical budgets need to account for the larger BF16 dense weights. Larger pin sets helped the long prompt but slowed a repeated short chat; select pins for the expected workload.
+Partial caches use one global slot pool across all streamed layers. A `(layer, expert)` mapping identifies each resident bundle. Eviction ranks candidates by decayed frequency for the current execution phase and then by recency. Calibration, prefill, and decode have separate frequency histories. The history lasts for the loaded model's lifetime and starts empty.
 
-With a 128000-token context and 8192-token microbatches, the persistent V4.1 state allocation is approximately 699 MiB, including rollback and the encoder frontier. The global KV/index part is approximately 109 MiB. Compute buffers and lazily touched PLE rows are additional memory; the compact context size does not describe total process memory.
+When a conversation returns from decode to prefill, the cache protects the most useful resident decode experts. It leaves at least 10 percent of dynamic slots, or one layer's 384 experts when that is larger, available for prompt work. A large prompt can release the least useful temporary protections when its active group would otherwise need to be split.
 
-Context checkpoints are separate from `--cache-ram`: the server defaults to retaining up to 32 per slot. A checkpoint in this configuration can occupy about 590 MiB. `--ctx-checkpoints 2` bounds their memory cost while retaining recent rollback points; revisiting older branches of a conversation can require more prompt processing.
+When a partial cache can hold at least twelve complete layers, layers 0, 1, 19, and 2 are made fully resident within the same budget. Route replay found that these four layers save more routing and synchronization overhead than the global capacity they consume. Five resident layers performed worse because the fifth displaced too many experts from the shared pool.
 
-Before the dense FP8-to-BF16 upgrade, a 94 GiB routed cache with 2000 pins, four readers, 8192-token microbatches and two checkpoints passed a 20215-token recall request plus a follow-up that reused 20220 cached tokens. Peak process RSS was 109.5 GiB without added swap. Conversation recall, reasoning output, tool calls, tool-result handling and streaming responses also passed. These measurements cover the tested prompts; additional context and different PLE row access patterns can change memory use.
+For Metal shared buffers, positioned reads write directly into cache storage. Other supported buffers use staged uploads. Selected reads begin while the shared expert graph runs. During single-token decode, a mixed-hit layer can compute resident ranks while missing ranks are being read, then compute the missing ranks and combine both outputs in their original rank positions. `LLAMA_MOE_OVERLAP=0` and `LLAMA_MOE_SPLIT=0` remain private diagnostic environment variables.
 
-Single-slot text serving defaults to CED prefill. `--prefill-mode full` selects full causal prefill. CED runs the encoder over the full prompt and replays the decoder's final window; every generation step still runs both halves. Streaming does not evict all encoder data at the start of generation.
+The routed decode output fuses per-expert BF16 conversion, six-rank reduction, shared-expert addition, and final BF16 conversion into one Metal dispatch when its scratch layout is safe. Fully resident routed tensors use the normal graph and preserve original expert IDs. Streamed graphs sharing one model are serialized because they share mutable cache storage.
 
-### Q2_K hot expert caching on M1 Ultra
+`LLAMA_MOE_TRACE=/path/to/routes.jsonl` records the cache layout, ordered routes, and read intervals for local diagnosis. Fully resident layers do not emit route events. Tracing adds I/O overhead and is not a supported cache configuration format.
 
-The Q2_K routed / Q8_0 default / original I8 Engram recipe can use a 109 GiB adaptive expert cache on a 128 GiB M1 Ultra. For chat, leave encoder pinning disabled so both halves can cache their hot experts:
+## CED and images
 
-```bash
-./build/bin/llama-server -m model-Q2_K.gguf -ngl 99 -fa on \
-    --stream-moe --moe-cache-policy adaptive --moe-cache 111616 \
-    --moe-read-threads 4 --load-mode none --lazy-mode on \
-    --fit off -b 2048 -ub 2048 -c 262144 -np 1 -t 16 -tb 16 \
-    --prefill-mode ced --ctx-checkpoints 2 --cache-ram 1024 --no-warmup
-```
+Single-slot text serving defaults to CED prefill when the model supports it. The encoder processes the full prompt, and the decoder replays its final attention window. Every generated token still runs both halves. A routed cache therefore needs useful capacity for both encoder and decoder experts. Permanent encoder residency was removed because it reduced the capacity available to generation and did not make complete prompt processing resident.
 
-No draft model is loaded. Eight read workers did not improve a matched three-turn chat compared with four. Use physical footprint and swap when sizing this configuration; RSS also includes reclaimable mapped Engram pages. Fresh adaptive caches fill on demand, so startup memory use does not show the eventual footprint.
+Image input uses the V4.1 `deepseek41v` projector supplied with `--mmproj`. Image rows remain in reading order and have no V4 alignment padding. Image embeddings use the vision routing bias and bypass Engram. Text n-grams after an image stop at the image boundary. CED image chunks set the streaming phase to prefill before execution.
 
-Adding `--moe-pin-encoder` permanently reserves 83.06 GiB for the encoder and leaves about 25.94 GiB for the decoder. That configuration used about 119 GiB of physical process memory in measured chats and 5120-token prefill probes without increasing swap. It removes routed reads from the encoder pass, but complete CED prompt timing still includes decoder replay over the last 128 tokens. An instrumented 1280-token prompt took 9.45 seconds through the pinned encoder and 4.86 seconds afterward with warmed experts, or 89 tokens/s overall. A 5120-token prompt took 52.58 seconds through the encoder across three batches and 2.65 seconds afterward, or 93 tokens/s overall. These probes cleared prompt state between repeats and synchronized once at the encoder boundary. They are not measurements with the entire model resident.
+DSpark support exists elsewhere in the branch, but it is not part of the streaming configuration. Measurements on this M1 Ultra did not justify the memory and complexity cost, so current presets and validation must run without a draft model.
 
-The Q8_0 recipe requires Metal to honor explicit F32 activation requests on matrix multiplication. Otherwise, finite raw HC residuals above 65504 can overflow during F16 staging. The corrected F32-input Q8_0 matrix path avoids that overflow without changing weight bytes. V4.1 also uses the residual-first HC post mode to preserve separate product rounding and residual accumulation order when fusing the graph.
+## Measured behavior on the M1 Ultra
 
-## Resident DSpark and images
+The global pool, phase protection, mixed-hit overlap, fused output reduction, and four resident layers were first isolated with a fully resident control quant. These are architecture-level paths and do not select behavior by quantization type. On the control workload, the global pool improved repeated long-chat generation from about 13.50 to 14.36 tokens/s. Mixed-hit overlap improved a cold run from 9.60 to 10.09 tokens/s and a changed-topic repeat from 12.58 to 13.13 tokens/s. Four resident layers reached 14.53-14.54 tokens/s. The fully resident control reached 17.49 tokens/s, which shows that cache handler and Metal command-boundary overhead remain even without SSD misses.
 
-A converted V4.1 DSpark model can stay resident alongside the streamed target. The draft does not inherit target streaming or profile options. It shares the target token embedding and output projection, and captures only the target attention window from layers 37, 38, and 39. CED prompt replay supplies the same bounded feature window.
+The last MXFP4 comparison used the final global adaptive design and 8192-token batches:
 
-```bash
-./build/bin/llama-server -m model.gguf -md dspark.gguf \
-    --spec-type draft-dspark --spec-draft-n-max 2 --spec-draft-p-min 0 \
-    --stream-moe --moe-cache-policy adaptive --moe-cache 81920 \
-    -ngl 99 --spec-draft-ngl 99 -fa on --fit off \
-    -b 8192 -ub 8192 -c 128000 -np 1 --ctx-checkpoints 2 --no-warmup
-```
+| Routed cache | Cold long generation | Warm long generation | Warm short generation | Peak process memory |
+| --- | ---: | ---: | ---: | ---: |
+| 85 GiB | 5.44 tokens/s | 7.11 tokens/s | 11.92 tokens/s | 105.07 GiB |
+| 88 GiB | 5.55 tokens/s | 8.46 tokens/s | 12.26 tokens/s | about 107.4 GiB |
+| 95 GiB | 5.75 tokens/s | 13.06 tokens/s | 13.50 tokens/s | 111.59 GiB |
 
-The draft always evaluates its trained five-position noise block; `--spec-draft-n-max` limits how many proposals the target verifies. Confidence can truncate that prefix further. Target verification uses full causal inference and the target sampler. Rejected suffixes are removed from both contexts. Drafting can cost more than it saves when acceptance is low or its resident weights displace useful cached experts. Compare end-to-end chat timings at the same total memory budget.
+The 95 GiB warm result came from replaying the exact workload after its experts had entered the cache. It does not represent a cold or changed-topic chat. MXFP4 is too large for a useful cache hit rate at the desired memory margin, so the next target is a Q3_K routed quant with an 85 GiB cache. Its smaller bundles provide more resident expert slots at the same byte budget.
 
-Image input uses the V4.1 `deepseek41v` projector, supplied with `--mmproj`. Its image rows stay in reading order and have no V4 alignment padding. Image embeddings use the vision routing bias and bypass Engram; subsequent text n-grams stop at the image boundary. Image serving currently uses full prefill and can also use resident DSpark. Use `--prefill-mode full` or the automatic mode when loading a projector.
+Four and eight read workers performed similarly after warmup; four remains fixed. A profile showed meaningful time in both SSD wait and Metal synchronization. Cache victim selection itself was negligible. A prototype that fused routed gate, up, and SwiGLU work either corrupted reused scratch or lost performance after adding the required guard, so it was removed.
 
-Live server measurements with BF16 dense weights on the M1 Ultra:
+The persistent V4.1 context allocation measured about 699 MiB at 128K context with one slot, including rollback and the encoder frontier. Context checkpoints are separate from `--cache-ram`; each checkpoint in that configuration can use about 590 MiB. Use physical footprint and swap to size the routed cache because startup RSS does not include all experts or lazy Engram rows that a conversation will touch.
 
-| Workload | Adaptive streaming | Adaptive streaming with resident DSpark |
-| --- | --- | --- |
-| Three-turn coding conversation, generation | 4.22, 4.31, 4.44 tokens/s | 4.83, 5.57, 4.83 tokens/s |
-| Repeated short explanation, generation | 10.68 tokens/s | 9.59 tokens/s with two proposals; 4.88 with five |
-| Image description and OCR | Not measured | 3.96 tokens/s for the logo; 4.55 for the carrots |
+## Calibration and quantization
 
-The coding comparison used greedy decoding, 88 GiB of cache without drafting and 80 GiB with drafting, a 256 Ki-token context, 8192-token batches, CED, and two checkpoints. DSpark used up to five proposals with confidence threshold 0.5, accepting 74-83% of proposals. Each answer was capped at 192 tokens and hit that cap; these are bounded generation measurements, not completed-answer latency comparisons. Peak RSS was 106.3 GiB without drafting and 105.3 GiB with drafting. Responses with and without speculation differed in these tests. Different target batch shapes remain a possible numerical cause; the rollback fixture reproduced serial continuation logits exactly for all 72 tested cases. Sampling at a positive temperature can change draft acceptance and speed.
-
-The image tests used the BF16 projector, 80 GiB of cache, two proposals without confidence filtering, and full prefill. The 460-token logo prompt took 34.4 seconds to process; the 459-token carrot prompt took 28.3 seconds. Peak RSS was 107.8 GiB. These tests do not establish a universal DSpark speedup.
-
-## Calibration and validation
-
-Use the current branch's [imatrix tool](../../tools/imatrix/README.md#routed-expert-profiles) to obtain both quantization importance data and phase-specific routing counts. The collector sees original expert IDs and canonical source tensor dimensions even when the execution tensor is a smaller cache. Routing counts are not importance scores, and they should not be used to prune experts.
+For streamed calibration, `llama-imatrix` sees canonical source tensor dimensions even though the execution tensors contain only cache slots. V4.1 calibration uses full causal evaluation so that both halves receive importance data for every token.
 
 ```bash
 ./build/bin/llama-imatrix -m model.gguf -f calibration.txt \
     --stream-moe --moe-cache 81920 -ngl 99 -fa on --fit off \
     -c 8192 -b 8192 -ub 8192 --process-output --output-frequency 1 \
-    --moe-profile-output experts.json --moe-profile-generate 256 \
-    --moe-profile-prompts 16 --moe-profile-prompt-tokens 1024 \
-    -o imatrix.gguf --seed 41
+    -o imatrix.gguf
 ```
 
-Calibration batches need more working memory than single-token generation, so use a smaller routed cache. The generation pass collects routing statistics without changing the importance matrix. Keep both final files: the quantizer consumes `imatrix.gguf`, while streaming consumes `experts.json`. A zero-count expert has no measured importance; the native quantizer substitutes unit importance for that expert.
+Calibration batches need more working memory than single-token generation. Only complete corpus chunks are evaluated, and imatrix checkpoints are replaced atomically. A zero-count expert has no measured importance; the quantizer substitutes unit importance for that expert.
 
-The quantizer preserves V4.1's FP8 Engram tables unless a tensor-type override names them. For example, `--tensor-type 'engram_embd\.weight=iq4_nl' --allow-requantize` decodes each FP8 block with its E8M0 scale before quantizing it. Conversion uses the existing bounded row slabs. Runtime lazy lookup dequantizes only the requested rows and does not read the original scales for quantized tables. The scale tensors remain in the GGUF, unchanged, for layout compatibility. Elementwise BF16 Engram key/query weights remain unchanged; routed projections and the Engram KV projection are independently eligible for quantization.
+The quantizer can requantize V4.1 Engram tables when a tensor override names them. Runtime lazy lookup then dequantizes only requested rows. Engram scale tensors remain in the GGUF for layout compatibility. Routed projections and the Engram KV projection are independently eligible for quantization.
 
-Perplexity and reference-logit generation use full causal inference. For V4.1, set `-c 512 -b 512 -ub 512` to evaluate one sequence at a time; a larger batch than context makes the perplexity tool create multiple sequences, which this runtime does not support. An 80 GiB routed cache leaves room for the evaluation buffers. Keep Metal residency enabled on this device. Reference `.kld` files generated with `--save-all-logits` can later be supplied to `--kl-divergence-base` when evaluating a quantized model.
+Perplexity and reference-logit generation use full causal inference. Use `-c 512 -b 512 -ub 512` for the established V4.1 comparison so the tool evaluates one sequence. Supply the MXFP4 reference made with `--save-all-logits` through `--kl-divergence-base` when measuring a quantized model. Save the full command, build revision, memory samples, perplexity, and KLD output together.
 
-The low-level API exposes `llama_set_moe_phase`, `llama_get_moe_cache_stats`, and `llama_model_tensor_source`. Callers should set the phase before each prefill or decode operation. The server, imatrix profiler, and benchmark do this automatically. Streamed graphs sharing a model are serialized to protect cache storage while Metal work is in flight.
+## Limits
 
-Row/tensor splitting, MTP loading, Windows streaming, and model loading without GGUF source files are currently rejected. Automatic CPU repacking is disabled for streaming. Use native CPU or Metal buffers for routed tensors. The cache handles quantization strides directly; it does not requantize weights.
+Row or tensor splitting, MTP loading, Windows streaming, and model loading without GGUF source files are rejected. Automatic CPU repacking is disabled for streamed experts. The global adaptive pool requires equal expert bundle sizes in every layer. LoRA tensors targeting nonresident routed weights are rejected because their canonical source descriptors do not expose resident buffers.
 
-Metal attention can decode visible cache rows into temporary F32 working storage and reuse them across query heads. Single-token attention expands only selected rows, computes each query/key score once, and shares each online-softmax tile across 256 output threads when dimensions permit. With at least 256 visible compressed rows, a tiled unpack also creates a column-major key copy for coalesced score reads. The 128-dimensional indexer decodes each packed key once per lane and reuses the values across query heads. These paths preserve the existing arithmetic order and BF16 rounding boundaries. Persistent context remains packed. The working allocation is included in the compute buffer, so include it when setting the routed cache budget. `GGML_METAL_DSV41_ATTN_UNPACK_DISABLE=1` selects the original packed attention path for comparisons; `GGML_METAL_DSV41_ATTN_THREADS=64 GGML_METAL_DSV41_ATTN_TRANSPOSE_SCORES=0` selects the previous selected-row path. Streamed expert groups preserve the original Metal matrix/vector dispatch choice, since those kernels can use different dequantization precision for types such as Q8_0. LoRA tensors targeting nonresident routed weights are rejected; their canonical source descriptors do not expose a resident weight buffer.
+The low-level API exposes `llama_set_moe_phase`, `llama_get_moe_cache_stats`, and `llama_model_tensor_source`. Callers must set the phase before prefill or decode. The server, benchmark, and imatrix tool do this automatically.

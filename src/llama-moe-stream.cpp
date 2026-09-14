@@ -235,7 +235,7 @@ struct llama_moe_stream::impl {
             throw std::runtime_error("adaptive MoE caching requires equal expert sizes in every layer");
         }
         const uint64_t available_slots = std::min(total_experts, budget/expert_bytes);
-        const int resident_layers = global_cache && layers.size() > 19 && available_slots >= 12*(uint64_t) n_expert ? 4 : 0;
+        const int resident_layers = global_cache && layers.size() > 19 && available_slots >= 12*(uint64_t) n_expert ? 1 : 0;
         if (resident_layers) {
             static constexpr int order[] = { 0, 1, 19, 2 };
             for (int i = 0; i < resident_layers; ++i) { layers[order[i]].fully_resident = true; }
@@ -321,7 +321,7 @@ struct llama_moe_stream::impl {
         auto & counts = l.frequency[phase];
         for (size_t i = 0; i < original.size(); ++i) {
             counts[original[i]] += 1.0f;
-            if ((i + 1) % used == 0 && ++l.observations[phase] % 16 == 0) {
+            if ((i + 1) % used == 0 && ++l.observations[phase] % 32 == 0) {
                 for (auto & count : counts) { count *= 0.5f; }
             }
         }
@@ -340,7 +340,16 @@ struct llama_moe_stream::impl {
 
     void select_phase_protection() {
         for (auto & l : layers) { std::fill(l.protected_experts.begin(), l.protected_experts.end(), false); }
-        if (!global_cache || phase == LLAMA_MOE_PHASE_DECODE) { return; }
+        if (!global_cache) { return; }
+        if (phase == LLAMA_MOE_PHASE_DECODE) {
+            for (auto & l : layers) {
+                if (l.fully_resident) { continue; }
+                for (int e = 0; e < n_expert; ++e) {
+                    l.frequency[phase][e] = std::max(l.frequency[phase][e], l.frequency[LLAMA_MOE_PHASE_PREFILL][e]*0.125f);
+                }
+            }
+            return;
+        }
         struct ranked_expert { int layer; int expert; };
         std::vector<ranked_expert> hot;
         for (size_t il = 0; il < layers.size(); ++il) {
