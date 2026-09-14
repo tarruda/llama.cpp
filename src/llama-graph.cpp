@@ -1827,21 +1827,24 @@ ggml_tensor * llm_graph_context::build_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate && type_gate == LLM_FFN_PAR) {
+                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                    const float limit = il >= 0 ? hparams.swiglu_clamp_shexp[il] : 0.0f;
+                    cur = ggml_dsv4_swiglu(ctx0, cur, tmp, nullptr, limit);
+                    cb(cur, "ffn_swiglu", il);
+                    type_gate = LLM_FFN_SEQ;
+                    break;
+                }
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                            cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
-                        } else {
-                            tmp = ggml_clamp(ctx0, tmp, -limit, limit);
-                            cb(tmp, "ffn_up_clamped", il);
-                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                            cb(gate_act, "ffn_silu", il);
-                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                            cb(gate_act, "ffn_silu_clamped", il);
-                            cur = ggml_mul(ctx0, gate_act, tmp);
-                        }
+                        tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                        cb(tmp, "ffn_up_clamped", il);
+                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                        cb(gate_act, "ffn_silu", il);
+                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                        cb(gate_act, "ffn_silu_clamped", il);
+                        cur = ggml_mul(ctx0, gate_act, tmp);
                         cb(cur, "ffn_swiglu_limited", il);
                         type_gate = LLM_FFN_SEQ;
                         break;
@@ -2221,15 +2224,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     const bool has_gate = gate_exps || gate_up_exps;
+    bool weight_in_swiglu = false;
 
     switch (type_op) {
         case LLM_FFN_SILU:
+            if (has_gate && (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0))) {
+                const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+                cur = ggml_dsv4_swiglu(ctx0, cur, up, weights, limit);
+                weight_in_swiglu = true;
+                cb(cur, "ffn_moe_swiglu", il);
+                break;
+            }
             if (gate_exps) {
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2317,7 +2328,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !weight_in_swiglu) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }

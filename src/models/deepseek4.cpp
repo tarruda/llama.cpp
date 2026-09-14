@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -16,7 +17,16 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
+static void dsv4_require(bool condition, const char * message) {
+    if (!condition) {
+        throw std::runtime_error(std::string("DeepSeek-V4: ") + message);
+    }
+}
+
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    dsv4_require(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS, "invalid block count");
+    dsv4_require(hparams.n_layer_nextn <= hparams.n_layer_all, "nextn block count exceeds block count");
+
     if (hparams.n_layer_nextn > 0) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
@@ -50,6 +60,22 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
 
+    dsv4_require(hparams.n_embd > 0 && uint64_t(hparams.dsv4_hc_mult)*hparams.n_embd <= std::numeric_limits<uint32_t>::max(), "invalid embedding or hyper-connection dimensions");
+    dsv4_require(hparams.dsv4_hc_mult == 4, "hyper-connection count must be 4");
+    dsv4_require(hparams.dsv4_hc_sinkhorn_iters > 0, "Sinkhorn iteration count must be positive");
+    dsv4_require(std::isfinite(hparams.dsv4_hc_eps) && hparams.dsv4_hc_eps > 0.0f, "invalid hyper-connection epsilon");
+    dsv4_require(std::isfinite(hparams.f_norm_rms_eps) && hparams.f_norm_rms_eps > 0.0f, "invalid RMS normalization epsilon");
+    dsv4_require(hparams.n_lora_q > 0 && hparams.n_swa > 0 && hparams.n_embd_head_k_full > 0 && hparams.n_embd_head_k_full == hparams.n_embd_head_v_full && hparams.n_rot_full <= hparams.n_embd_head_k_full, "invalid attention dimensions");
+    dsv4_require(hparams.indexer_n_head > 0 && hparams.indexer_head_size >= hparams.n_rot_full && hparams.indexer_top_k > 0, "invalid attention indexer dimensions");
+    dsv4_require(hparams.n_head() > 0 && hparams.dsv4_o_group_count > 0 && hparams.dsv4_o_lora_rank > 0 && hparams.n_head() % hparams.dsv4_o_group_count == 0, "invalid grouped attention output dimensions");
+    dsv4_require(hparams.dsv4_hash_layer_count <= hparams.n_layer(), "hash layer count exceeds main block count");
+    dsv4_require(std::isfinite(hparams.dsv4_compress_rope_base) && hparams.dsv4_compress_rope_base > 0.0f, "invalid compression RoPE frequency base");
+    dsv4_require(std::isfinite(hparams.expert_weights_scale), "invalid expert weight scale");
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        dsv4_require(std::isfinite(hparams.swiglu_clamp_exp[il]) && hparams.swiglu_clamp_exp[il] >= 0.0f, "invalid routed expert SwiGLU clamp");
+        dsv4_require(std::isfinite(hparams.swiglu_clamp_shexp[il]) && hparams.swiglu_clamp_shexp[il] >= 0.0f, "invalid shared expert SwiGLU clamp");
+    }
+
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
     uint32_t n_compress_ratios = 0;
@@ -57,8 +83,12 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     if (n_compress_ratios < hparams.n_layer_all) {
         throw std::runtime_error("DeepSeek-V4 compress_ratios is shorter than block_count");
     }
-    GGML_ASSERT(n_compress_ratios <= LLAMA_MAX_LAYERS);
+    dsv4_require(n_compress_ratios <= LLAMA_MAX_LAYERS, "compress_ratios exceeds the layer limit");
     ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        const uint32_t ratio = hparams.dsv4_compress_ratios[il];
+        dsv4_require(ratio == 0 || ratio == 4 || ratio == 128, "unsupported attention compression ratio");
+    }
 
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
     if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -287,6 +317,19 @@ static ggml_tensor * dsv4_hc_affine(
     return x;
 }
 
+static ggml_tensor * dsv4_rstd(ggml_context * ctx, ggml_tensor * x, float eps) {
+    ggml_tensor * variance = ggml_scale_bias(ctx, ggml_mean(ctx, ggml_sqr(ctx, x)), 1.0f, eps);
+    ggml_tensor * one = ggml_fill(ctx, ggml_dup_tensor(ctx, variance), 1.0f);
+    return ggml_div(ctx, one, ggml_sqrt(ctx, variance));
+}
+
+static ggml_tensor * dsv4_mul_mat_f32(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x) {
+    ggml_tensor * result = ggml_mul_mat(ctx, weight, x);
+    GGML_ASSERT(ggml_prec_set_src(result, GGML_PREC_F32, 0));
+    GGML_ASSERT(ggml_prec_set_src(result, GGML_PREC_F32, 1));
+    return result;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * x,
         ggml_tensor * weights,
@@ -314,43 +357,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     return result;
 }
 
-ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
-        ggml_tensor * comb,
-        int           il) const {
-    GGML_UNUSED(il);
-
-    // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
-    // row softmax over dst, one column normalization, then repeated row/column normalization.
-    comb = ggml_soft_max(ctx0, comb);
-
-    ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    eps = ggml_fill(ctx0, eps, hparams.dsv4_hc_eps);
-
-    comb = ggml_add(ctx0, comb, eps);
-
-    auto norm_cols = [&]() {
-        ggml_tensor * comb_src_dst = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
-        ggml_tensor * col_sum = ggml_sum_rows(ctx0, comb_src_dst);
-        col_sum = ggml_add(ctx0, col_sum, eps);
-        col_sum = ggml_permute(ctx0, col_sum, 1, 0, 2, 3);
-        comb = ggml_div(ctx0, comb, col_sum);
-    };
-
-    auto norm_rows = [&]() {
-        ggml_tensor * row_sum = ggml_sum_rows(ctx0, comb);
-        row_sum = ggml_add(ctx0, row_sum, eps);
-        comb = ggml_div(ctx0, comb, row_sum);
-    };
-
-    norm_cols();
-    for (uint32_t i = 1; i < hparams.dsv4_hc_sinkhorn_iters; ++i) {
-        norm_rows();
-        norm_cols();
-    }
-
-    return comb;
-}
-
 ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
@@ -368,41 +374,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
-    ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    ggml_tensor * mixes = ggml_mul(ctx0, dsv4_mul_mat_f32(ctx0, hc_fn, flat), dsv4_rstd(ctx0, flat, norm_rms_eps));
     cb(mixes, "hc_mixes", il);
 
-    ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
-    ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
-
-    ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
-    ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
-
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
-    pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
-    pre = ggml_sigmoid(ctx0, pre);
-    pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
+    ggml_tensor * split = ggml_dsv4_hc_split(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+            (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+    ggml_tensor * pre = ggml_view_2d(ctx0, split, hc, nt, split->nb[1], 0);
     cb(pre, "hc_pre", il);
 
-    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
-    *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
-    *post = ggml_sigmoid(ctx0, *post);
-    *post = ggml_scale(ctx0, *post, 2.0f);
+    *post = ggml_view_2d(ctx0, split, hc, nt, split->nb[1], hc*sizeof(float));
     cb(*post, "hc_post", il);
 
-    if (cparams.fused_dsv4_hc_comb) {
-        *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
-                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
-    } else {
-        ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
-        ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
-
-        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
-        *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
-        *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
-        *comb = build_hc_sinkhorn(*comb, il);
-    }
+    *comb = ggml_view_3d(ctx0, split, hc, hc, nt, hc*sizeof(float), split->nb[1], 2*hc*sizeof(float));
     cb(*comb, "hc_comb", il);
 
     ggml_tensor * result = build_hc_pre(x, pre, il);
@@ -430,14 +413,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     ggml_tensor * out = nullptr;
     for (int64_t dst = 0; dst < hc; ++dst) {
         ggml_tensor * post_dst = ggml_view_2d(ctx0, post, 1, nt, post->nb[1], dst*post->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
+        ggml_tensor * cur = nullptr;
 
         for (int64_t src = 0; src < hc; ++src) {
             ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
             ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2],
                     dst*comb->nb[0] + src*comb->nb[1]);
-            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));
+            ggml_tensor * product = ggml_mul(ctx0, res_src, comb_src_dst);
+            cur = cur ? ggml_add(ctx0, cur, product) : product;
         }
+        cur = ggml_add(ctx0, cur, ggml_mul(ctx0, x, post_dst));
 
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
         out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
@@ -456,8 +441,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_head(
     const int64_t nt     = x->ne[2];
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
-    ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    ggml_tensor * mixes = ggml_mul(ctx0, dsv4_mul_mat_f32(ctx0, hc_fn, flat), dsv4_rstd(ctx0, flat, norm_rms_eps));
     cb(mixes, "hc_head_mixes", -1);
 
     ggml_tensor * pre = dsv4_hc_affine(ctx0, mixes, hc_scale, hc_base);
