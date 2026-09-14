@@ -11530,6 +11530,63 @@ void ggml_compute_forward_dsv4_hc_comb(
     }
 }
 
+void ggml_compute_forward_dsv4_hc_split(const ggml_compute_params * params, ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const ggml_tensor * mixes = dst->src[0];
+    const float * scale = (const float *) dst->src[1]->data;
+    const float * base = (const float *) dst->src[2]->data;
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int n_iter = ggml_get_op_params_i32(dst, 1);
+
+    for (int64_t row = params->ith; row < mixes->ne[1]; row += params->nth) {
+        const float * x = (const float *) ((const char *) mixes->data + row*mixes->nb[1]);
+        float * out = (float *) ((char *) dst->data + row*dst->nb[1]);
+
+        for (int i = 0; i < 24; ++i) {
+            const float v = x[i]*scale[i < 4 ? 0 : i < 8 ? 1 : 2] + base[i];
+            out[i] = i < 8 ? 1.0f/(1.0f + std::exp(-v)) : v;
+            if (i < 4) {
+                out[i] += eps;
+            } else if (i < 8) {
+                out[i] *= 2.0f;
+            }
+        }
+
+        float * comb = out + 8;
+        for (int src = 0; src < 4; ++src) {
+            float * v = comb + 4*src;
+            const float maximum = std::max(std::max(v[0], v[1]), std::max(v[2], v[3]));
+            for (int i = 0; i < 4; ++i) {
+                v[i] = std::exp(v[i] - maximum);
+            }
+            const float sum = ((v[0] + v[1]) + v[2]) + v[3];
+            for (int i = 0; i < 4; ++i) {
+                v[i] = v[i]/sum + eps;
+            }
+        }
+
+        for (int iteration = 0; iteration < n_iter; ++iteration) {
+            if (iteration) {
+                for (int src = 0; src < 4; ++src) {
+                    float * v = comb + 4*src;
+                    const float sum = (((v[0] + v[1]) + v[2]) + v[3]) + eps;
+                    for (int i = 0; i < 4; ++i) {
+                        v[i] /= sum;
+                    }
+                }
+            }
+            for (int idst = 0; idst < 4; ++idst) {
+                const float sum = (((comb[idst] + comb[4 + idst]) + comb[8 + idst]) + comb[12 + idst]) + eps;
+                for (int src = 0; src < 4; ++src) {
+                    comb[4*src + idst] /= sum;
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(
@@ -11615,6 +11672,10 @@ void ggml_compute_forward_dsv4_hc_pre(
 static void ggml_compute_forward_dsv4_hc_post_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * post     = dst->src[2];
@@ -11672,18 +11733,51 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
         const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
 
-        float sum = xv * pv;
+        volatile float sum = 0.0f;
         if (comb) {
             for (int64_t isrc = 0; isrc < hc; ++isrc) {
                 const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
                 const float cv = *(const float *) ((const char *) comb->data     + idst*nbc0 + isrc*nbc1 + it*nbc2);
-                sum += rv * cv;
+                volatile float product = rv * cv;
+                sum = isrc == 0 ? product : sum + product;
             }
         } else {
-            sum += *(const float *) ((const char *) residual->data + i0*nbr0 + idst*nbr1 + it*nbr2);
+            sum = *(const float *) ((const char *) residual->data + i0*nbr0 + idst*nbr1 + it*nbr2);
         }
+        volatile float product = xv * pv;
 
-        *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = sum;
+        *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = product + sum;
+    }
+}
+
+void ggml_compute_forward_dsv4_swiglu(const ggml_compute_params * params, ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+    const float limit = ggml_get_op_params_f32(dst, 0);
+
+    for (int64_t row = params->ith; row < ggml_nrows(gate); row += params->nth) {
+        const int64_t i1 = row % gate->ne[1];
+        const int64_t i2 = row / gate->ne[1] % gate->ne[2];
+        const int64_t i3 = row / (gate->ne[1]*gate->ne[2]);
+        const float * g = (const float *) ((const char *) gate->data + i1*gate->nb[1] + i2*gate->nb[2] + i3*gate->nb[3]);
+        const float * u = (const float *) ((const char *) up->data + i1*up->nb[1] + i2*up->nb[2] + i3*up->nb[3]);
+        const float weight = weights ? *(const float *) ((const char *) weights->data + i1*weights->nb[1] + i2*weights->nb[2] + i3*weights->nb[3]) : 1.0f;
+        float * out = (float *) dst->data + row*gate->ne[0];
+
+        for (int64_t i = 0; i < gate->ne[0]; ++i) {
+            const float gate_bf16 = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(g[i]));
+            const float up_bf16 = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(u[i]));
+            const float a = limit > 0 ? std::min(gate_bf16, limit) : gate_bf16;
+            const float b = limit > 0 ? std::clamp(up_bf16, -limit, limit) : up_bf16;
+            const float silu = a/(1.0f + std::exp(-a));
+            const float value = (silu*b)*weight;
+            out[i] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));
+        }
     }
 }
 

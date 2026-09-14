@@ -2117,6 +2117,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_SPLIT:
+            {
+                ggml_compute_forward_dsv4_hc_split(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_PRE:
             {
                 ggml_compute_forward_dsv4_hc_pre(params, tensor);
@@ -2124,6 +2128,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DSV4_HC_POST:
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+            } break;
+        case GGML_OP_DSV4_SWIGLU:
+            {
+                ggml_compute_forward_dsv4_swiglu(params, tensor);
             } break;
         case GGML_OP_QSA_BLOCK_SCORE:
             {
@@ -2313,8 +2321,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_TOP_K_MASK:
         case GGML_OP_DSV4_SPARSE_PACK:
         case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_SPLIT:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_SWIGLU:
         case GGML_OP_QSA_BLOCK_SCORE:
             {
                 n_tasks = n_threads;

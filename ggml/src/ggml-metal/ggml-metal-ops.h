@@ -67,6 +67,8 @@ int ggml_metal_op_dsv4_compress     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_top_k_mask   (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_sparse_pack  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_split     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_swiglu       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_qsa_block_score      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);

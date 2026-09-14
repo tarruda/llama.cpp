@@ -1086,8 +1086,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_TOP_K_MASK",
     "DSV4_SPARSE_PACK",
     "DSV4_HC_COMB",
+    "DSV4_HC_SPLIT",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_SWIGLU",
     "QSA_BLOCK_SCORE",
 
     "UNARY",
@@ -1106,7 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1206,8 +1208,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_top_k_mask(raw_mask, comp_mask, comp_idx)",
     "dsv4_sparse_pack(raw_k, comp_k, raw_mask, comp_mask, comp_idx)",
     "dsv4_hc_comb(mixes, scale, base)",
+    "dsv4_hc_split(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_swiglu(gate, up, weights)",
     "qsa_block_score(q, k, cells, mask)",
 
     "unary(x)",
@@ -1226,7 +1230,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3323,7 +3327,7 @@ bool ggml_prec_set_src(
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-                if (idx != 1) {
+                if (idx != 1 && (idx != 0 || a->op != GGML_OP_MUL_MAT)) {
                     return false;
                 }
 
@@ -6739,6 +6743,28 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_hc_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes) && ggml_is_contiguous(scale) && ggml_is_contiguous(base));
+    GGML_ASSERT(mixes->ne[0] == 24 && ggml_is_matrix(mixes));
+    GGML_ASSERT(ggml_nelements(scale) == 3 && ggml_nelements(base) == 24 && eps > 0 && n_iter > 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+    result->op = GGML_OP_DSV4_HC_SPLIT;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+    return result;
+}
+
 struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -6802,6 +6828,30 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * weights,
+        float                 limit) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(gate) && ggml_is_contiguous_rows(up) && ggml_are_same_shape(gate, up));
+    GGML_ASSERT(isfinite(limit) && limit >= 0);
+    if (weights) {
+        GGML_ASSERT(weights->type == GGML_TYPE_F32 && weights->ne[0] == 1);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            GGML_ASSERT(weights->ne[i] == gate->ne[i]);
+        }
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, gate);
+    result->op = GGML_OP_DSV4_SWIGLU;
+    result->src[0] = gate;
+    result->src[1] = up;
+    result->src[2] = weights;
+    ggml_set_op_params_f32(result, 0, limit);
+    return result;
+}
 // ggml_qsa_block_score
 
 struct ggml_tensor * ggml_qsa_block_score(

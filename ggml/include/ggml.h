@@ -587,8 +587,10 @@ extern "C" {
         GGML_OP_DSV4_TOP_K_MASK,
         GGML_OP_DSV4_SPARSE_PACK,
         GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_SPLIT,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_SWIGLU,
         GGML_OP_QSA_BLOCK_SCORE,
 
         GGML_OP_UNARY,
@@ -1475,7 +1477,8 @@ extern "C" {
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
     //
-    // return false on faliure
+    // MUL_MAT accepts sources 0 and 1. MUL_MAT_ID accepts source 1.
+    // return false on failure
     GGML_API bool ggml_prec_set_src(
             struct ggml_tensor * a,
             enum ggml_prec       prec,
@@ -2764,6 +2767,15 @@ extern "C" {
             float                 eps,
             int32_t               n_iter);
 
+    // HC affine, sigmoid and Sinkhorn normalization. Returns packed pre[4], post[4], comb[16] rows.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
     // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
     //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
     //
@@ -2795,6 +2807,13 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // Clamped SwiGLU with optional per-row weights. Inputs and output are rounded to BF16 values in F32.
+    GGML_API struct ggml_tensor * ggml_dsv4_swiglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * weights,
+            float                 limit);
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

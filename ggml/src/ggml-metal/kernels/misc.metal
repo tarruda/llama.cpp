@@ -437,6 +437,130 @@ template [[host_name("kernel_fwht_f32_128")]] kernel kernel_fwht_t kernel_fwht_f
 template [[host_name("kernel_fwht_f32_256")]] kernel kernel_fwht_t kernel_fwht_f32<256>;
 template [[host_name("kernel_fwht_f32_512")]] kernel kernel_fwht_t kernel_fwht_f32<512>;
 
+// Metal arithmetic can flush subnormals. Apply power-of-two scales through the bits.
+static float dsv4_scale_pow2(float x, int shift) {
+    const uint bits = as_type<uint>(x);
+    const uint sign = bits & 0x80000000;
+    int exponent = (bits >> 23) & 255;
+    uint mantissa = bits & 0x7fffff;
+    if (exponent == 255 || (exponent == 0 && mantissa == 0)) {
+        return x;
+    }
+    if (exponent == 0) {
+        const int normalize = clz(mantissa) - 8;
+        mantissa <<= normalize;
+        exponent = 1 - normalize;
+    } else {
+        mantissa |= 0x800000;
+    }
+    exponent += shift;
+    if (exponent >= 255) {
+        return as_type<float>(sign | 0x7f800000);
+    }
+    if (exponent > 0) {
+        return as_type<float>(sign | uint(exponent) << 23 | (mantissa & 0x7fffff));
+    }
+    const int right = 1 - exponent;
+    if (right > 24) {
+        return as_type<float>(sign);
+    }
+    uint rounded = mantissa >> right;
+    const uint remainder = mantissa & ((1u << right) - 1);
+    const uint halfway = 1u << (right - 1);
+    rounded += remainder > halfway || (remainder == halfway && (rounded & 1));
+    return as_type<float>(sign | rounded);
+}
+
+static float2 dsv4_pair_add(float2 a, float2 b) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const float sum = a.x + b.x, v = sum - a.x;
+    const float error = (a.x - (sum - v)) + (b.x - v) + (a.y + b.y);
+    const float hi = sum + error;
+    return float2(hi, error - (hi - sum));
+}
+
+static float2 dsv4_pair_mul(float2 a, float2 b) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const float product = a.x*b.x;
+    const float error = fma(a.x, b.x, -product) + (a.x*b.y + a.y*b.x);
+    const float hi = product + error;
+    return float2(hi, error - (hi - product));
+}
+
+// Extra precision keeps exp error from crossing BF16 boundaries.
+static float dsv4_exp(float x) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    if (isnan(x)) { return x; }
+    if (x > 89.0f) { return INFINITY; }
+    if (x < -104.0f) { return 0.0f; }
+    const float n = rint(x*0x1.715476p+0f);
+    const float2 r = dsv4_pair_add(float2(x, 0), dsv4_pair_mul(float2(-n, 0), float2(0x1.62e4300000000p-1f, -0x1.05c6100000000p-29f)));
+    constexpr float2 coefficients[] = {
+        { 0x1.0000000000000p+0f, 0x0.0p+0f },
+        { 0x1.0000000000000p+0f, 0x0.0p+0f },
+        { 0x1.0000000000000p-1f, 0x0.0p+0f },
+        { 0x1.5555560000000p-3f, -0x1.5555560000000p-28f },
+        { 0x1.5555560000000p-5f, -0x1.5555560000000p-30f },
+        { 0x1.1111120000000p-7f, -0x1.ddddde0000000p-32f },
+        { 0x1.6c16c20000000p-10f, -0x1.27d27e0000000p-35f },
+        { 0x1.a01a020000000p-13f, -0x1.7f97fa0000000p-39f },
+        { 0x1.a01a020000000p-16f, -0x1.7f97fa0000000p-42f },
+        { 0x1.71de3a0000000p-19f, 0x1.55b1cc0000000p-45f },
+        { 0x1.27e4fc0000000p-22f, -0x1.10ec140000000p-47f },
+        { 0x1.ae64560000000p-26f, 0x1.fd51380000000p-52f },
+        { 0x1.1eed8e0000000p-29f, 0x1.ff1b120000000p-54f }
+    };
+    float2 value = coefficients[12];
+    for (int i = 11; i >= 0; --i) { value = dsv4_pair_add(dsv4_pair_mul(value, r), coefficients[i]); }
+    if (n <= -126) {
+        const float2 scaled = float2(dsv4_scale_pow2(value.x, int(n) + 149), dsv4_scale_pow2(value.y, int(n) + 149));
+        const float base = floor(scaled.x), fraction = scaled.x - base;
+        uint bits = uint(base);
+        bits += fraction > 0.5f || (fraction == 0.5f && (scaled.y > 0 || (scaled.y == 0 && (bits & 1))));
+        return as_type<float>(bits);
+    }
+    return dsv4_scale_pow2(value.x, int(n));
+}
+
+kernel void kernel_dsv4_hc_split(
+        constant ggml_metal_kargs_dsv4_hc_split & args,
+        device const char  * mixes,
+        device const float * scale,
+        device const float * base,
+        device       float * dst,
+        uint3    tgpig[[threadgroup_position_in_grid]],
+        ushort   tiisg[[thread_index_in_simdgroup]],
+        ushort   sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3    ntg[[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+    const int it = tgpig.x*ntg.y + sgitg;
+    if (it >= args.n_tokens) { return; }
+    device const float * x = (device const float *) (mixes + it*args.nb_m1);
+    float v = tiisg < 24 ? x[tiisg]*scale[tiisg < 4 ? 0 : tiisg < 8 ? 1 : 2] + base[tiisg] : 0.0f;
+    if (tiisg < 8) {
+        const float p = precise::divide(1.0f, 1.0f + dsv4_exp(-v));
+        dst[24*it + tiisg] = tiisg < 4 ? p + args.eps : 2*p;
+    }
+    const ushort first = tiisg & ~3;
+    const ushort column = 8 + tiisg % 4;
+    const float maximum = max(max(simd_shuffle(v, first), simd_shuffle(v, first + 1)), max(simd_shuffle(v, first + 2), simd_shuffle(v, first + 3)));
+    v = dsv4_exp(v - maximum);
+    float sum = ((simd_shuffle(v, first) + simd_shuffle(v, first + 1)) + simd_shuffle(v, first + 2)) + simd_shuffle(v, first + 3);
+    v = precise::divide(v, sum) + args.eps;
+    for (int iteration = 0; iteration < args.n_iter; ++iteration) {
+        if (iteration) {
+            sum = ((simd_shuffle(v, first) + simd_shuffle(v, first + 1)) + simd_shuffle(v, first + 2)) + simd_shuffle(v, first + 3);
+            v = precise::divide(v, sum + args.eps);
+        }
+        sum = ((simd_shuffle(v, column) + simd_shuffle(v, column + 4)) + simd_shuffle(v, column + 8)) + simd_shuffle(v, column + 12);
+        v = precise::divide(v, sum + args.eps);
+    }
+    if (tiisg >= 8 && tiisg < 24) { dst[24*it + tiisg] = v; }
+}
+
 kernel void kernel_dsv4_hc_comb_f32(
         constant ggml_metal_kargs_dsv4_hc_comb & args,
         device const char * mixes,
@@ -654,6 +778,8 @@ kernel void kernel_dsv4_hc_post_f32_impl(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
     constexpr ushort hc = 4;
 
     const int it = tgpig.y;
@@ -690,18 +816,19 @@ kernel void kernel_dsv4_hc_post_f32_impl(
     }
     float result[hc];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
-        result[idst] = xv*post_reg[idst];
+        result[idst] = 0.0f;
     }
 
     device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
     FOR_UNROLL (ushort isrc = 0; isrc < hc; ++isrc) {
         const float rv = *(device const float *) (rb + isrc*args.nb_r1);
         FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
-            result[idst] = fma(rv, comb_reg[isrc][idst], result[idst]);
+            result[idst] += rv*comb_reg[isrc][idst];
         }
     }
 
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+        result[idst] += xv*post_reg[idst];
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
@@ -710,6 +837,36 @@ typedef decltype(kernel_dsv4_hc_post_f32_impl<false>) kernel_dsv4_hc_post_f32_t;
 
 template [[host_name("kernel_dsv4_hc_post_f32")]]     kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<false>;
 template [[host_name("kernel_dsv4_hc_post_add_f32")]] kernel kernel_dsv4_hc_post_f32_t kernel_dsv4_hc_post_f32_impl<true>;
+
+static float dsv4_round_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    bits = (bits & 0x7fffffff) > 0x7f800000 ? bits | 0x400000 : bits + 0x7fff + ((bits >> 16) & 1);
+    return as_type<float>(bits & 0xffff0000);
+}
+
+kernel void kernel_dsv4_swiglu(
+        constant ggml_metal_kargs_dsv4_swiglu & args,
+        device const char * gate,
+        device const char * up,
+        device const char * weights,
+        device      float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const int i = 128*tgpig.x + tiitg, row = tgpig.y;
+    if (i >= args.ne0) { return; }
+    const int i1 = row % args.ne1, i2 = row / args.ne1 % args.ne2, i3 = row / (args.ne1*args.ne2);
+    device const float * g = (device const float *) (gate + i1*args.nb_g1 + i2*args.nb_g2 + i3*args.nb_g3);
+    device const float * u = (device const float *) (up + i1*args.nb_u1 + i2*args.nb_u2 + i3*args.nb_u3);
+    const float w = args.weighted ? *(device const float *) (weights + i1*args.nb_w1 + i2*args.nb_w2 + i3*args.nb_w3) : 1.0f;
+    const float gate_value = dsv4_round_bf16(g[i]);
+    const float up_value = dsv4_round_bf16(u[i]);
+    const float a = args.limit > 0 ? min(gate_value, args.limit) : gate_value;
+    const float b = args.limit > 0 ? clamp(up_value, -args.limit, args.limit) : up_value;
+    const float silu = precise::divide(a, 1.0f + precise::exp(-a));
+    dst[row*args.ne0 + i] = dsv4_round_bf16((silu*b)*w);
+}
 
 kernel void kernel_dsv4_hc_affine_f32(
         constant ggml_metal_kargs_dsv4_hc_affine & args,

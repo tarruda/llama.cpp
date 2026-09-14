@@ -78,15 +78,18 @@ void main() {
 
     [[unroll]]
     for (uint idst = 0; idst < hc; ++idst) {
-        float result = xv * post_s[idst];
+        precise float result = 0.0;
         if (HAS_COMB == 1) {
             [[unroll]]
             for (uint isrc = 0; isrc < hc; ++isrc) {
-                result = fma(r[isrc], comb_s[idst + hc * isrc], result);
+                precise float product = r[isrc] * comb_s[idst + hc * isrc];
+                result = isrc == 0 ? product : result + product;
             }
         } else {
-            result += r[idst];
+            result = r[idst];
         }
+        precise float product = xv * post_s[idst];
+        result = product + result;
         data_d[d_offset + i0 * nbd0 + idst * nbd1 + it * nbd2] = result;
     }
 }

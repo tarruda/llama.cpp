@@ -1321,6 +1321,13 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hc_comb;
 
 typedef struct {
+    int32_t  n_tokens;
+    int32_t  n_iter;
+    float    eps;
+    uint64_t nb_m1;
+} ggml_metal_kargs_dsv4_hc_split;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_blocks;
     int32_t  n_rows;
@@ -1417,6 +1424,23 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  weighted;
+    float    limit;
+    uint64_t nb_g1;
+    uint64_t nb_g2;
+    uint64_t nb_g3;
+    uint64_t nb_u1;
+    uint64_t nb_u2;
+    uint64_t nb_u3;
+    uint64_t nb_w1;
+    uint64_t nb_w2;
+    uint64_t nb_w3;
+} ggml_metal_kargs_dsv4_swiglu;
 
 typedef struct {
     int32_t  n_tokens;
