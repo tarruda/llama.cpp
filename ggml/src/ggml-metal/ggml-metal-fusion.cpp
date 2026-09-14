@@ -53,6 +53,20 @@ static bool ggml_metal_fusion_same_buffer(const ggml_tensor * a, const ggml_tens
     return ggml_metal_buffer_get_id(ca, a).metal == ggml_metal_buffer_get_id(cb, b).metal;
 }
 
+static bool ggml_metal_fusion_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
+    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
+
+    const ggml_metal_buffer_id ida = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->context, a);
+    const ggml_metal_buffer_id idb = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->context, b);
+
+    if (ida.metal != idb.metal) {
+        return false;
+    }
+
+    return ida.offs <= idb.offs ? idb.offs - ida.offs < ggml_nbytes(a) : ida.offs - idb.offs < ggml_nbytes(b);
+}
+
 // ---- pattern checks ------------------------------------------------------
 
 // NORM/RMS_NORM + MUL + ADD: the weight/bias of each fused step must match the norm input
@@ -744,7 +758,6 @@ static bool ggml_metal_fusion_check_dsv4_hc_pre_norm(
     GGML_UNUSED(gf);
     GGML_UNUSED(node_idxs);
     GGML_UNUSED(idx);
-    GGML_UNUSED(mode);
 
     const ggml_tensor * op          = nodes[0];
     const ggml_tensor * x           = op->src[0];
@@ -753,13 +766,22 @@ static bool ggml_metal_fusion_check_dsv4_hc_pre_norm(
     const ggml_tensor * mul         = nodes[2];
     const ggml_tensor * norm_weight = mul->src[1];
 
-    return ggml_get_op_params_i32(op, 1) == 0 &&
+    const bool can_fuse = ggml_get_op_params_i32(op, 1) == 0 &&
         x->ne[0] == 4096 && ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(weights) &&
         norm->src[0] == op && mul->src[0] == norm &&
         norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && norm_weight->type == GGML_TYPE_F32 &&
         ggml_are_same_shape(op, norm) && ggml_are_same_shape(norm, mul) &&
         ggml_nelements(norm_weight) == x->ne[0] &&
         ggml_is_contiguous_rows(norm_weight) && ggml_is_contiguous_rows(mul);
+
+    if (can_fuse && mode == GGML_METAL_FUSION_FULL) {
+        const ggml_tensor * dst = nodes[2];
+        if (ggml_metal_fusion_tensors_overlap(x, dst) || ggml_metal_fusion_tensors_overlap(weights, dst) || ggml_metal_fusion_tensors_overlap(norm_weight, dst)) {
+            return false;
+        }
+    }
+
+    return can_fuse;
 }
 
 // ---- patterns ------------------------------------------------------------
