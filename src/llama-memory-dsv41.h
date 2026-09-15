@@ -54,6 +54,7 @@ public:
 
 private:
     uint32_t ring_end = 0;
+    uint32_t ring_floor = 0;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 };
 

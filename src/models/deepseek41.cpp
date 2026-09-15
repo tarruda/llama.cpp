@@ -724,8 +724,10 @@ struct dsv41_graph : public llama_model_deepseek41::graph {
                     ggml_set_input(positions);
                     auto * rows = input->cache_rows[0] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
                     ggml_set_input(rows);
-                    input->modalities = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
-                    ggml_set_input(input->modalities);
+                    if (std::any_of(model.layers.begin() + split, model.layers.end(), [](const auto & layer) { return layer.ffn_exp_probs_b_vl != nullptr; })) {
+                        input->modalities = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tokens);
+                        ggml_set_input(input->modalities);
+                    }
                     x = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, hidden, rows), n_embd, hc, tokens);
                     pre = ggml_get_rows(ctx0, mixes, rows);
                     cb(x, "dsv41_encoder_tail", split);

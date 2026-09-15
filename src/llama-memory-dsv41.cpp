@@ -12,6 +12,24 @@
 #include <cstring>
 #include <stdexcept>
 
+static void dsv41_write_ring(llama_io_write_i & io, ggml_tensor * tensor, uint32_t n_ring, uint32_t start, uint32_t end) {
+    for (uint32_t pos = start; pos < end;) {
+        const uint32_t row = pos % n_ring;
+        const uint32_t count = std::min(end - pos, n_ring - row);
+        io.write_tensor(tensor, row*tensor->nb[1], count*tensor->nb[1]);
+        pos += count;
+    }
+}
+
+static void dsv41_read_ring(llama_io_read_i & io, ggml_tensor * tensor, uint32_t n_ring, uint32_t start, uint32_t end) {
+    for (uint32_t pos = start; pos < end;) {
+        const uint32_t row = pos % n_ring;
+        const uint32_t count = std::min(end - pos, n_ring - row);
+        io.read_tensor(tensor, row*tensor->nb[1], count*tensor->nb[1]);
+        pos += count;
+    }
+}
+
 llama_memory_dsv41::llama_memory_dsv41(const llama_model & model, uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch, bool offload) :
     hparams(model.hparams), n_ctx(n_ctx), n_ring(std::min(n_ctx, hparams.n_swa + n_ubatch)), n_vocab(model.vocab.n_tokens()) {
     if (n_seq_max != 1 || n_ctx == 0 || n_ring < hparams.n_swa) {
@@ -152,6 +170,7 @@ void llama_memory_dsv41::complete(const llama_ubatch & ubatch, bool success) {
 void llama_memory_dsv41::clear(bool data) {
     tokens.clear();
     ring_end = 0;
+    ring_floor = 0;
     decoder_start = 0;
     decoder_ready = true;
     if (data && !hparams.no_alloc) {
@@ -174,11 +193,13 @@ bool llama_memory_dsv41::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     if (p0 != 0 && ring_end > n_ring && p0 < (int64_t) ring_end - n_ring + hparams.n_swa) {
         return false;
     }
+    if (p0 != 0 && ring_floor > 0 && p0 < (int64_t) ring_floor + hparams.n_swa) { return false; }
     if (p0 != 0 && decoder_ready && p0 < (llama_pos) decoder_start) { return false; }
     tokens.resize(p0);
     decoder_start = std::min<uint32_t>(decoder_start, p0);
     if (p0 == 0) {
         ring_end = 0;
+        ring_floor = 0;
         decoder_ready = true;
     }
     return true;
@@ -212,7 +233,7 @@ void llama_memory_dsv41::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
 llama_pos llama_memory_dsv41::seq_pos_min(llama_seq_id seq_id) const {
     if (seq_id != 0 || tokens.empty()) { return -1; }
-    return std::max(ring_end > n_ring ? ring_end - n_ring : 0u, decoder_ready ? decoder_start : 0u);
+    return std::max({ring_end > n_ring ? ring_end - n_ring : 0u, ring_floor, decoder_ready ? decoder_start : 0u});
 }
 
 llama_pos llama_memory_dsv41::seq_pos_max(llama_seq_id seq_id) const {
@@ -261,7 +282,10 @@ void llama_memory_dsv41::state_write(llama_io_write_i & io, llama_seq_id seq_id,
     }
     const bool partial = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     GGML_ASSERT(seq_id == -1 || seq_id == 0);
-    const uint32_t header[] = { 0xd5410003, n_ring, (uint32_t) layers.size(), hparams.n_embd_head_k(), hparams.indexer_head_size, (uint32_t) tokens.size(), ring_end, decoder_start, decoder_ready, hparams.n_embd, hparams.dsv4_hc_mult, partial };
+    // Keep one SWA window for attention and one for suffix rollback.
+    const size_t keep_rows = std::min<size_t>(n_ring, size_t(hparams.n_swa)*2);
+    const uint32_t ring_start = partial ? std::max(ring_floor, (uint32_t) (tokens.size() - std::min(tokens.size(), keep_rows))) : ring_floor;
+    const uint32_t header[] = { 0xd5410004, n_ring, (uint32_t) layers.size(), hparams.n_embd_head_k(), hparams.indexer_head_size, (uint32_t) tokens.size(), ring_end, decoder_start, decoder_ready, hparams.n_embd, hparams.dsv4_hc_mult, partial, ring_start };
     io.write(header, sizeof(header));
     for (uint32_t il = 0; il < layers.size(); ++il) {
         const int32_t layout[] = { hparams.dsv41_kv_source[il], (int32_t) hparams.dsv4_compress_ratios[il] };
@@ -269,15 +293,19 @@ void llama_memory_dsv41::state_write(llama_io_write_i & io, llama_seq_id seq_id,
     }
     io.write(tokens.data(), tokens.size()*sizeof(llama_token));
     for (auto * tensor : {encoder_hidden, encoder_pre}) {
-        io.write_tensor(tensor, 0, std::min<size_t>(tokens.size(), n_ring)*tensor->nb[1]);
+        if (partial) { dsv41_write_ring(io, tensor, n_ring, ring_start, tokens.size()); }
+        else { io.write_tensor(tensor, 0, std::min<size_t>(tokens.size(), n_ring)*tensor->nb[1]); }
     }
     for (uint32_t il = 0; il < layers.size(); ++il) {
         const auto & layer = layers[il];
         for (auto * tensor : {layer.raw, layer.kv, layer.index, layer.comp_kv, layer.comp_score}) {
             if (partial && (tensor == layer.kv || tensor == layer.index)) { continue; }
             if (tensor) {
-                const size_t rows = tensor == layer.kv || tensor == layer.index ? tokens.size()/hparams.dsv4_compress_ratios[il] : std::min<size_t>(tokens.size(), n_ring);
-                io.write_tensor(tensor, 0, rows*tensor->nb[1]);
+                if (partial) { dsv41_write_ring(io, tensor, n_ring, ring_start, tokens.size()); }
+                else {
+                    const size_t rows = tensor == layer.kv || tensor == layer.index ? tokens.size()/hparams.dsv4_compress_ratios[il] : std::min<size_t>(tokens.size(), n_ring);
+                    io.write_tensor(tensor, 0, rows*tensor->nb[1]);
+                }
             }
         }
     }
@@ -290,9 +318,12 @@ void llama_memory_dsv41::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
     const bool partial = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     GGML_ASSERT(seq_id == -1 || seq_id == 0);
     try {
-        uint32_t header[12];
-        io.read(header, sizeof(header));
-        if (header[0] != 0xd5410003 || header[1] != n_ring || header[2] != layers.size() || header[3] != hparams.n_embd_head_k() || header[4] != hparams.indexer_head_size || header[5] > header[6] || header[6] > n_ctx || header[7] > header[5] || header[8] > 1 || header[9] != hparams.n_embd || header[10] != hparams.dsv4_hc_mult || header[11] != partial) {
+        uint32_t header[13] = {};
+        io.read(header, 12*sizeof(uint32_t));
+        const bool compact = header[0] == 0xd5410004;
+        if (compact) { io.read(&header[12], sizeof(header[12])); }
+        const size_t keep_rows = std::min<size_t>(n_ring, size_t(hparams.n_swa)*2);
+        if ((!compact && header[0] != 0xd5410003) || header[1] != n_ring || header[2] != layers.size() || header[3] != hparams.n_embd_head_k() || header[4] != hparams.indexer_head_size || header[5] > header[6] || header[6] > n_ctx || header[7] > header[5] || header[8] > 1 || header[9] != hparams.n_embd || header[10] != hparams.dsv4_hc_mult || header[11] != partial || header[12] > header[5] || (partial && compact && (header[5] - header[12] > keep_rows || header[5] - header[12] < std::min(header[5], hparams.n_swa)))) {
             throw std::runtime_error("DeepSeek-V4.1 state layout mismatch");
         }
         for (uint32_t il = 0; il < layers.size(); ++il) {
@@ -313,20 +344,25 @@ void llama_memory_dsv41::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
             throw std::runtime_error("DeepSeek-V4.1 partial state requires the matching global context");
         }
         for (auto * tensor : {encoder_hidden, encoder_pre}) {
-            io.read_tensor(tensor, 0, std::min<size_t>(restored.size(), n_ring)*tensor->nb[1]);
+            if (partial && compact) { dsv41_read_ring(io, tensor, n_ring, header[12], restored.size()); }
+            else { io.read_tensor(tensor, 0, std::min<size_t>(restored.size(), n_ring)*tensor->nb[1]); }
         }
         for (uint32_t il = 0; il < layers.size(); ++il) {
             const auto & layer = layers[il];
             for (auto * tensor : {layer.raw, layer.kv, layer.index, layer.comp_kv, layer.comp_score}) {
                 if (partial && (tensor == layer.kv || tensor == layer.index)) { continue; }
                 if (tensor) {
-                    const size_t rows = tensor == layer.kv || tensor == layer.index ? restored.size()/hparams.dsv4_compress_ratios[il] : std::min<size_t>(restored.size(), n_ring);
-                    io.read_tensor(tensor, 0, rows*tensor->nb[1]);
+                    if (partial && compact) { dsv41_read_ring(io, tensor, n_ring, header[12], restored.size()); }
+                    else {
+                        const size_t rows = tensor == layer.kv || tensor == layer.index ? restored.size()/hparams.dsv4_compress_ratios[il] : std::min<size_t>(restored.size(), n_ring);
+                        io.read_tensor(tensor, 0, rows*tensor->nb[1]);
+                    }
                 }
             }
         }
         tokens = std::move(restored);
         ring_end = header[6];
+        ring_floor = header[12];
         decoder_start = header[7];
         decoder_ready = header[8];
     } catch (...) {
