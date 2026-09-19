@@ -4,6 +4,7 @@
 #include "ggml-metal-device.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <set>
@@ -541,7 +542,7 @@ static bool ggml_metal_fusion_check_topk_moe(
     return true;
 }
 
-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
+#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 10
 
 struct ggml_metal_moe_reduce_match {
     const ggml_tensor * experts;
@@ -837,6 +838,8 @@ static const std::vector<ggml_op> ops_moe_reduce_5 = { GGML_OP_MUL, GGML_OP_ADD,
 static const std::vector<ggml_op> ops_moe_reduce_6 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_7 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_8 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_moe_reduce_9 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_moe_reduce_10 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 
 static const std::vector<ggml_op> ops_moe_reduce_all_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -864,6 +867,20 @@ static const std::vector<ggml_op> ops_moe_reduce_all_8 = {
     GGML_OP_MUL,
     GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_moe_reduce_all_9 = {
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_moe_reduce_all_10 = {
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
 };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
@@ -900,8 +917,23 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           ops_moe_reduce_all_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           ops_moe_reduce_all_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           ops_moe_reduce_all_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_9,           ops_moe_reduce_all_9,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_10,          ops_moe_reduce_all_10,          {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          ops_ssm_conv_silu,              {},     false, ggml_metal_fusion_check_ssm_conv_silu },
 };
+
+bool ggml_metal_fusion_can_start(ggml_op op) {
+    static const std::array<bool, GGML_OP_COUNT> result = [] {
+        std::array<bool, GGML_OP_COUNT> result = {};
+        for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            GGML_ASSERT(!fusion.ops.empty());
+            result[fusion.ops[0]] = true;
+        }
+        return result;
+    }();
+
+    return result[op];
+}
 
 // ---- alloc deps -----------------------------------------------------------
 

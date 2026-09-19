@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <cmath>
 
@@ -60,6 +61,10 @@ struct ggml_metal_op {
                 idxs.push_back(i);
             }
         }
+
+        fusion_cache.resize(idxs.size());
+        fusion_cache_n.resize(idxs.size());
+        fusion_cache_valid.resize(idxs.size());
     }
 
     ~ggml_metal_op() {
@@ -79,11 +84,17 @@ struct ggml_metal_op {
 
     // consult the fusion table for the longest pattern starting at i0
     // returns the matching pattern (nullptr if no fusion) and sets *n_out to the number of nodes
-    const ggml_metal_fusion * can_fuse(int i0, enum ggml_metal_fusion_mode mode, int * n_out) const {
+    const ggml_metal_fusion * can_fuse(int i0, enum ggml_metal_fusion_mode mode, int * n_out) {
         assert(use_fusion());
         assert(i0 >= 0 && i0 < n_nodes());
 
-        return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
+        if (mode != GGML_METAL_FUSION_FULL || !fusion_cache_valid[i0]) {
+            fusion_cache[i0] = ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, &fusion_cache_n[i0]);
+            fusion_cache_valid[i0] = mode == GGML_METAL_FUSION_FULL;
+        }
+
+        *n_out = fusion_cache_n[i0];
+        return fusion_cache[i0];
     }
 
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
@@ -118,6 +129,9 @@ private:
 
     // non-empty node indices
     std::vector<int> idxs;
+    std::vector<const ggml_metal_fusion *> fusion_cache;
+    std::vector<int> fusion_cache_n;
+    std::vector<uint8_t> fusion_cache_valid;
 };
 
 ggml_metal_op_t ggml_metal_op_init(
@@ -228,7 +242,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     {
         bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
 
-        if (is_concurrent && ctx->use_fusion()) {
+        if (is_concurrent && ctx->use_fusion() && ggml_metal_fusion_can_start(node->op)) {
             int n_fuse = 1;
             const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
             if (fusion) {
@@ -1814,6 +1828,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                     /*.nb_d0    =*/ op->nb[0],
                     /*.nb_d1    =*/ op->nb[1],
                     /*.nb_d2    =*/ op->nb[2],
+                    /*.scale    =*/ ggml_get_op_params_f32(op, 0),
                 };
 
                 ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
@@ -3380,6 +3395,62 @@ size_t ggml_metal_op_mul_mat_id_extra_tasks(const ggml_tensor * op) {
     return sizeof(uint32_t)*(2*n_tasks_max + 1);
 }
 
+static ggml_metal_buffer_id ggml_metal_op_mul_mat_id_bid_amax(const ggml_tensor * op) {
+    ggml_metal_buffer_id bid_amax = ggml_metal_get_buffer_id(op);
+    bid_amax.offs += ggml_nbytes(op);
+    bid_amax.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
+    bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+    bid_amax.offs += ggml_metal_op_mul_mat_id_extra_tasks(op);
+
+    return bid_amax;
+}
+
+static bool ggml_metal_op_mul_mat_id_can_reuse_precompute(
+        ggml_metal_op_t ctx,
+        int idx,
+        const ggml_tensor * op,
+        bool has_simdgroup_mm) {
+    if (idx == 0) {
+        return false;
+    }
+
+    const ggml_tensor * prev = ctx->node(idx - 1);
+    if (prev->op != GGML_OP_MUL_MAT_ID ||
+        prev->src[0]->type != op->src[0]->type ||
+        prev->src[0]->ne[2] != op->src[0]->ne[2] ||
+        !ggml_metal_op_mul_mat_id_use_mm(prev, has_simdgroup_mm) ||
+        ggml_metal_op_mul_mat_id_use_compact(prev) != ggml_metal_op_mul_mat_id_use_compact(op)) {
+        return false;
+    }
+
+    const ggml_metal_buffer_id prev_src1 = ggml_metal_get_buffer_id(prev->src[1]);
+    const ggml_metal_buffer_id prev_src2 = ggml_metal_get_buffer_id(prev->src[2]);
+    const ggml_metal_buffer_id src1 = ggml_metal_get_buffer_id(op->src[1]);
+    const ggml_metal_buffer_id src2 = ggml_metal_get_buffer_id(op->src[2]);
+    if (prev_src1.metal != src1.metal || prev_src1.offs != src1.offs ||
+        prev_src2.metal != src2.metal || prev_src2.offs != src2.offs ||
+        prev->src[1]->type != op->src[1]->type ||
+        prev->src[2]->type != op->src[2]->type ||
+        memcmp(prev->src[1]->ne, op->src[1]->ne, sizeof(op->src[1]->ne)) != 0 ||
+        memcmp(prev->src[1]->nb, op->src[1]->nb, sizeof(op->src[1]->nb)) != 0 ||
+        memcmp(prev->src[2]->ne, op->src[2]->ne, sizeof(op->src[2]->ne)) != 0 ||
+        memcmp(prev->src[2]->nb, op->src[2]->nb, sizeof(op->src[2]->nb)) != 0) {
+        return false;
+    }
+
+    ggml_metal_buffer_id prev_scratch = ggml_metal_get_buffer_id(prev);
+    prev_scratch.offs += ggml_nbytes(prev);
+    const ggml_metal_buffer_id dst = ggml_metal_get_buffer_id(op);
+    const size_t prev_scratch_size =
+        ggml_metal_op_mul_mat_id_extra_tpe(prev) +
+        ggml_metal_op_mul_mat_id_extra_ids(prev) +
+        ggml_metal_op_mul_mat_id_extra_tasks(prev) +
+        ggml_metal_op_mul_mat_id_extra_amax(prev);
+    return prev_scratch.metal != dst.metal ||
+        prev_scratch.offs + prev_scratch_size <= dst.offs ||
+        dst.offs + ggml_nbytes(op) <= prev_scratch.offs;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3434,12 +3505,28 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_tasks = bid_ids;
         bid_tasks.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
 
-        ggml_metal_buffer_id bid_amax = bid_tasks;
-        bid_amax.offs += ggml_metal_op_mul_mat_id_extra_tasks(op);
+        ggml_metal_buffer_id bid_amax = ggml_metal_op_mul_mat_id_bid_amax(op);
+
+        const bool reuse_precompute = ggml_metal_op_mul_mat_id_can_reuse_precompute(
+                ctx, idx, op, props_dev->has_simdgroup_mm);
+        if (reuse_precompute) {
+            const ggml_tensor * prev = ctx->node(idx - 1);
+
+            bid_tpe = ggml_metal_get_buffer_id(prev);
+            bid_tpe.offs += ggml_nbytes(prev);
+
+            bid_ids = bid_tpe;
+            bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(prev);
+
+            bid_tasks = bid_ids;
+            bid_tasks.offs += ggml_metal_op_mul_mat_id_extra_ids(prev);
+
+            bid_amax = ggml_metal_op_mul_mat_id_bid_amax(prev);
+        }
 
         // src1 rescale factors, computed before the matmul
         // ref: https://github.com/ggml-org/llama.cpp/pull/26223
-        {
+        if (!reuse_precompute) {
             ggml_metal_kargs_mul_mm_id_amax args = {
                 /*.ne00 =*/ ne10,
                 /*.ne01 =*/ ne11,
@@ -3464,7 +3551,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, N_MM_NPART_AMAX, 1, 1, 256, 1, 1);
         }
 
-        {
+        if (!reuse_precompute) {
             ggml_metal_kargs_mul_mm_id_map0 args = {
                 ne02,
                 ne10,
@@ -3495,24 +3582,26 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, pipeline.nr1, 1, 1, pipeline.nr0, 1, 1);
         }
 
-        ggml_metal_op_concurrency_reset(ctx);
+        if (!reuse_precompute) {
+            ggml_metal_op_concurrency_reset(ctx);
+        }
 
-        {
+        if (!reuse_precompute) {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_amax(lib);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
             ggml_metal_encoder_set_buffer  (enc, bid_amax, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
-        }
 
-        // the next kernel has to wait for the amax data
-        ggml_metal_op_concurrency_reset(ctx);
+            // the next kernel has to wait for the amax data
+            ggml_metal_op_concurrency_reset(ctx);
+        }
 
         const bool compact = ggml_metal_op_mul_mat_id_use_compact(op);
         const bool split_tail = ggml_metal_op_mul_mat_id_use_tail16(op) && !props_dev->has_tensor;
         const int64_t n_tasks = ne02 + (ne21*ne20 + 31)/32;
-        if (compact) {
+        if (compact && !reuse_precompute) {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map1(lib, split_tail);
             int32_t n_expert = ne02;
 
@@ -4672,6 +4761,7 @@ static int ggml_metal_op_try_dsv4_hc_post_add(ggml_metal_op_t ctx, int idx) {
         /*.nb_d0    =*/ hc_post->nb[0],
         /*.nb_d1    =*/ hc_post->nb[1],
         /*.nb_d2    =*/ hc_post->nb[2],
+        /*.scale    =*/ 0.0f,
     };
 
     ggml_metal_encoder_t enc = ctx->enc;

@@ -1423,6 +1423,7 @@ typedef struct {
     uint64_t nb_d0;
     uint64_t nb_d1;
     uint64_t nb_d2;
+    float    scale;
 } ggml_metal_kargs_dsv4_hc_post;
 
 typedef struct {

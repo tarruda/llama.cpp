@@ -17,7 +17,7 @@ extern "C" {
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 20
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks only; used by the graph optimizer, at which point the graph
@@ -56,6 +56,7 @@ typedef struct ggml_metal_fusion ggml_metal_fusion;
 
 // access the fusion identifier without exposing the full pattern definition
 ggml_metal_fusion_id ggml_metal_fusion_get_id(const struct ggml_metal_fusion * fusion);
+bool ggml_metal_fusion_can_start(enum ggml_op op);
 
 // apply any alloc-dependencies required by the fused kernels during graph optimize
 void ggml_metal_fusion_add_alloc_deps(

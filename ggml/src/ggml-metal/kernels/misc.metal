@@ -725,6 +725,43 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
     }
 }
 
+kernel void kernel_dsv4_hc_post_gated_f32(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const float * x,
+        device const float * residual,
+        device const float * gate,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr ushort hc = 4;
+
+    const int it = tgpig.y;
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+
+    float weight_lane = 0.0f;
+    if (tiisg < hc) {
+        weight_lane = 2.0f/(1.0f + exp(-args.scale*gate[it*hc + tiisg]));
+    }
+
+    float weight[hc];
+    FOR_UNROLL (ushort ih = 0; ih < hc; ++ih) {
+        weight[ih] = simd_shuffle(weight_lane, ih);
+    }
+
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const float xv = x[it*args.n_embd + i0];
+    const int offset = it*hc*args.n_embd + i0;
+    FOR_UNROLL (ushort ih = 0; ih < hc; ++ih) {
+        const int idx = offset + ih*args.n_embd;
+        dst[idx] = fma(xv, weight[ih], residual[idx]);
+    }
+}
+
 kernel void kernel_dsv4_hc_pre_norm_f32(
         constant ggml_metal_kargs_dsv4_hc_pre_norm & args,
         device const char * x,

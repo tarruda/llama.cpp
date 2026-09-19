@@ -11680,6 +11680,8 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
+    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
+    const float gate_scale = ggml_get_op_params_f32(dst, 0);
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -11703,6 +11705,7 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     size_t nbc1 = 0;
     size_t nbc2 = 0;
     if (comb) {
+        GGML_ASSERT(!gated);
         GGML_ASSERT(comb->type == GGML_TYPE_F32);
         GGML_ASSERT(comb->ne[0] == hc);
         GGML_ASSERT(comb->ne[1] == hc);
@@ -11731,7 +11734,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t it     = ir / (n_embd * hc);
 
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        if (gated) {
+            pv = 2.0f/(1.0f + expf(-gate_scale*pv));
+        }
 
         volatile float sum = 0.0f;
         if (comb) {

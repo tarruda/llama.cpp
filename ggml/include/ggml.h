@@ -2807,6 +2807,16 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // hc_post with a sigmoid gate and identity residual mixing
+    //   result[i, h, t] = residual[i, h, t] + x[i, t]*2*sigmoid(scale*gate[h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // Clamped SwiGLU with optional per-row weights. Inputs and output are rounded to BF16 values in F32.
     GGML_API struct ggml_tensor * ggml_dsv4_swiglu(
             struct ggml_context * ctx,

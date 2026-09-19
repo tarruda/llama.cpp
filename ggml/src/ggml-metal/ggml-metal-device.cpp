@@ -579,7 +579,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             }
             break;
         case GGML_OP_DSV4_HC_POST:
-            if (op->src[3]) {
+            if (ggml_get_op_params_i32(op, 1) != 0) {
+                name = "kernel_dsv4_hc_post_gated_f32";
+            } else if (op->src[3]) {
                 name = "kernel_dsv4_hc_post_f32";
             } else {
                 name = "kernel_dsv4_hc_post_nocomb_f32";

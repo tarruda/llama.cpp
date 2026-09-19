@@ -6828,6 +6828,20 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_hc_post_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * gate,
+        float                 scale) {
+    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, x, residual, gate, NULL);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, 1);
+
+    return result;
+}
+
 struct ggml_tensor * ggml_dsv4_swiglu(
         struct ggml_context * ctx,
         struct ggml_tensor  * gate,

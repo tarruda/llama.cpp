@@ -15316,6 +15316,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
             {
+                if (op->op == GGML_OP_DSV4_HC_POST && ggml_get_op_params_i32(op, 1) != 0) {
+                    return false;
+                }
                 if (op->type != GGML_TYPE_F32) {
                     return false;
                 }
@@ -16114,4 +16117,3 @@ void ggml_vk_debug_label::begin(vk_context & ctx, const std::string & name) {
     subctx->debug_labels.push_back(name);
     ggml_vk_cmd_label_begin(subctx->s->buffer->buf, subctx->debug_labels.back().c_str());
 }
-

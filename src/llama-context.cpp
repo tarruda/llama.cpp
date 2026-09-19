@@ -98,6 +98,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_qwen4exp_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QWEN4EXP_HC_POST,
+    /*.name             =*/ "fused Qwen4-Exp HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_qsa_block_score_probe = {
     /*.op               =*/ LLM_FUSED_OP_QSA_BLOCK_SCORE,
     /*.name             =*/ "QSA block score",
@@ -276,6 +282,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_qwen4exp_hc_post = true;
     cparams.auto_fhc           = true;
 
     cparams.fused_qsa_block_score = true;
@@ -623,6 +630,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_qwen4exp_hc_post_probe, cparams.fused_qwen4exp_hc_post);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
     }

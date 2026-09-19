@@ -52,6 +52,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_qwen4exp_hc_post;
     bool auto_fhc;
     bool fused_qsa_block_score;
     bool auto_fqsa_block_score;

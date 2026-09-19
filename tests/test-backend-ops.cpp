@@ -4651,6 +4651,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    fuse_add;
+    const bool    gated;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4658,13 +4659,13 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, fuse_add);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, fuse_add, gated);
     }
 
     bool run_whole_graph() override { return fuse_add; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool fuse_add = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), fuse_add(fuse_add) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool fuse_add = false, bool gated = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), fuse_add(fuse_add), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4680,7 +4681,13 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_set_name(residual, "residual");
 
         ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
-        ggml_set_name(post, "post");
+        ggml_set_name(post, gated ? "gate" : "post");
+
+        if (gated) {
+            out = ggml_dsv4_hc_post_gated(ctx, x, residual, post, 1.0f/hc);
+            ggml_set_name(out, "out");
+            return out;
+        }
 
         ggml_tensor * comb = nullptr;
         if (!identity) {
@@ -9790,6 +9797,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post(7168, 1, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(7168, 1, false, false, true));
 
     test_cases.emplace_back(new test_qsa_block_score(8, 1, 17, 11, 4, 2));
     test_cases.emplace_back(new test_qsa_block_score(31, 3, 37, 17, 3, 2));
@@ -11781,9 +11790,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    // Cover the supported 2/10 boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
+    test_cases.emplace_back(new test_moe_reduce(2048, 10, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));

@@ -332,6 +332,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
+    if (cparams.fused_qwen4exp_hc_post && il >= 0) {
+        ggml_tensor * cur = ggml_dsv4_hc_post_gated(ctx0, block_out, residual, inject, 1.0f / (float) hc);
+        res->add_fused_node({LLM_FUSED_OP_QWEN4EXP_HC_POST, cur, il});
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
+
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
