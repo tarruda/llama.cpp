@@ -1414,6 +1414,12 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hc_pre;
 
 typedef struct {
+    int32_t n_embd;
+    int32_t n_low;
+    float scale;
+} ggml_metal_kargs_dsv4_hc_up;
+
+typedef struct {
     int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;

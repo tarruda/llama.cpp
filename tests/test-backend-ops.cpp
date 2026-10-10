@@ -3971,6 +3971,58 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+struct test_rms_norm_mul_sigmoid : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool broadcast;
+    const bool view_gate;
+    const bool shared_norm;
+    const ggml_unary_op gate_op;
+
+    std::string op_desc(ggml_tensor *) override {
+        return "RMS_NORM_MUL_SIGMOID";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, broadcast, view_gate, shared_norm, gate_op);
+    }
+
+    test_rms_norm_mul_sigmoid(std::array<int64_t, 4> ne, bool broadcast, bool view_gate,
+            bool shared_norm = false, ggml_unary_op gate_op = GGML_UNARY_OP_SIGMOID)
+        : ne(ne), broadcast(broadcast), view_gate(view_gate), shared_norm(shared_norm), gate_op(gate_op) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0]*(view_gate ? 2 : 1), ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+        ggml_set_name(w, "w");
+        ggml_set_name(z, "z");
+
+        if (view_gate) {
+            z = ggml_view_4d(ctx, z, ne[0], ne[1], ne[2], ne[3], z->nb[1], z->nb[2], z->nb[3], ne[0]*sizeof(float));
+        }
+
+        a = ggml_add(ctx, ggml_add(ctx, a, w), z);
+        ggml_tensor * norm = ggml_rms_norm(ctx, a, 1e-6f);
+        ggml_tensor * mul = ggml_mul(ctx, norm, w);
+        ggml_tensor * gate = ggml_unary(ctx, z, gate_op);
+        ggml_tensor * out = ggml_mul(ctx, mul, gate);
+        if (shared_norm) {
+            out = ggml_add(ctx, out, norm);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -4763,6 +4815,45 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         }
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+struct test_dsv4_hc_up : public test_case {
+    const int64_t n_embd;
+    const int64_t n_low;
+    const int64_t n_tokens;
+    const int64_t n_hc;
+    const bool shared_gate;
+
+    std::string op_desc(ggml_tensor *) override { return "DSV4_HC_UP"; }
+    std::string vars() override { return VARS_TO_STR5(n_embd, n_low, n_tokens, n_hc, shared_gate); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_dsv4_hc_up(int64_t n_embd, int64_t n_low, int64_t n_tokens = 1, int64_t n_hc = 4, bool shared_gate = false)
+        : n_embd(n_embd), n_low(n_low), n_tokens(n_tokens), n_hc(n_hc), shared_gate(shared_gate) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_low, n_embd*n_hc);
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_low, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(lo, "lo");
+        ggml_tensor * gate = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, lo), n_embd, n_hc, n_tokens);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
+        if (shared_gate) {
+            out = ggml_add(ctx, out, ggml_view_2d(ctx, gate, n_embd, n_tokens, gate->nb[2], 0));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const float range = strcmp(t->name, "w") == 0 ? 0.1f : 1.0f;
+            init_tensor_uniform(t, -range, range);
+        }
     }
 };
 
@@ -10374,6 +10465,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
     test_cases.emplace_back(new test_dsv4_hc_pre_norm(4096, 21));
+    for (int64_t n_embd : {1, 31, 128, 2560}) {
+        for (int64_t n_low : {32, 320, 1024}) {
+            test_cases.emplace_back(new test_dsv4_hc_up(n_embd, n_low));
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_up(128, 320, 4));
+    test_cases.emplace_back(new test_dsv4_hc_up(128, 320, 1, 3));
+    test_cases.emplace_back(new test_dsv4_hc_up(128, 320, 1, 4, true));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
@@ -11158,6 +11257,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    for (const std::array<int64_t, 4> & ne : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 48, 16, 2}, {33, 5, 3, 2}}) {
+        for (bool broadcast : {false, true}) {
+            for (bool view_gate : {false, true}) {
+                test_cases.emplace_back(new test_rms_norm_mul_sigmoid(ne, broadcast, view_gate));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_sigmoid({128, 48, 1, 1}, true, false, true));
+    test_cases.emplace_back(new test_rms_norm_mul_sigmoid({128, 48, 1, 1}, true, false, false, GGML_UNARY_OP_SILU));
+
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));

@@ -801,6 +801,61 @@ kernel void kernel_dsv4_hc_pre_gated_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
+kernel void kernel_dsv4_hc_up_q8_0_f32(
+        constant ggml_metal_kargs_dsv4_hc_up & args,
+        device const block_q8_0 * w,
+        device const float * lo,
+        device const float * x,
+        device float * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR = 2;
+    const int i0 = (tgpig*4 + sgitg)*NR;
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const int nb = args.n_low/QK8_0;
+    const short il = tiisg%4;
+    float sums[4][NR] = {};
+    for (int ib = tiisg/4; ib < nb; ib += 8) {
+        float v[8];
+        FOR_UNROLL (short j = 0; j < 8; ++j) {
+            v[j] = lo[ib*QK8_0 + il*8 + j];
+        }
+        FOR_UNROLL (short ih = 0; ih < 4; ++ih) {
+            FOR_UNROLL (short r = 0; r < NR; ++r) {
+                if (i0 + r < args.n_embd) {
+                    device const block_q8_0 * b = w + (uint64_t) (ih*args.n_embd + i0 + r)*nb + ib;
+                    float sum = 0.0f;
+                    FOR_UNROLL (short j = 0; j < 8; ++j) {
+                        sum += b->qs[il*8 + j]*v[j];
+                    }
+                    sums[ih][r] += sum*b->d;
+                }
+            }
+        }
+    }
+
+    float result[NR] = {};
+    FOR_UNROLL (short ih = 0; ih < 4; ++ih) {
+        FOR_UNROLL (short r = 0; r < NR; ++r) {
+            const float gate = simd_sum(sums[ih][r]);
+            if (tiisg == 0 && i0 + r < args.n_embd) {
+                result[r] = fma(x[ih*args.n_embd + i0 + r], 1.0f/(1.0f + exp(-gate)), result[r]);
+            }
+        }
+    }
+    if (tiisg == 0) {
+        FOR_UNROLL (short r = 0; r < NR; ++r) {
+            if (i0 + r < args.n_embd) {
+                dst[i0 + r] = args.scale*result[r];
+            }
+        }
+    }
+}
+
 kernel void kernel_dsv4_hc_post_nocomb_f32(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,

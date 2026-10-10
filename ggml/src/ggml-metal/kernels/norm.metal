@@ -107,6 +107,7 @@ template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t ke
 // F == 1 : rms_norm (no fuse)
 // F == 2 : rms_norm + mul
 // F == 3 : rms_norm + mul + add
+// F == 4 : rms_norm + mul + sigmoid gate
 template <typename T, short F>
 kernel void kernel_rms_norm_fuse_impl(
         constant ggml_metal_kargs_norm & args,
@@ -170,6 +171,9 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
         }
+        if (F == 4) {
+            y[i00] = ((x[i00]*scale)*f0[i00])*(1.0f/(1.0f + exp(-f1[i00])));
+        }
     }
 }
 
@@ -178,10 +182,12 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 1>;
 template [[host_name("kernel_rms_norm_mul_f32")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 3>;
+template [[host_name("kernel_rms_norm_mul_sigmoid_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 4>;
 
 template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
+template [[host_name("kernel_rms_norm_mul_sigmoid_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;
 
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(

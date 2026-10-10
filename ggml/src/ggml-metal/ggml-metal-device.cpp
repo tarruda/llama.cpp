@@ -625,6 +625,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_up(ggml_metal_library_t lib) {
+    const char * name = "kernel_dsv4_hc_up_q8_0_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post_add(ggml_metal_library_t lib) {
     const char * name = "kernel_dsv4_hc_post_add_f32";
 
@@ -2402,6 +2411,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
                 case 1: snprintf(base, 256, "kernel_rms_norm_f32%s", suffix);         break;
                 case 2: snprintf(base, 256, "kernel_rms_norm_mul_f32%s", suffix);     break;
                 case 3: snprintf(base, 256, "kernel_rms_norm_mul_add_f32%s", suffix); break;
+                case 4: snprintf(base, 256, "kernel_rms_norm_mul_sigmoid_f32%s", suffix); break;
                 default: GGML_ABORT("fatal error");
             } break;
         default: GGML_ABORT("fatal error");

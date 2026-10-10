@@ -158,6 +158,43 @@ static bool ggml_metal_fusion_check_norm(
     return true;
 }
 
+static bool ggml_metal_fusion_check_rms_norm_mul_sigmoid(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * norm = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * gate = nodes[2];
+    const ggml_tensor * out  = nodes[3];
+
+    if (mul->src[0] != norm || out->src[0] != mul || out->src[1] != gate ||
+        ggml_get_unary_op(gate) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * inputs[] = { norm->src[0], mul->src[1], gate->src[0] };
+    for (const ggml_tensor * input : inputs) {
+        if (!input || input->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(input) || input->ne[0] != norm->ne[0]) {
+            return false;
+        }
+    }
+    for (int j = 0; j < 4; ++j) {
+        if (nodes[j]->type != GGML_TYPE_F32 || !ggml_are_same_shape(norm, nodes[j])) {
+            return false;
+        }
+    }
+    if (!ggml_are_same_shape(norm, gate->src[0])) {
+        return false;
+    }
+
+    const int output = node_idxs[idx + 3];
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), &output, 1);
+}
+
 // SSM_CONV + UNARY (silu)
 static bool ggml_metal_fusion_check_ssm_conv_silu(
         const ggml_metal_fusion       * fusion,
@@ -888,6 +925,41 @@ static bool ggml_metal_fusion_check_dsv4_hc_pre_norm(
     return can_fuse;
 }
 
+static bool ggml_metal_fusion_check_dsv4_hc_up(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * mm   = nodes[0];
+    const ggml_tensor * out  = nodes[1];
+    const ggml_tensor * w    = mm->src[0];
+    const ggml_tensor * lo   = mm->src[1];
+    const ggml_tensor * x    = out->src[0];
+    const ggml_tensor * gate = out->src[1];
+
+    if (ggml_get_op_params_i32(out, 1) == 0 || gate->op != GGML_OP_RESHAPE || gate->src[0] != mm ||
+        w->type != GGML_TYPE_Q8_0 || lo->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        mm->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+        !ggml_is_matrix(w) || !ggml_is_vector(lo) || !ggml_is_vector(mm) || !ggml_is_vector(out) ||
+        x->ne[1] != 4 || x->ne[2] != 1 || x->ne[3] != 1 || w->ne[0] > 1024 ||
+        w->ne[1] != 4*x->ne[0] || !ggml_are_same_shape(x, gate) || out->ne[0] != x->ne[0] ||
+        !ggml_is_contiguous(w) || !ggml_is_contiguous(lo) || !ggml_is_contiguous(x) || !ggml_is_contiguous(out)) {
+        return false;
+    }
+
+    const int first = node_idxs[idx];
+    const int last = node_idxs[idx + 1];
+    if (last != first + 2 || gf->nodes[first + 1] != gate) {
+        return false;
+    }
+    const int raw_idxs[] = { first, first + 1, last };
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, 3, fusion->ops_all.data(), &last, 1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -896,6 +968,7 @@ static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP
 static const std::vector<ggml_op> ops_rms_norm_mul     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_rms_norm_mul_add = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_rms_norm_scale   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_rms_norm_mul_sigmoid = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 
 static const std::vector<ggml_op> ops_add_2 = { GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_3 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -962,8 +1035,11 @@ static const std::vector<ggml_op> ops_moe_reduce_10 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_dsv4_hc_up = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+    { GGML_METAL_FUSION_RMS_NORM_MUL_SIGMOID, ops_rms_norm_mul_sigmoid, {},     true,  ggml_metal_fusion_check_rms_norm_mul_sigmoid },
+    { GGML_METAL_FUSION_DSV4_HC_UP,       ops_dsv4_hc_up,             {},     true,  ggml_metal_fusion_check_dsv4_hc_up },
     { GGML_METAL_FUSION_DSV4_HC_AFFINE,    ops_dsv4_hc_affine,          {},     false, ggml_metal_fusion_check_dsv4_hc_affine },
     { GGML_METAL_FUSION_DSV4_HC_POST_ADD,  ops_dsv4_hc_post_add,        {},     true,  ggml_metal_fusion_check_dsv4_hc_post_add },
     { GGML_METAL_FUSION_DSV4_HC_PRE_NORM,  ops_dsv4_hc_pre_norm,        {},     false, ggml_metal_fusion_check_dsv4_hc_pre_norm },
