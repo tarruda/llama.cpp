@@ -534,11 +534,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     const int16_t nh = op->src[0]->ne[1];
 
     if (nh == OP_LIGHTNING_INDEXER_VEC_NH && (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16)) {
-        snprintf(name, 256, "kernel_lightning_indexer_vec_%s", ggml_type_name(op->src[1]->type));
+        const bool tiled = op->src[0]->ne[2] >= 16;
+        snprintf(name, 256, "kernel_lightning_indexer_%s_%s", tiled ? "tiled" : "vec", ggml_type_name(op->src[1]->type));
         auto res = ggml_metal_library_get_pipeline(lib, name);
         if (!res.pipeline) {
             res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
         }
+        res.nr0 = tiled ? 16 : 1;
         return res;
     }
 
@@ -664,6 +666,60 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_i
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
     }
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_silu_norm(ggml_metal_library_t lib) {
+    const char * name = "kernel_ssm_conv_silu_norm_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gdn_alpha_beta(ggml_metal_library_t lib) {
+    const char * name = "kernel_gdn_alpha_beta_q8_0_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_down(ggml_metal_library_t lib, bool finish) {
+    const char * name = finish ? "kernel_dsv4_hc_down_finish_f32" : "kernel_dsv4_hc_down_q8_0_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sigmoid_mul_add(ggml_metal_library_t lib) {
+    const char * name = "kernel_sigmoid_mul_add_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ple_gate(ggml_metal_library_t lib) {
+    const char * name = "kernel_ple_gate_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ple_conv(ggml_metal_library_t lib) {
+    const char * name = "kernel_ple_conv_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
     return res;
 }
 

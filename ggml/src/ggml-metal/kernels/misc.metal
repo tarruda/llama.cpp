@@ -856,6 +856,101 @@ kernel void kernel_dsv4_hc_up_q8_0_f32(
     }
 }
 
+kernel void kernel_dsv4_hc_down_q8_0_f32(
+        constant ggml_metal_kargs_dsv4_hc_down & args,
+        device const float * x,
+        device const float * gamma,
+        device const block_q8_0 * wd,
+        device const block_q8_0 * wi,
+        device float * part,
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = (4*group.x + sg)*4;
+    const uint stream = group.y;
+    const uint rows = args.n_low + 4;
+    if (row0 >= rows) {
+        return;
+    }
+    const uint nb = args.n_embd/QK8_0;
+    const uint n_parts = (nb + 19)/20;
+    const uint il = lane%4;
+    float sums[4] = {};
+    float ss = 0.0f;
+    for (uint ib = group.z*20 + lane/4; ib < min(nb, (group.z + 1)*20); ib += 8) {
+        float values[8];
+        FOR_UNROLL (uint j = 0; j < 8; ++j) {
+            const uint col = stream*args.n_embd + ib*QK8_0 + il*8 + j;
+            const float v = x[col];
+            values[j] = v*gamma[col];
+            if (row0 == 0) {
+                ss += v*v;
+            }
+        }
+        FOR_UNROLL (uint r = 0; r < 4; ++r) {
+            const uint row = row0 + r;
+            if (row < rows) {
+                device const block_q8_0 * w = row < args.n_low ? wd + row*4*nb : wi + (row - args.n_low)*4*nb;
+                w += stream*nb + ib;
+                float v = 0.0f;
+                FOR_UNROLL (uint j = 0; j < 8; ++j) {
+                    v += values[j]*w->qs[il*8 + j];
+                }
+                sums[r] += v*float(w->d);
+            }
+        }
+    }
+    FOR_UNROLL (uint r = 0; r < 4; ++r) {
+        const float sum = simd_sum(sums[r]);
+        if (lane == 0 && row0 + r < rows) {
+            part[(stream*n_parts + group.z)*rows + row0 + r] = sum;
+        }
+    }
+    if (row0 == 0) {
+        ss = simd_sum(ss);
+        if (lane == 0) {
+            part[4*n_parts*rows + group.z*4 + stream] = ss;
+        }
+    }
+}
+
+kernel void kernel_dsv4_hc_down_finish_f32(
+        constant ggml_metal_kargs_dsv4_hc_down & args,
+        device const float * x,
+        device const float * gamma,
+        device const float * part,
+        device float * xn,
+        device float * lo,
+        device float * inject,
+        uint i [[thread_position_in_grid]]) {
+    const uint rows = args.n_low + 4;
+    const uint n_parts = (args.n_embd + 639)/640;
+    float4 ss = 0.0f;
+    for (uint j = 0; j < n_parts; ++j) {
+        ss += *(device const float4 *) (part + 4*n_parts*rows + j*4);
+    }
+    const float4 rs = rsqrt(ss/float(args.n_embd) + args.eps);
+    if (i < 4*args.n_embd) {
+        xn[i] = (x[i]*rs[i/args.n_embd])*gamma[i];
+    }
+    if (i < rows) {
+        float sum = 0.0f;
+        FOR_UNROLL (uint h = 0; h < 4; ++h) {
+            float dot = 0.0f;
+            for (uint j = 0; j < n_parts; ++j) {
+                dot += part[(h*n_parts + j)*rows + i];
+            }
+            sum += dot*rs[h];
+        }
+        if (i < args.n_low) {
+            const float v = sum*args.scale + args.bias;
+            lo[i] = v/(1.0f + exp(-v));
+        } else {
+            inject[i - args.n_low] = sum;
+        }
+    }
+}
+
 kernel void kernel_dsv4_hc_post_nocomb_f32(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,

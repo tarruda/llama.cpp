@@ -5023,6 +5023,183 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+struct test_sigmoid_mul_add : public test_case {
+    const int64_t width;
+    const int64_t rows;
+    const bool shared_gate;
+
+    test_sigmoid_mul_add(int64_t width, int64_t rows, bool shared_gate = false)
+        : width(width), rows(rows), shared_gate(shared_gate) {}
+    std::string op_desc(ggml_tensor *) override { return "SIGMOID_MUL_ADD"; }
+    std::string vars() override { return VARS_TO_STR3(width, rows, shared_gate); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, rows));
+        if (shared_gate) {
+            ggml_set_output(gate);
+        }
+        return ggml_add(ctx, residual, ggml_mul(ctx, x, gate));
+    }
+};
+
+struct test_ple_conv : public test_case {
+    const int64_t width;
+    const int64_t tokens;
+    const int dilation;
+    const bool shared_conv;
+
+    test_ple_conv(int64_t width, int64_t tokens, int dilation = 3, bool shared_conv = false)
+        : width(width), tokens(tokens), dilation(dilation), shared_conv(shared_conv) {}
+    std::string op_desc(ggml_tensor *) override { return "PLE_CONV"; }
+    std::string vars() override { return VARS_TO_STR4(width, tokens, dilation, shared_conv); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tokens + 3*dilation, 4*width);
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 1, 4*width);
+        ggml_tensor * gated = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 4, tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 4, tokens);
+        ggml_tensor * conv = ggml_conv_1d_dw(ctx, w, x, 1, 0, dilation);
+        conv = ggml_cont(ctx, ggml_transpose(ctx, conv));
+        conv = ggml_silu(ctx, ggml_reshape_2d(ctx, conv, 4*width, tokens));
+        conv = ggml_reshape_3d(ctx, ggml_cont(ctx, conv), width, 4, tokens);
+        ggml_tensor * out = ggml_add(ctx, residual, ggml_add(ctx, gated, conv));
+        return shared_conv ? ggml_add(ctx, out, conv) : out;
+    }
+};
+
+struct test_ple_gate : public test_case {
+    const int64_t width;
+    const int64_t rows;
+    const bool zero;
+    const bool shared_scale;
+
+    test_ple_gate(int64_t width, int64_t rows, bool zero = false, bool shared_scale = false)
+        : width(width), rows(rows), zero(zero), shared_scale(shared_scale) {}
+    std::string op_desc(ggml_tensor *) override { return "PLE_GATE"; }
+    std::string vars() override { return VARS_TO_STR4(width, rows, zero, shared_scale); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * key = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        ggml_tensor * s = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, key, query)), 1.0f/sqrtf(width));
+        ggml_tensor * mag = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, s), 1e-6f, INFINITY));
+        ggml_tensor * out = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, s), mag));
+        return shared_scale ? ggml_add(ctx, out, s) : out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, zero ? 0.0f : -1.0f, zero ? 0.0f : 1.0f);
+        }
+    }
+};
+
+struct test_dsv4_hc_down : public test_case {
+    const int64_t embd;
+    const int64_t low;
+    const int64_t tokens;
+    const bool shared_norm;
+    ggml_tensor * xn = nullptr;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * lo = nullptr;
+
+    test_dsv4_hc_down(int64_t embd, int64_t low, int64_t tokens = 1, bool shared_norm = false)
+        : embd(embd), low(low), tokens(tokens), shared_norm(shared_norm) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSV4_HC_DOWN"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { xn, inject, lo }; }
+    std::string vars() override { return VARS_TO_STR4(embd, low, tokens, shared_norm); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 4, tokens);
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, 4);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 4*embd, low);
+        ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 4*embd, 4);
+        ggml_tensor * norm = ggml_rms_norm(ctx, x, 1e-6f);
+        xn = ggml_mul(ctx, norm, gamma);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, xn, 4*embd, tokens);
+        inject = ggml_mul_mat(ctx, wi, flat);
+        lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, wd, flat), 0.25f));
+        if (shared_norm) {
+            ggml_set_output(norm);
+        }
+        return ggml_add(ctx, inject, ggml_sum_rows(ctx, lo));
+    }
+};
+
+struct test_gdn_alpha_beta : public test_case {
+    const int64_t embd;
+    const int64_t heads;
+    const int64_t tokens;
+    const bool shared_alpha;
+
+    test_gdn_alpha_beta(int64_t embd, int64_t heads, int64_t tokens = 1, bool shared_alpha = false)
+        : embd(embd), heads(heads), tokens(tokens), shared_alpha(shared_alpha) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GDN_ALPHA_BETA"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::string vars() override { return VARS_TO_STR4(embd, heads, tokens, shared_alpha); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, embd, heads);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, embd, heads);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
+        ggml_tensor * beta = ggml_mul_mat(ctx, wb, x);
+        beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, beta, 1, heads, tokens, 1));
+        ggml_tensor * alpha = ggml_mul_mat(ctx, wa, x);
+        ggml_tensor * raw = alpha;
+        alpha = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, ggml_reshape_3d(ctx, alpha, heads, tokens, 1), dt)), a);
+        if (shared_alpha) {
+            ggml_set_output(raw);
+        }
+        return ggml_add(ctx, beta, ggml_reshape_4d(ctx, alpha, 1, heads, tokens, 1));
+    }
+};
+
+struct test_ssm_conv_silu_norm : public test_case {
+    const int64_t tokens;
+    const int64_t seqs;
+    const int64_t heads;
+    const int64_t width;
+    const bool shared_conv;
+
+    test_ssm_conv_silu_norm(int64_t tokens, int64_t seqs, int64_t heads, int64_t width = 128, bool shared_conv = false)
+        : tokens(tokens), seqs(seqs), heads(heads), width(width), shared_conv(shared_conv) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_SILU_NORM"; }
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR5(tokens, seqs, heads, width, shared_conv); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t channels = 5*heads*width;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, tokens + 3, channels, seqs);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, x, w);
+        ggml_tensor * silu = ggml_silu(ctx, conv);
+        ggml_tensor * q = ggml_view_4d(ctx, silu, width, heads, tokens, seqs, width*sizeof(float), silu->nb[1], silu->nb[2], 0);
+        ggml_tensor * k = ggml_view_4d(ctx, silu, width, heads, tokens, seqs, width*sizeof(float), silu->nb[1], silu->nb[2], width*heads*sizeof(float));
+        ggml_tensor * v = ggml_view_4d(ctx, silu, width, 3*heads, tokens, seqs, width*sizeof(float), silu->nb[1], silu->nb[2], 2*width*heads*sizeof(float));
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f/width), 1.0f/sqrtf(width));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/width), 1.0f/sqrtf(width));
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_add(ctx, q, k), width*heads, tokens*seqs);
+        out = ggml_concat(ctx, out, ggml_reshape_2d(ctx, ggml_cont(ctx, v), 3*width*heads, tokens*seqs), 0);
+        if (shared_conv) {
+            ggml_set_output(conv);
+        }
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11327,6 +11504,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t tokens : { 1, 7, 64 }) {
+        for (int64_t seqs : { 1, 2 }) {
+            test_cases.emplace_back(new test_ssm_conv_silu_norm(tokens, seqs, 3));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_silu_norm(1, 1, 16));
+    test_cases.emplace_back(new test_ssm_conv_silu_norm(1, 1, 3, 64));
+    test_cases.emplace_back(new test_ssm_conv_silu_norm(1, 2, 3, 128, true));
+    for (int64_t embd : { 32, 2560 }) {
+        for (int64_t heads : { 3, 48 }) {
+            test_cases.emplace_back(new test_gdn_alpha_beta(embd, heads));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_alpha_beta(128, 4, 3));
+    test_cases.emplace_back(new test_gdn_alpha_beta(128, 4, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_down(32, 3));
+    test_cases.emplace_back(new test_dsv4_hc_down(32, 1024));
+    test_cases.emplace_back(new test_dsv4_hc_down(2560, 320));
+    test_cases.emplace_back(new test_dsv4_hc_down(128, 32, 4));
+    test_cases.emplace_back(new test_dsv4_hc_down(128, 32, 1, true));
+    test_cases.emplace_back(new test_ple_gate(2560, 4));
+    test_cases.emplace_back(new test_sigmoid_mul_add(2560, 1));
+    test_cases.emplace_back(new test_sigmoid_mul_add(2560, 32));
+    test_cases.emplace_back(new test_sigmoid_mul_add(33, 7));
+    test_cases.emplace_back(new test_sigmoid_mul_add(128, 4, true));
+    test_cases.emplace_back(new test_ple_gate(2560, 76));
+    test_cases.emplace_back(new test_ple_gate(33, 7));
+    test_cases.emplace_back(new test_ple_gate(2560, 4, true));
+    test_cases.emplace_back(new test_ple_gate(2560, 4, false, true));
+    test_cases.emplace_back(new test_ple_conv(2560, 1));
+    test_cases.emplace_back(new test_ple_conv(128, 31));
+    test_cases.emplace_back(new test_ple_conv(33, 5, 1));
+    test_cases.emplace_back(new test_ple_conv(128, 7, 3, true));
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -12807,6 +13018,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 3, 4, 1, type_K));
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 19, 2, 1, type_K));
         }
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));

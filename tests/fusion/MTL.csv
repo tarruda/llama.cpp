@@ -226,25 +226,28 @@ qwen2vl             ,0   ,any     ,RMS_NORM+MUL                ,      5
 qwen3               ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen35              ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen35              ,0   ,any     ,RMS_NORM+MUL                ,      8
-qwen35              ,0   ,any     ,RMS_NORM+SCALE              ,      2
-qwen35              ,0   ,any     ,SSM_CONV+UNARY              ,      1
-qwen35moe           ,1   ,any     ,ADD+ADD                     ,      2
+qwen35              ,0   ,prefill ,RMS_NORM+SCALE              ,      2
+qwen35              ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35              ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
 qwen35moe           ,1   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen35moe           ,1   ,any     ,MUL+ADD                     ,      4
 qwen35moe           ,1   ,any     ,RMS_NORM+MUL                ,      8
-qwen35moe           ,1   ,any     ,RMS_NORM+SCALE              ,      2
+qwen35moe           ,1   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen35moe           ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen35moe           ,1   ,any     ,SSM_CONV+UNARY              ,      1
+qwen35moe           ,1   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35moe           ,1   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen35moe           ,1   ,any     ,UNARY+MUL+ADD               ,      2
 qwen3moe            ,1   ,any     ,MUL+ADD                     ,      4
 qwen3moe            ,1   ,any     ,RMS_NORM+MUL                ,      9
 qwen3moe            ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen3next           ,0   ,any     ,ADD+ADD                     ,      2
 qwen3next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen3next           ,0   ,any     ,MUL+ADD                     ,      4
 qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      8
-qwen3next           ,0   ,any     ,RMS_NORM+SCALE              ,      2
+qwen3next           ,0   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen3next           ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen3next           ,0   ,any     ,SSM_CONV+UNARY              ,      1
+qwen3next           ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen3next           ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen3next           ,0   ,any     ,UNARY+MUL+ADD               ,      2
 qwen3tts            ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vl             ,0   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vlmoe          ,1   ,any     ,MUL+ADD                     ,      4
@@ -252,12 +255,16 @@ qwen3vlmoe          ,1   ,any     ,RMS_NORM+MUL                ,      9
 qwen3vlmoe          ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 qwen4exp            ,0   ,any     ,ADD+ADD+ADD                 ,      1
 qwen4exp            ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
+qwen4exp            ,0   ,any     ,IM2COL+MUL_MAT+CONT+UNARY+CONT+ADD+ADD,      1
 qwen4exp            ,0   ,any     ,MUL+ADD                     ,      4
+qwen4exp            ,0   ,any     ,MUL+SUM_ROWS+SCALE+UNARY+UNARY+CLAMP+SQRT+MUL+UNARY,      1
 qwen4exp            ,0   ,any     ,RMS_NORM+MUL                ,     10
 qwen4exp            ,0   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
-qwen4exp            ,0   ,any     ,RMS_NORM+SCALE              ,      2
+qwen4exp            ,0   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen4exp            ,0   ,any     ,SCALE+UNARY                 ,      5
-qwen4exp            ,0   ,any     ,SSM_CONV+UNARY              ,      1
+qwen4exp            ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen4exp            ,0   ,decode  ,SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen4exp            ,0   ,any     ,UNARY+MUL+ADD               ,      2
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 rnd1                ,0   ,any     ,MUL+ADD                     ,      4

@@ -367,6 +367,80 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 constant short FC_lightning_indexer_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];
 
 template<typename k4_t>
+kernel void kernel_lightning_indexer_tiled(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device char * dst,
+        threadgroup float * shared [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float * qs = shared;
+    threadgroup float * ks = qs + 32*64;
+    const uint tx = tid%8;
+    const uint ty = tid/8;
+    const uint iq = group.y*16 + ty;
+    const uint ik = group.x*32 + tx*4;
+    float4 acc[4] = {};
+    for (uint kc = 0; kc < 128; kc += 32) {
+        FOR_UNROLL (uint j = 0; j < 4; ++j) {
+            const uint i = tid + j*128;
+            const uint row = i/8;
+            const uint col = 4*(i%8);
+            const uint query = group.y*16 + row/4;
+            float4 v = 0.0f;
+            if (query < args.n_batch) {
+                v = *(device const float4 *) (q + group.z*args.nbq3 + query*args.nbq2 + (row%4)*args.nbq1 + (kc + col)*sizeof(float));
+            }
+            FOR_UNROLL (uint x = 0; x < 4; ++x) {
+                qs[(col + x)*64 + row] = v[x];
+            }
+        }
+        FOR_UNROLL (uint j = 0; j < 2; ++j) {
+            const uint i = tid + j*128;
+            const uint row = i/8;
+            const uint col = 4*(i%8);
+            const uint key = group.x*32 + row;
+            float4 v = 0.0f;
+            if (key < args.n_kv) {
+                v = float4(*(device const k4_t *) (k + group.z*args.nbk3 + key*args.nbk2 + (kc + col)*sizeof(k4_t)/4));
+            }
+            FOR_UNROLL (uint x = 0; x < 4; ++x) {
+                ks[(col + x)*32 + row] = v[x];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint x = 0; x < 32; ++x) {
+            const float4 qv = *(threadgroup float4 *) (qs + x*64 + ty*4);
+            const float4 kv = *(threadgroup float4 *) (ks + x*32 + tx*4);
+            FOR_UNROLL (uint h = 0; h < 4; ++h) {
+                acc[h] = fma(float4(qv[h]), kv, acc[h]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (iq < args.n_batch) {
+        device const float * weights = (device const float *) (w + iq*args.nbw1 + group.z*args.nbw3);
+        device const half * mask = (device const half *) (m + iq*args.nbm1 + (group.z%args.mask_ne3)*args.nbm3);
+        float4 score = 0.0f;
+        FOR_UNROLL (uint h = 0; h < 4; ++h) {
+            score += max(acc[h], 0.0f)*weights[h];
+        }
+        FOR_UNROLL (uint j = 0; j < 4; ++j) {
+            if (ik + j < args.n_kv) {
+                *(device float *) (dst + (ik + j)*sizeof(float) + iq*args.nb1 + group.z*args.nb3) = score[j] + float(mask[ik + j]);
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_tiled<float4>) kernel_lightning_indexer_tiled_t;
+template [[host_name("kernel_lightning_indexer_tiled_f32")]] kernel kernel_lightning_indexer_tiled_t kernel_lightning_indexer_tiled<float4>;
+template [[host_name("kernel_lightning_indexer_tiled_f16")]] kernel kernel_lightning_indexer_tiled_t kernel_lightning_indexer_tiled<half4>;
+
+template<typename k4_t>
 kernel void kernel_lightning_indexer_vec(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,

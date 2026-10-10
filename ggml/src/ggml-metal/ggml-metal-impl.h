@@ -965,6 +965,48 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t n_tokens;
+    int32_t n_channels;
+    int32_t n_heads;
+    float eps;
+    float scale;
+    float bias;
+} ggml_metal_kargs_ssm_conv_silu_norm;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_heads;
+} ggml_metal_kargs_gdn_alpha_beta;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_low;
+    float eps;
+    float scale;
+    float bias;
+} ggml_metal_kargs_dsv4_hc_down;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_rows;
+} ggml_metal_kargs_sigmoid_mul_add;
+
+typedef struct {
+    int32_t n_embd;
+    int32_t n_rows;
+    float scale;
+    float bias;
+    float min;
+    float max;
+} ggml_metal_kargs_ple_gate;
+
+typedef struct {
+    int32_t n_channels;
+    int32_t n_tokens;
+    int32_t dilation;
+} ggml_metal_kargs_ple_conv;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;

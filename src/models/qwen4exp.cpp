@@ -332,6 +332,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
+    if (inject) {
+        *inject = build_lora_mm(w_inject, xn);
+        cb(*inject, "hc_inject", il);
+        if (nt == 1 && hc == 4 && w_down->type == GGML_TYPE_Q8_0 && w_inject->type == GGML_TYPE_Q8_0) {
+            ggml_build_forward_expand(gf, *inject);
+        }
+    }
+
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
@@ -361,11 +369,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
     cb(mixed, "hc_mixed", il);
-
-    if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
-        cb(*inject, "hc_inject", il);
-    }
 
     return mixed;
 }
@@ -1188,6 +1191,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    if (n_seq_tokens == 1 && n_seqs == 1 && alpha->src[0]->op == GGML_OP_MUL_MAT &&
+        beta->src[0]->src[0]->op == GGML_OP_MUL_MAT &&
+        model.layers[il].ssm_alpha->type == GGML_TYPE_Q8_0 && model.layers[il].ssm_beta->type == GGML_TYPE_Q8_0) {
+        ggml_build_forward_expand(gf, q_conv);
+        ggml_build_forward_expand(gf, k_conv);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, gate);
+    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
