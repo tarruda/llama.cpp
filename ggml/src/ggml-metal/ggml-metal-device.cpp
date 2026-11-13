@@ -993,8 +993,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
-    const bool f32_inputs = (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32 &&
-        (ggml_get_op_params_i32(op, 2) == GGML_PREC_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32);
+    const bool f32_inputs = ggml_metal_op_mul_mat_use_f32_inputs(op);
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 

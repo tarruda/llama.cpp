@@ -43,6 +43,14 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
            has_simdgroup_mm && ne11 > 8 && ne00 >= 32;
 }
 
+bool ggml_metal_op_mul_mat_use_f32_inputs(const struct ggml_tensor * op) {
+    const ggml_type type = op->src[0]->type;
+
+    return op->op == GGML_OP_MUL_MAT && op->src[1]->type == GGML_TYPE_F32 &&
+        (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0) &&
+        (ggml_get_op_params_i32(op, 2) == GGML_PREC_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32);
+}
+
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne02 = op->src[0]->ne[2];

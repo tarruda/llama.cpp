@@ -1516,7 +1516,7 @@ static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op,
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
     if (prec == GGML_PREC_F32) {
-        return false;
+        return !has_tensor && ggml_metal_op_mul_mat_use_f32_inputs(op);
     }
     if (prec == GGML_PREC_BF16) {
         return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;
